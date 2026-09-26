@@ -1,32 +1,5 @@
 /**
  * NEXORA — config.js
- * The single source of truth for runtime configuration on the frontend.
- *
- * Every other module (api.js, websocket.js, sw.js, theme.js) imports from
- * here. Nothing else may hardcode a host, a port or a scheme.
- *
- * Resolution order for the API origin — first match wins:
- *   1. explicit runtime config:  window.NEXORA_RUNTIME = { apiBase: '…' }
- *      (or a `nexora-config` JSON <script>), injected by the deployment
- *   2. meta tag:  <meta name="nexora-api-base" content="https://api.example.org">
- *   3. local-development detection: when the page is served from a known
- *      static-dev-server port (5500, 5501, 8080, 3000, 5173 …) the API is
- *      assumed to be Django on the SAME HOSTNAME at port 8000
- *   4. the deployed backend origin (PRODUCTION_API_ORIGIN below) — this
- *      deployment serves the frontend from Vercel and the API from Render, so
- *      "same origin" would resolve to the static host and every request would
- *      404 (and every WebSocket would fail forever)
- *   5. same origin — used only when the page is already being served by the
- *      backend itself (single reverse proxy / devserver.py layout)
- *
- * Step 3 deliberately preserves the hostname: browsers scope cookies by host
- * and ignore the port, so a page on http://127.0.0.1:5500 must talk to
- * http://127.0.0.1:8000 (not localhost:8000) for the session and CSRF cookies
- * to be sent at all. The same holds for localhost.
- *
- * The WebSocket origin is always derived from the resolved API origin by
- * swapping the scheme (http→ws, https→wss), so TLS can never be mismatched.
- */
 
 /* ============================================================
    Sources
@@ -60,33 +33,32 @@ const RUNTIME = { ...readInlineConfig(), ...(globalThis.NEXORA_RUNTIME || {}) };
 
 const trimSlashes = (value) => String(value || '').replace(/\/+$/, '');
 
-/** Ports commonly used by static dev servers that are NOT the Django port. */
+/** Kept for backward compatibility with any module still importing it; no
+ *  longer consulted by isLocalDevFrontend (see J1-style detection below). */
 export const LOCAL_STATIC_PORTS = new Set(['3000', '4173', '5173', '5500', '5501', '8080', '8081', '']);
 
-/** Hostnames that mean "this developer's machine". */
-export const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1', '0.0.0.0']);
+/** Hostnames that mean "this developer's machine" — same set J1 uses,
+ *  plus the extra loopback literals Nexora already recognized. */
+export const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1', '0.0.0.0', '']);
 
 /** Default port Django/uvicorn listens on in development. */
 export const LOCAL_API_PORT = String(RUNTIME.localApiPort || readMeta('nexora-local-api-port') || '8000');
 
-
 export const PRODUCTION_API_ORIGIN = 'https://nexora-backend-ptsc.onrender.com';
+const SANDBOX_PREVIEW_RE = /\.e2b\.app$/;
 
 export function isLocalHostname(hostname) {
   return LOCAL_HOSTS.has(String(hostname || '').toLowerCase());
 }
 
-/**
- * True when the current page looks like a local static dev server that is
- * NOT itself the Django server.
- */
+export function isSandboxPreview(hostname) {
+  return SANDBOX_PREVIEW_RE.test(String(hostname || ''));
+}
+
 export function isLocalDevFrontend(location = globalThis.location) {
   if (!location) return false;
   if (location.protocol === 'file:') return true;
-  if (!isLocalHostname(location.hostname)) return false;
-  const port = String(location.port || '');
-  if (port === LOCAL_API_PORT) return false; // already served by Django
-  return LOCAL_STATIC_PORTS.has(port);
+  return isLocalHostname(location.hostname);
 }
 
 /** Swap an http(s) origin to its ws(s) equivalent, preserving TLS. */
@@ -108,7 +80,7 @@ export function toHttpOrigin(wsOrigin) {
 }
 
 /* ============================================================
-   Resolution
+   Resolution — J1-style: same machine (dev) vs sandbox preview vs prod
    ============================================================ */
 
 export function resolveApiOrigin(location = globalThis.location) {
@@ -121,15 +93,16 @@ export function resolveApiOrigin(location = globalThis.location) {
 
   if (!location) return PRODUCTION_API_ORIGIN;
 
+  const hostname = location.protocol === 'file:' ? '127.0.0.1' : location.hostname;
+
+  
   if (isLocalDevFrontend(location)) {
-    // The hostname is preserved on purpose: cookies are scoped by host and
-    // ignore the port, so a page on http://127.0.0.1:5500 must talk to
-    // http://127.0.0.1:8000 — never localhost:8000 — or the session and CSRF
-    // cookies are simply not sent.
-    const host = location.protocol === 'file:' ? '127.0.0.1' : location.hostname;
     const protocol = location.protocol === 'https:' ? 'https:' : 'http:';
-    return `${protocol}//${host}:${LOCAL_API_PORT}`;
+    return `${protocol}//${hostname}:${LOCAL_API_PORT}`;
   }
+
+  // Sandboxed preview host — same-origin, proxied by the dev server.
+  if (isSandboxPreview(hostname)) return '';
 
   // Already served BY the backend (reverse proxy / devserver.py): stay
   // relative — no CORS preflight, no cookie-domain surprises.
@@ -196,13 +169,7 @@ export const config = Object.freeze({
   UPLOAD_TIMEOUT: Number(RUNTIME.uploadTimeout) || 0,
   SOCKET_PATH: RUNTIME.socketPath || readMeta('nexora-ws-path') || '/ws/app/',
   IS_LOCAL_DEV: isLocalDevFrontend(),
-  /**
-   * Verbose transport diagnostics (WebSocket URL, close codes, state changes).
-   * On by default in local development only; a hosted deployment can turn it
-   * on deliberately and temporarily with
-   *   window.NEXORA_RUNTIME = { debug: true }
-   * Diagnostics never include cookies, tokens, PINs or message content.
-   */
+  
   DEBUG: RUNTIME.debug === true || isLocalDevFrontend(),
 });
 
