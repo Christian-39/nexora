@@ -268,7 +268,7 @@ REFRESH_COOKIE = config("REFRESH_COOKIE", default="nexora_refresh")
 REFRESH_COOKIE_PATH = "/api/auth/"
 #: "Lax" for same-site deployments; "None" is required when the frontend is
 #: served from a different site than the API (and then Secure must be on).
-COOKIE_SAMESITE = config("COOKIE_SAMESITE", default="Lax")
+COOKIE_SAMESITE = config("COOKIE_SAMESITE", default="None")
 COOKIE_SECURE = config("COOKIE_SECURE", default=not DEBUG, cast=boolean)
 COOKIE_DOMAIN = config("COOKIE_DOMAIN", default="") or None
 
