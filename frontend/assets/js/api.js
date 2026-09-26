@@ -312,6 +312,16 @@ function authHeaders(method, extra = {}) {
  * Attempt a single session refresh, de-duplicated across concurrent 401s.
  * Returns true when the session was renewed.
  */
+/**
+ * Why the last refresh failed:
+ *   'ok'          — renewed
+ *   'rejected'    — the backend refused it: the session is really over
+ *   'unreachable' — transport/server problem: the session may still be valid
+ * Distinguishing the two failures is what stops a network blip from signing
+ * the user out (and an expired session from reconnecting forever).
+ */
+let lastRefreshOutcome = 'ok';
+
 async function tryRefreshSession() {
   if (refreshPromise) return refreshPromise;
   refreshPromise = (async () => {
@@ -322,22 +332,45 @@ async function tryRefreshSession() {
         headers: authHeaders('POST', { 'Content-Type': 'application/json' }),
         body: '{}',
       });
-      if (!response.ok) return false;
+      if (!response.ok) {
+        lastRefreshOutcome = response.status === 401 || response.status === 403 ? 'rejected' : 'unreachable';
+        return false;
+      }
       const payload = await parseBody(response);
       const data = unwrap(payload) || {};
       if (AUTH_MODE === 'bearer') {
         const token = data.access || data.access_token || data.token;
-        if (!token) return false;
+        if (!token) {
+          lastRefreshOutcome = 'rejected';
+          return false;
+        }
         tokenStore.set(token);
       }
+      lastRefreshOutcome = 'ok';
       return true;
     } catch {
+      lastRefreshOutcome = 'unreachable';
       return false;
     } finally {
       setTimeout(() => { refreshPromise = null; }, 0);
     }
   })();
   return refreshPromise;
+}
+
+/**
+ * Renew the session from the refresh cookie, using the one shared, de-duplicated
+ * implementation above.
+ *
+ * Exported for the realtime transport: when the backend refuses a WebSocket
+ * because the access cookie expired, the socket must try the SAME refresh the
+ * HTTP layer uses (never its own), exactly once, before giving up.
+ *
+ * @returns {Promise<{ok:boolean, reason:'ok'|'rejected'|'unreachable'}>}
+ */
+export async function refreshSession() {
+  const ok = await tryRefreshSession();
+  return { ok, reason: ok ? 'ok' : lastRefreshOutcome };
 }
 
 /**

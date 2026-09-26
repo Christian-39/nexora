@@ -1,17 +1,23 @@
 /**
  * NEXORA — navigation.js
- * Application shell: primary navigation, role-aware entries, unread badges,
- * connection banner, theme control and sign-out.
+ * Application shell: application header (hamburger + top-right theme/profile),
+ * primary navigation, the mobile navigation drawer, role-aware entries,
+ * unread badges, connection banner and sign-out.
+ *
+ * Layout contract (see responsive.css):
+ *   >= 1024px  full sidebar          + slim header carrying theme/profile
+ *   768-1023px icon-only nav rail    + slim header carrying theme/profile
+ *   <= 767px   NO sidebar: header with a hamburger that opens a drawer
  *
  * Role filtering here is UX only. Every hidden destination is still enforced
  * by the backend; a member typing admin.html receives 403 from the API.
  */
 
 import { authEvents, getUser, isAdmin, logout } from './auth.js';
-import { apiEvents } from './api.js';
+import { apiEvents, resolveMediaUrl } from './api.js';
 import { getThemePreference, setTheme } from './theme.js';
-import { icon, iconButton, openMenu, toast } from './ui.js';
-import { clear, el, formatCount, prefs } from './utils.js';
+import { avatar, icon, iconButton, openMenu, toast } from './ui.js';
+import { clear, el, formatCount, prefs, trapFocus } from './utils.js';
 import { connectionLabel, realtime, socketEvents } from './websocket.js';
 import { unreadEvents, getUnread } from './notifications.js';
 
@@ -25,7 +31,14 @@ const NAV_ITEMS = [
   { key: 'members', href: 'members.html', label: 'Members', icon: 'users', adminOnly: true },
 ];
 
+/** Secondary destinations. Profile now lives in the header profile menu too. */
 const FOOTER_ITEMS = [
+  { key: 'settings', href: 'settings.html', label: 'Settings', icon: 'settings' },
+];
+
+/** Destinations offered inside the mobile drawer, in order. */
+const DRAWER_ITEMS = [
+  ...NAV_ITEMS,
   { key: 'profile', href: 'profile.html', label: 'Profile', icon: 'user' },
   { key: 'settings', href: 'settings.html', label: 'Settings', icon: 'settings' },
 ];
@@ -33,6 +46,8 @@ const FOOTER_ITEMS = [
 let navRoot = null;
 let bannerRoot = null;
 let activeKey = null;
+let headerRoot = null;
+let drawer = null;
 
 /**
  * Mount the primary navigation.
@@ -46,10 +61,16 @@ export function mountNavigation(options = {}) {
   const shell = document.getElementById('app-shell');
   if (shell && prefs.get(NAV_COLLAPSE_KEY, false)) shell.dataset.nav = 'collapsed';
 
+  mountAppHeader();
   render();
-  authEvents.on('user', render);
-  authEvents.on('user-updated', render);
+  authEvents.on('user', renderAll);
+  authEvents.on('user-updated', renderAll);
   unreadEvents.on('change', updateBadges);
+}
+
+function renderAll() {
+  render();
+  renderHeader();
 }
 
 function render() {
@@ -72,22 +93,11 @@ function render() {
   }
   navRoot.append(list);
 
-  /* ---- footer ---- */
+  /* ---- footer ----
+     Profile, Appearance and Sign out deliberately live in the header's
+     top-right control group (and in the mobile drawer), not buried here. */
   const footer = el('div', { class: 'app-nav__footer' });
   for (const item of FOOTER_ITEMS) footer.append(navEntry(item, { bare: true }));
-
-  const themeBtn = el('button', { type: 'button', class: 'nav-item', 'aria-label': 'Change appearance' });
-  themeBtn.append(icon(themeIconName()), el('span', { class: 'nav-item__label', text: 'Appearance' }));
-  themeBtn.addEventListener('click', () => openThemeMenu(themeBtn));
-  footer.append(themeBtn);
-
-  const outBtn = el('button', { type: 'button', class: 'nav-item', 'aria-label': 'Sign out' });
-  outBtn.append(icon('log-out'), el('span', { class: 'nav-item__label', text: 'Sign out' }));
-  outBtn.addEventListener('click', async () => {
-    outBtn.disabled = true;
-    await logout();
-  });
-  footer.append(outBtn);
 
   if (user) {
     const meta = el('div', {
@@ -142,6 +152,229 @@ function updateBadges() {
 }
 
 /* ============================================================
+   Application header — hamburger (mobile) + top-right controls
+   ============================================================ */
+
+/**
+ * Insert the application header at the top of the work area of every
+ * authenticated page. It is created here rather than in each HTML file so the
+ * markup, the roles and the behaviour cannot drift apart between pages.
+ */
+function mountAppHeader() {
+  headerRoot = document.getElementById('app-header');
+  if (!headerRoot) {
+    const main = document.querySelector('.app-main');
+    if (!main) return;
+    headerRoot = el('header', { class: 'app-header', id: 'app-header' });
+    main.prepend(headerRoot);
+  }
+  renderHeader();
+}
+
+function renderHeader() {
+  if (!headerRoot) return;
+  clear(headerRoot);
+
+  /* ---- hamburger (mobile only; hidden with CSS from 768px up) ---- */
+  const menuBtn = el('button', {
+    type: 'button',
+    class: 'app-header__menu',
+    id: 'nav-toggle',
+    'aria-label': 'Open navigation menu',
+    'aria-haspopup': 'dialog',
+    'aria-expanded': 'false',
+    'aria-controls': 'app-drawer',
+  });
+  menuBtn.append(icon('menu'), el('span', { class: 'sr-only', text: 'Menu' }));
+  menuBtn.addEventListener('click', () => openDrawer(menuBtn));
+  headerRoot.append(menuBtn);
+
+  /* ---- compact brand (mobile context) ---- */
+  const brand = el('div', { class: 'app-header__brand' });
+  brand.append(
+    el('span', { class: 'app-header__logo-slot', 'data-brand': 'logo' }),
+    el('span', { class: 'app-header__name truncate', 'data-brand': 'org-name', text: '' })
+  );
+  headerRoot.append(brand);
+
+  headerRoot.append(el('span', { class: 'spacer' }));
+
+  /* ---- top-right control group: [Theme] [Profile] ---- */
+  const controls = el('div', { class: 'app-header__controls' });
+
+  const themeBtn = iconButton(themeIconName(), 'Change appearance', {
+    className: 'app-header__control',
+  });
+  themeBtn.id = 'theme-toggle';
+  themeBtn.addEventListener('click', () => openThemeMenu(themeBtn));
+  controls.append(themeBtn);
+
+  const user = getUser();
+  const profileBtn = el('button', {
+    type: 'button',
+    class: 'app-header__profile',
+    id: 'profile-menu-button',
+    'aria-label': 'Open your account menu',
+    'aria-haspopup': 'menu',
+  });
+  profileBtn.append(avatar(user?.full_name || user?.name || 'You', resolveAvatarUrl(user), { size: 'sm' }));
+  profileBtn.addEventListener('click', () => openProfileMenu(profileBtn));
+  controls.append(profileBtn);
+
+  headerRoot.append(controls);
+}
+
+function resolveAvatarUrl(user) {
+  const raw = user?.avatar_url || user?.avatar || null;
+  return raw ? resolveMediaUrl(raw) : null;
+}
+
+/* ============================================================
+   Profile menu (header, both breakpoints)
+   ============================================================ */
+
+function openProfileMenu(anchor) {
+  const user = getUser();
+  const admin = isAdmin();
+  const name = user?.full_name || user?.name || 'Signed in';
+  const role = admin ? 'Administrator' : 'Member';
+
+  openMenu(anchor, [
+    { label: `${name} · ${role}`, icon: admin ? 'shield-check' : 'user', disabled: true },
+    { separator: true },
+    { label: 'Profile', icon: 'user', onClick: () => navigateTo('profile.html') },
+    { label: 'Settings', icon: 'settings', onClick: () => navigateTo('settings.html') },
+    { separator: true },
+    { label: 'Sign out', icon: 'log-out', danger: true, onClick: () => logout() },
+  ]);
+}
+
+function navigateTo(href) {
+  window.location.assign(href);
+}
+
+/* ============================================================
+   Mobile navigation drawer
+   ============================================================ */
+
+let releaseDrawerFocus = null;
+let drawerOpener = null;
+
+function buildDrawer() {
+  const admin = isAdmin();
+  const user = getUser();
+
+  const backdrop = el('div', { class: 'nav-drawer__backdrop', 'data-drawer-backdrop': '' });
+  const panel = el('div', {
+    class: 'nav-drawer__panel',
+    role: 'dialog',
+    'aria-modal': 'true',
+    'aria-label': 'Navigation',
+  });
+
+  /* header row: brand + close */
+  const head = el('div', { class: 'nav-drawer__head' });
+  head.append(
+    el('span', { class: 'app-header__logo-slot', 'data-brand': 'logo' }),
+    el('span', { class: 'nav-drawer__title truncate', 'data-brand': 'org-name', text: 'NEXORA' }),
+    el('span', { class: 'spacer' })
+  );
+  const closeBtn = iconButton('x', 'Close navigation menu', { className: 'nav-drawer__close' });
+  closeBtn.addEventListener('click', () => closeDrawer());
+  head.append(closeBtn);
+  panel.append(head);
+
+  /* identity */
+  if (user) {
+    const who = el('div', { class: 'nav-drawer__user' });
+    who.append(avatar(user.full_name || user.name || 'You', resolveAvatarUrl(user), {}));
+    who.append(
+      el('div', { class: 'nav-drawer__identity' }, [
+        el('span', { class: 'nav-drawer__name truncate', text: user.full_name || user.name || 'Signed in' }),
+        el('span', { class: 'nav-drawer__role', text: admin ? 'Administrator' : 'Member' }),
+      ])
+    );
+    panel.append(who);
+  }
+
+  /* destinations (role aware — the backend still enforces access) */
+  const list = el('nav', { class: 'nav-drawer__list', 'aria-label': 'Primary' });
+  const unread = getUnread();
+  for (const item of DRAWER_ITEMS) {
+    if (item.adminOnly && !admin) continue;
+    const link = el('a', { class: 'nav-drawer__item', href: item.href });
+    if (activeKey === item.key) link.setAttribute('aria-current', 'page');
+    link.append(icon(item.icon), el('span', { class: 'nav-drawer__label', text: item.label }));
+    const count = Number(unread[item.badge] || 0);
+    if (item.badge && count > 0) {
+      link.append(el('span', { class: 'badge', text: formatCount(count), 'aria-label': `${count} unread` }));
+    }
+    // Close before navigating so focus is restored even for in-page targets.
+    link.addEventListener('click', () => closeDrawer({ restoreFocus: false }));
+    list.append(link);
+  }
+  panel.append(list);
+
+  /* appearance + sign out */
+  const foot = el('div', { class: 'nav-drawer__footer' });
+  const themeBtn = el('button', { type: 'button', class: 'nav-drawer__item', 'aria-label': 'Change appearance' });
+  themeBtn.append(icon(themeIconName()), el('span', { class: 'nav-drawer__label', text: 'Appearance' }));
+  themeBtn.addEventListener('click', () => openThemeMenu(themeBtn));
+  foot.append(themeBtn);
+
+  const outBtn = el('button', { type: 'button', class: 'nav-drawer__item nav-drawer__item--danger' });
+  outBtn.append(icon('log-out'), el('span', { class: 'nav-drawer__label', text: 'Sign out' }));
+  outBtn.addEventListener('click', async () => {
+    outBtn.disabled = true;
+    await logout();
+  });
+  foot.append(outBtn);
+  panel.append(foot);
+
+  const root = el('div', { class: 'nav-drawer', id: 'app-drawer', hidden: true });
+  root.append(backdrop, panel);
+  backdrop.addEventListener('click', () => closeDrawer());
+  root.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      event.stopPropagation();
+      closeDrawer();
+    }
+  });
+  return root;
+}
+
+export function openDrawer(opener = null) {
+  closeDrawer({ restoreFocus: false });
+  drawerOpener = opener || document.getElementById('nav-toggle');
+  drawer = buildDrawer();
+  document.body.append(drawer);
+  // Force a frame so the CSS transition runs from the closed position.
+  drawer.hidden = false;
+  requestAnimationFrame(() => drawer?.setAttribute('data-open', 'true'));
+  document.body.classList.add('no-scroll');
+  drawerOpener?.setAttribute('aria-expanded', 'true');
+  releaseDrawerFocus = trapFocus(drawer);
+  drawer.querySelector('.nav-drawer__close')?.focus();
+}
+
+export function closeDrawer({ restoreFocus = true } = {}) {
+  if (!drawer) return;
+  releaseDrawerFocus?.();
+  releaseDrawerFocus = null;
+  drawer.remove();
+  drawer = null;
+  document.body.classList.remove('no-scroll');
+  const opener = drawerOpener || document.getElementById('nav-toggle');
+  opener?.setAttribute('aria-expanded', 'false');
+  if (restoreFocus) opener?.focus();
+  drawerOpener = null;
+}
+
+export function isDrawerOpen() {
+  return !!drawer;
+}
+
+/* ============================================================
    Theme menu
    ============================================================ */
 
@@ -161,8 +394,16 @@ function openThemeMenu(anchor) {
 }
 
 function applyThemeChoice(pref) {
+  // theme.js remains the single source of truth for the theme; this only
+  // repaints the controls that show which preference is active.
   setTheme(pref);
   render();
+  renderHeader();
+  if (isDrawerOpen()) {
+    const opener = document.getElementById('nav-toggle');
+    closeDrawer({ restoreFocus: false });
+    openDrawer(opener);
+  }
 }
 
 /* ============================================================
@@ -290,4 +531,12 @@ export const mobile = {
   },
 };
 
-export default { mountNavigation, mountConnectionBanner, mountSessionGuards, mobile, navToggleButton };
+export default {
+  mountNavigation,
+  mountConnectionBanner,
+  mountSessionGuards,
+  mobile,
+  navToggleButton,
+  openDrawer,
+  closeDrawer,
+};

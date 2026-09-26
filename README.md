@@ -109,14 +109,17 @@ Then open <http://127.0.0.1:5500/login.html>.
 3. **local-dev detection** — a page served from `localhost`/`127.0.0.1` on a
    known static-server port (5500, 5501, 8080, 3000, 5173 …) assumes Django is
    on **the same hostname**, port 8000;
-4. **same origin** — the recommended production layout.
+4. **the deployed backend** (`PRODUCTION_API_ORIGIN` in `config.js`) — this
+   project's hosted frontend lives on Vercel and its API on Render, so a hosted
+   page resolves to `https://nexora-backend-ptsc.onrender.com`;
+5. **same origin** — used when the page is already served *by* the backend
+   (reverse proxy / `devserver.py`), or when an override says `same-origin`.
 
 Step 3 preserves the hostname on purpose. Browsers scope cookies by host and
 ignore the port, so a page on `http://127.0.0.1:5500` must call
 `http://127.0.0.1:8000` — not `localhost:8000` — or the session and CSRF
 cookies are never sent. Use `127.0.0.1` on both sides, or `localhost` on both
-sides. Verified working on `127.0.0.1:5500`, `localhost:5500` and
-`localhost:8080`.
+sides.
 
 The WebSocket origin is always derived from the resolved API origin by swapping
 the scheme (`http→ws`, `https→wss`), so TLS can never be mismatched.
@@ -139,53 +142,121 @@ API returns `403 PERMISSION_DENIED` until they do.
 
 ## 4. Production deployment
 
-### 4.1 Same origin (recommended)
-
-One reverse proxy (nginx/Caddy) serves the static `frontend/` directory and
-forwards `/api/`, `/ws/`, `/static/` and `/health/` to the ASGI server. No CORS
-is involved, cookies stay `SameSite=Lax`, and `config.js` resolves to the same
-origin with no configuration at all.
+### 4.1 The deployed topology (no Docker)
 
 ```
-COOKIE_SAMESITE=Lax
-COOKIE_SECURE=True
-CSRF_TRUSTED_ORIGINS=https://app.example.org
+Vercel static frontend            https://nexora-eight-lilac.vercel.app
+        │ HTTPS + WSS
+        ▼
+Render Python web service         https://nexora-backend-ptsc.onrender.com
+  Gunicorn + UvicornWorker + Django Channels
+        ├── external managed MySQL 8
+        ├── external managed Redis        (REDIS_URL — channels, cache, presence)
+        └── external private S3-compatible bucket
+        +  separate Render background workers (push / media / uploads)
 ```
 
-### 4.2 Separate origins
+There is **no Docker anywhere in this project**: no Dockerfile, no Compose, no
+container Redis and no container MySQL. Redis, MySQL and object storage are
+external managed services reached over the network.
 
-The frontend is on `https://app.example.org`, the API on
-`https://api.example.org`:
+`render.yaml` in the repository root is the blueprint for exactly this layout.
+
+**Build command** (`rootDir: backend`)
+
+```bash
+./bin/render-build.sh
+```
+
+**Start command** — ASGI, never WSGI:
+
+```bash
+gunicorn config.asgi:application -k uvicorn.workers.UvicornWorker -c gunicorn.conf.py
+```
+
+`gunicorn.conf.py` binds `0.0.0.0:$PORT`, which is what the platform health
+checks; a hard-coded port makes the deploy time out. `config.wsgi` cannot serve
+WebSockets — deploying it silently removes every realtime feature.
+
+**Backend environment (Render → Environment)**
 
 ```
-# backend/.env
-ALLOWED_HOSTS=api.example.org
-CORS_ALLOWED_ORIGINS=https://app.example.org
-CSRF_TRUSTED_ORIGINS=https://app.example.org,https://api.example.org
-COOKIE_SAMESITE=None          # required for cross-site cookies
-COOKIE_SECURE=True            # enforced: SameSite=None without Secure is refused
+DJANGO_ENV=production
+DEBUG=False
+SECRET_KEY=<64+ random characters>
+ALLOWED_HOSTS=nexora-backend-ptsc.onrender.com
+CORS_ALLOWED_ORIGINS=https://nexora-eight-lilac.vercel.app
+CSRF_TRUSTED_ORIGINS=https://nexora-eight-lilac.vercel.app
+COOKIE_SAMESITE=None            # cross-site frontend
+COOKIE_SECURE=True              # enforced: SameSite=None without Secure is refused
+SECURE_SSL_REDIRECT=True
+REDIS_URL=<external managed redis url>
+DATABASE_URL=mysql://user:password@host:3306/nexora
+STORAGE_BUCKET / STORAGE_ENDPOINT / STORAGE_REGION /
+STORAGE_ACCESS_KEY / STORAGE_SECRET_KEY
+PUSH_PUBLIC_KEY / PUSH_PRIVATE_KEY / PUSH_CONTACT
+MEDIA_PROCESS_INLINE=False
+FFMPEG_BINARY / FFPROBE_BINARY  (see 4.3)
 ```
+
+Secrets are set in the dashboard, never committed.
+
+### 4.2 Redis is a hard requirement in production
+
+`REDIS_URL` must point at an **external managed Redis** (Render Key Value,
+Upstash, Redis Cloud, ElastiCache …). Production refuses to boot without it and
+never silently degrades to the in-memory channel layer, because that layer
+cannot deliver an event from one ASGI process to another: messages would appear
+only for users who happened to land on the same worker.
+
+* `redis://` or `rediss://` (TLS). A value without a scheme is rejected at boot.
+* If a managed provider's TLS certificate cannot be verified by the host trust
+  store, set `REDIS_SSL_CERT_REQS=none` — the transport stays encrypted.
+* The in-memory layer remains available for local development only.
+
+### 4.3 Background workers and FFmpeg
+
+Push delivery, media derivatives and upload finalization run as **separate
+Render background workers**, not inside the web service (a web service is
+recycled on deploy and scaled per request):
+
+```
+python manage.py push_worker
+python manage.py media_worker
+python manage.py finalize_uploads
+```
+
+`bin/render-build.sh` downloads a static FFmpeg/ffprobe into `backend/bin/`
+because a managed Python runtime has no package manager; point `FFMPEG_BINARY`
+and `FFPROBE_BINARY` at them. If the download is unavailable, image derivatives
+still work and video/voice items are recorded as `FFMPEG_MISSING` rather than
+failing the deploy.
+
+### 4.4 Frontend (Vercel)
+
+Deploy the `frontend/` directory as a static project — no build step, no
+framework. `frontend/vercel.json` keeps HTML, JS, CSS and `sw.js` revalidated on
+every request so a deploy cannot be masked by a stale cached bundle.
+
+No file needs editing to point it at Render: `config.js` resolves the backend
+origin (see 3.2). To aim a fork at a different backend, set **one** value:
 
 ```html
-<!-- every page in frontend/ -->
 <meta name="nexora-api-base" content="https://api.example.org">
 ```
 
-`CORS_ALLOW_ALL_ORIGINS` is never enabled, in any mode.
+or `window.NEXORA_RUNTIME = { apiBase: '…' }` (use `'same-origin'` for a
+reverse-proxy deployment). `CORS_ALLOW_ALL_ORIGINS` is never enabled, in any
+mode.
 
-### 4.3 Running
+### 4.5 Alternative: one origin behind a reverse proxy
 
-```bash
-python -m uvicorn config.asgi:application --host 0.0.0.0 --port 8000 \
-  --workers 4 --proxy-headers --forwarded-allow-ips='*'
-python manage.py media_worker
-python manage.py push_worker
-```
+One nginx/Caddy serving `frontend/` and forwarding `/api/`, `/ws/`, `/static/`
+and `/health/` to the ASGI server still works unchanged: set
+`nexora-api-base` to `same-origin`, keep `COOKIE_SAMESITE=Lax`, and no CORS is
+involved.
 
-Both HTTP and WebSocket traffic go through the ASGI app; do not run the WSGI
-entry point if you want realtime.
-
-### 4.4 Web push keys
+### 4.6 Web push keys
 
 ```bash
 python -c "from py_vapid import Vapid01; v=Vapid01(); v.generate_keys(); print(v.public_key, v.private_key)"
@@ -295,9 +366,12 @@ the original, and `media.ready` tells connected clients when they exist.
 ```bash
 cd backend
 DJANGO_ENV=test python -m pytest        # in-memory SQLite, no services needed
+
+cd ../frontend
+node --test tests/                      # no npm install, no test framework
 ```
 
-96 tests covering authentication and lockout, CSRF, authorization and IDOR,
+132 backend tests covering authentication and lockout, CSRF, authorization and IDOR,
 messaging idempotency/ordering/receipts, media validation and streaming,
 WebSocket authorization and every emitted event, push subscription and
 aggregation, database-driven settings, and — in
@@ -306,6 +380,19 @@ every endpoint `api.js` calls is asserted against the real URL map, every
 socket event the UI listens for is asserted against the backend source, and
 the frontend is scanned for raw `fetch`, hardcoded origins, `innerHTML`/`eval`
 sinks and sensitive values in web storage.
+
+`tests/test_deployment_config.py` loads `config/settings.py` with a controlled
+environment and asserts the production contract itself: Redis mandatory (and
+never silently replaced by the in-memory layer), the Redis channel layer and
+cache actually selected, CORS restricted to the Vercel origin, CSRF trusted
+origins, cross-site cookies (`SameSite=None; Secure`), MySQL and private
+storage required, the ASGI entry point, and the absence of Docker artefacts.
+
+The 21 frontend tests (`frontend/tests/`, Node's built-in runner) cover API and
+WebSocket URL resolution for local *and* production, and the whole reconnection
+lifecycle: open, bounded backoff, one-shot session refresh, authentication
+failure, an unreachable backend, logout, sign-in again, offline/online and
+single-socket/single-timer invariants.
 
 `DJANGO_ENV=test` selects in-memory SQLite and disables global throttling;
 `backend/conftest.py` sets it automatically.

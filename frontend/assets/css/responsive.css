@@ -48,52 +48,24 @@
    <= 767px — single-pane mobile experience
    ============================================================ */
 @media (max-width: 767px) {
-  /* Primary nav becomes a bottom bar */
+  /* Primary navigation is the header hamburger + drawer.
+     The sidebar is removed entirely so no desktop rule can leak into the
+     mobile layout, and the shell becomes a single full-width column. */
   .app-shell,
   .app-shell[data-nav="collapsed"],
   .app-shell[data-nav="none"] {
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: minmax(0, 1fr) auto;
+    grid-template-rows: minmax(0, 1fr);
   }
-  .app-nav {
-    grid-row: 2;
-    flex-direction: row;
-    border-right: none;
-    border-top: 1px solid var(--border);
-    padding: 0;
-    padding-bottom: var(--safe-bottom);
-  }
-  .app-nav__brand,
-  .app-nav__section,
-  .app-nav__footer { display: none; }
-  .app-nav__list {
-    flex-direction: row;
-    justify-content: space-around;
-    align-items: stretch;
-    padding: var(--sp-1);
-    gap: 0;
-    overflow: visible;
-    width: 100%;
-  }
-  .nav-item {
-    flex: 1;
-    min-width: 0;
-    flex-direction: column;
-    gap: 2px;
-    justify-content: center;
-    padding: var(--sp-2) var(--sp-1);
-    position: relative;
-  }
-  .nav-item__label {
-    display: block;
-    font-size: 0.6875rem; /* 11px */
-    font-weight: var(--fw-medium);
-    text-align: center;
-    width: 100%;
-  }
-  .nav-item__badge { position: absolute; top: 2px; right: 50%; margin: 0; transform: translateX(22px); }
-  /* Hide bottom bar when a thread is open full-screen */
-  .app-shell[data-mobile-view="thread"] .app-nav { display: none; }
+  .app-nav { display: none; }
+
+  .app-header__menu { display: inline-flex; }
+  .app-header__brand { display: flex; }
+  .app-header { gap: var(--sp-2); padding-left: calc(var(--sp-2) + var(--safe-left)); }
+
+  /* A full-screen thread keeps its own header; the app header stays reachable
+     so the user is never trapped behind the conversation. */
+  .app-shell[data-mobile-view="thread"] .app-header__brand { display: none; }
 
   /* Chat: one pane at a time */
   .chat-layout { grid-template-columns: minmax(0, 1fr); position: relative; }
@@ -178,7 +150,11 @@
   .metric { padding: var(--sp-3); }
   .metric__value { font-size: var(--fs-xl); }
 
-  .toast-region { width: calc(100vw - var(--sp-4)); bottom: calc(var(--sp-3) + var(--safe-bottom)); }
+  /* Notifications: top of the viewport, clear of the header and the notch. */
+  .toast-region {
+    width: calc(100vw - var(--sp-4));
+    top: calc(var(--safe-top) + var(--app-header-h, 52px) + var(--sp-2));
+  }
   .dl { grid-template-columns: minmax(0, 1fr); gap: var(--sp-1); }
   .dl dd { margin-bottom: var(--sp-2); }
 }
@@ -204,7 +180,7 @@
   .media-frame { width: min(210px, 74vw); }
   .conv-item { padding: var(--sp-2) var(--sp-3); }
   .avatar { width: 36px; height: 36px; }
-  .nav-item__label { font-size: 0.625rem; }
+  .nav-drawer__panel { width: min(288px, 90vw); }
   .metrics { grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); }
   .btn { padding: 0 var(--sp-3); }
   .page__body { padding: var(--sp-3) var(--sp-2); }
@@ -230,6 +206,7 @@
   .thread__scroll { padding-top: var(--sp-2); padding-bottom: var(--sp-2); }
   .composer { padding-top: var(--sp-1); padding-bottom: calc(var(--sp-1) + var(--safe-bottom)); }
   .app-nav { display: none; }
+  .app-header { min-height: 44px; --app-header-h: 44px; }
 }
 
 /* ============================================================
@@ -246,5 +223,5 @@
    Print — chat is private; discourage printing content
    ============================================================ */
 @media print {
-  .app-nav, .composer, .thread__actions, .conv-pane { display: none !important; }
+  .app-nav, .app-header, .nav-drawer, .composer, .thread__actions, .conv-pane { display: none !important; }
 }

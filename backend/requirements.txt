@@ -19,7 +19,14 @@ uvicorn[standard]>=0.30
 gunicorn>=23.0
 
 # ---- Database --------------------------------------------------------------
-mysqlclient>=2.2
+# mysqlclient is preferred (C extension) but needs the MySQL client headers at
+# build time. PyMySQL is a pure-Python fallback registered automatically by
+# config/__init__.py on hosts that cannot build it (e.g. a managed Python
+# runtime without libmysqlclient-dev). Same Django backend either way.
+PyMySQL>=1.1
+# Optional speed-up where libmysqlclient-dev IS available (self-hosted/CI):
+#   pip install "mysqlclient>=2.2"
+# config/__init__.py prefers it automatically whenever it is importable.
 
 # ---- Media -----------------------------------------------------------------
 Pillow>=10.4

@@ -47,11 +47,102 @@ async def drain(communicator, wanted, limit=12):
 
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.asyncio
-async def test_unauthenticated_socket_is_closed():
+async def test_unauthenticated_socket_is_told_why_and_closed():
+    """An unauthenticated socket gets one typed frame and is then closed.
+
+    A handshake refused before ``accept()`` reaches a browser as close code
+    1006 with no reason, which is indistinguishable from a network outage —
+    that is what made the client reconnect forever against a dead session. The
+    socket is therefore accepted only long enough to deliver ``auth.error``
+    and is closed with 4401; it joins no group and receives no data.
+    """
     communicator = WebsocketCommunicator(application, "/ws/app/")
+    connected, _ = await communicator.connect()
+    assert connected
+
+    frame = await communicator.receive_json_from(timeout=3)
+    assert frame["type"] == "auth.error"
+    assert frame["code"] == "NO_CREDENTIAL"
+
+    closed = await communicator.receive_output(timeout=3)
+    assert closed["type"] == "websocket.close"
+    assert closed["code"] == 4401
+    await communicator.disconnect()
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.asyncio
+async def test_a_revoked_device_session_cannot_open_a_socket(member_a):
+    """Signing out on a device kills that device's sockets everywhere."""
+    from rest_framework_simplejwt.tokens import RefreshToken
+
+    @database_sync_to_async
+    def revoked_cookie():
+        refresh = RefreshToken.for_user(member_a)
+        session = DeviceSession.objects.create(
+            user=member_a,
+            jti=str(refresh["jti"]),
+            expires_at=timezone.now() + timezone.timedelta(days=1),
+            revoked_at=timezone.now(),
+        )
+        refresh["sid"] = str(session.id)
+        return f"nexora_access={refresh.access_token}".encode()
+
+    communicator = WebsocketCommunicator(application, "/ws/app/")
+    communicator.scope["headers"] = [(b"cookie", await revoked_cookie())]
+    connected, _ = await communicator.connect()
+    assert connected
+
+    frame = await communicator.receive_json_from(timeout=3)
+    assert frame["type"] == "auth.error"
+    assert frame["code"] == "SESSION_REVOKED"
+    await communicator.disconnect()
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.asyncio
+async def test_a_foreign_origin_cannot_open_an_authenticated_socket(member_a, settings):
+    """Cross-site WebSocket hijacking guard.
+
+    The same-origin policy does not apply to WebSocket handshakes, so with
+    SameSite=None cookies any site could otherwise open an authenticated
+    socket for a signed-in visitor.
+    """
+    settings.WEBSOCKET_ALLOWED_ORIGINS = ["https://nexora-eight-lilac.vercel.app"]
+
+    cookie = await _issue_cookie(member_a)
+    communicator = WebsocketCommunicator(application, "/ws/app/")
+    communicator.scope["headers"] = [(b"cookie", cookie), (b"origin", b"https://evil.example")]
     connected, code = await communicator.connect()
     assert not connected
-    assert code == 4003
+    assert code == 4403
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.asyncio
+async def test_the_configured_frontend_origin_is_accepted(member_a, settings):
+    settings.WEBSOCKET_ALLOWED_ORIGINS = ["https://nexora-eight-lilac.vercel.app"]
+
+    cookie = await _issue_cookie(member_a)
+    communicator = WebsocketCommunicator(application, "/ws/app/")
+    communicator.scope["headers"] = [
+        (b"cookie", cookie),
+        (b"origin", b"https://nexora-eight-lilac.vercel.app"),
+    ]
+    connected, _ = await communicator.connect()
+    assert connected
+    ready = await communicator.receive_json_from(timeout=3)
+    assert ready["type"] == "connection.ready"
+    await communicator.disconnect()
+
+
+def test_the_frontend_websocket_path_is_routed():
+    """`/ws/app/` (the path the frontend opens) must exist in Channels routing."""
+    import re
+
+    from apps.conversations.routing import websocket_urlpatterns
+
+    assert any(re.compile(str(entry.pattern)).match("ws/app/") for entry in websocket_urlpatterns)
 
 
 @pytest.mark.django_db(transaction=True)
@@ -225,9 +316,20 @@ async def test_user_group_receives_unread_and_notification_events(admin, member_
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.asyncio
 async def test_single_conversation_socket_rejects_outsiders(member_b, private_thread):
+    """A non-participant is refused — and told so, instead of being left to
+    reconnect against a 1006 with no explanation. No conversation group is
+    joined and no conversation data is ever sent."""
     communicator = await socket(member_b, f"/ws/conversations/{private_thread.id}/")
-    connected, code = await communicator.connect()
-    assert not connected and code == 4003
+    connected, _ = await communicator.connect()
+    assert connected
+
+    frame = await communicator.receive_json_from(timeout=3)
+    assert frame == {"type": "auth.error", "code": "FORBIDDEN"}
+
+    closed = await communicator.receive_output(timeout=3)
+    assert closed["type"] == "websocket.close"
+    assert closed["code"] == 4403
+    await communicator.disconnect()
 
 
 @pytest.mark.django_db(transaction=True)

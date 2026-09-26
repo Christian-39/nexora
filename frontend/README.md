@@ -42,18 +42,39 @@ if you prefer to inject it):
 
 | Meta name | Default | Meaning |
 |---|---|---|
-| `nexora-api-base` | `""` (same origin) | Backend origin, e.g. `https://api.example.org` |
+| `nexora-api-base` | `""` (auto) | Backend origin, e.g. `https://api.example.org`. Empty = resolve automatically (see below); `same-origin` = force relative URLs |
 | `nexora-api-prefix` | `/api` | API path prefix |
 | `nexora-auth-mode` | `cookie` | `cookie` (HttpOnly session — recommended) or `bearer` |
 
-**Recommended deployment:** serve this directory from the same origin as Django
-(reverse proxy `/api/` and `/ws/` to the backend). That keeps the session cookie
-`SameSite=Lax`, avoids CORS entirely, and lets the service worker cache the shell.
+**Automatic resolution** (`assets/js/config.js`, the only module allowed to
+name a host):
 
-If you serve it cross-origin, the backend must send
-`Access-Control-Allow-Credentials: true` and an explicit
-`Access-Control-Allow-Origin`, and the session cookie must be
-`SameSite=None; Secure`.
+1. `window.NEXORA_RUNTIME.apiBase` / `nexora-config` JSON blob;
+2. `<meta name="nexora-api-base">`;
+3. local dev — a page on `localhost`/`127.0.0.1` at a static-server port uses
+   **the same hostname** on port 8000 (`http://127.0.0.1:5500` →
+   `http://127.0.0.1:8000`; the hostname is never rewritten, because cookies are
+   scoped by host);
+4. hosted — `PRODUCTION_API_ORIGIN`, i.e.
+   `https://nexora-backend-ptsc.onrender.com`;
+5. same origin — when the page is already served by the backend, or when an
+   override says `same-origin`.
+
+The WebSocket origin is always derived from the resolved API origin
+(`http→ws`, `https→wss`), so production resolves to
+`wss://nexora-backend-ptsc.onrender.com/ws/app/` and local to
+`ws://127.0.0.1:8000/ws/app/`. No module builds its own socket host.
+
+**This deployment is cross-origin** (frontend on Vercel, API on Render), so the
+backend must send `Access-Control-Allow-Credentials: true` with an explicit
+`Access-Control-Allow-Origin`, and the session cookies must be
+`SameSite=None; Secure`. A same-origin reverse-proxy layout also still works —
+set `nexora-api-base` to `same-origin` and keep `SameSite=Lax`.
+
+`vercel.json` pins HTML/JS/CSS and `sw.js` to `max-age=0, must-revalidate` so a
+new deployment is never hidden behind a stale cached bundle.
+
+**Tests:** `node --test tests/` (Node's built-in runner; no npm dependencies).
 
 ### Authentication transport
 

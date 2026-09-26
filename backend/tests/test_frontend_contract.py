@@ -263,3 +263,147 @@ def test_every_json_response_uses_the_same_envelope(admin, member_a, private_thr
         body = response.json()
         assert body["success"] is False
         assert "message" in body and "code" in body and "errors" in body
+
+
+# ---------------------------------------------------------------------------
+# Runtime origin resolution (Vercel frontend ↔ Render backend)
+# ---------------------------------------------------------------------------
+
+CSS = FRONTEND / "assets" / "css"
+
+PRODUCTION_API = "https://nexora-backend-ptsc.onrender.com"
+PRODUCTION_FRONTEND = "https://nexora-eight-lilac.vercel.app"
+
+
+def test_config_is_the_only_module_that_names_the_backend_origin():
+    """config.js resolves the API origin; nothing else may hardcode a host."""
+    source = (JS / "config.js").read_text()
+    assert PRODUCTION_API in source, "the deployed backend origin must be resolvable"
+    assert PRODUCTION_FRONTEND not in source, "the static host must never be used as an API origin"
+
+    for path in sorted(JS.glob("*.js")):
+        if path.name == "config.js":
+            continue
+        assert "onrender.com" not in path.read_text(), f"{path.name} hardcodes the backend host"
+
+
+def test_local_development_keeps_the_hostname_and_uses_port_8000():
+    source = (JS / "config.js").read_text()
+    assert "LOCAL_API_PORT" in source and "'8000'" in source
+    # 127.0.0.1 must not be silently rewritten to localhost (cookies are
+    # scoped by host), so the resolver reuses location.hostname.
+    assert "location.hostname" in source
+
+
+def test_the_websocket_origin_is_derived_from_the_api_origin():
+    ws = (JS / "websocket.js").read_text()
+    assert "apiConfig.wsOrigin" in ws
+    # No second source of truth, and no scheme guessing from the page origin.
+    assert "window.location.origin" not in ws
+    config_source = (JS / "config.js").read_text()
+    assert "toWebSocketOrigin" in config_source
+
+
+# ---------------------------------------------------------------------------
+# Realtime client: bounded, non-looping reconnection
+# ---------------------------------------------------------------------------
+
+
+def test_the_realtime_client_stops_instead_of_reconnecting_forever():
+    source = (JS / "websocket.js").read_text()
+    assert "AUTH_CLOSE_CODES" in source
+    assert "MAX_RECONNECT_ATTEMPTS" in source
+    assert "refreshSession" in source, "auth recovery must reuse the central HTTP refresh"
+    assert "backoffDelay" in source, "reconnection must use bounded backoff with jitter"
+    for state in ("idle", "connecting", "open", "reconnecting", "offline", "closed"):
+        assert f"'{state}'" in source
+
+
+def test_logout_stops_the_socket():
+    source = (JS / "auth.js").read_text()
+    assert "realtime.stop" in source
+
+
+# ---------------------------------------------------------------------------
+# Navigation: mobile hamburger + drawer, top-right profile/theme
+# ---------------------------------------------------------------------------
+
+
+def test_mobile_navigation_provides_an_accessible_hamburger_and_drawer():
+    source = (JS / "navigation.js").read_text()
+    assert "app-header__menu" in source, "the mobile hamburger button is missing"
+    assert "'aria-controls': 'app-drawer'" in source
+    assert "'aria-expanded'" in source
+    assert "trapFocus" in source, "the drawer must trap focus while open"
+    assert "'Escape'" in source, "the drawer must close on Escape"
+    assert "data-drawer-backdrop" in source, "the drawer must have a backdrop"
+    assert "export function closeDrawer" in source
+
+
+def test_profile_and_theme_live_in_the_header_not_the_nav_footer():
+    source = (JS / "navigation.js").read_text()
+    header = source.split("function renderHeader", 1)[1]
+    assert "app-header__controls" in header
+    assert "Change appearance" in header
+    assert "profile-menu-button" in header
+
+    footer_block = source.split("const footer = el(", 1)[1].split("navRoot.append(footer)", 1)[0]
+    assert "Change appearance" not in footer_block
+    assert "profile.html" not in footer_block
+
+
+def test_the_drawer_is_role_aware():
+    source = (JS / "navigation.js").read_text()
+    assert "DRAWER_ITEMS" in source
+    assert "item.adminOnly && !admin" in source
+
+
+def test_theme_control_delegates_to_the_theme_module():
+    source = (JS / "navigation.js").read_text()
+    assert "setTheme(pref)" in source
+    assert "from './theme.js'" in source
+
+
+# ---------------------------------------------------------------------------
+# Notifications: top placement, one system, no layout hacks
+# ---------------------------------------------------------------------------
+
+
+def test_toasts_are_anchored_to_the_top_of_the_viewport():
+    components = (CSS / "components.css").read_text()
+    region = components.split(".toast-region {", 1)[1].split("}", 1)[0]
+    assert "top:" in region
+    assert "bottom:" not in region
+    assert "safe-top" in region
+    assert "app-header-h" in region, "toasts must clear the header controls"
+
+    responsive = (CSS / "responsive.css").read_text()
+    mobile_region = responsive.split(".toast-region {", 1)[1].split("}", 1)[0]
+    assert "top:" in mobile_region and "bottom:" not in mobile_region
+
+
+def test_there_is_exactly_one_notification_toast_system():
+    creators = [
+        path.name
+        for path in JS.glob("*.js")
+        if "class: 'toast-region'" in path.read_text() and path.name != "ui.js"
+    ]
+    assert not creators, f"a second toast system was introduced in {creators}"
+
+
+def test_no_global_overflow_x_hidden_workaround():
+    offenders = []
+    for path in sorted(CSS.glob("*.css")):
+        source = path.read_text()
+        for match in re.finditer(r"([^{}]*)\{[^}]*overflow-x:\s*hidden", source):
+            selector = match.group(1).strip().splitlines()[-1].strip()
+            if selector in {"html", "body", "*", ":root", "html, body", "body.app-body"}:
+                offenders.append(f"{path.name}: {selector}")
+    assert not offenders, f"global overflow-x:hidden workaround found: {offenders}"
+
+
+def test_the_mobile_breakpoint_does_not_inherit_the_desktop_sidebar():
+    responsive = (CSS / "responsive.css").read_text()
+    mobile_block = responsive.split("@media (max-width: 767px) {", 1)[1]
+    assert ".app-nav { display: none; }" in mobile_block
+    assert ".app-header__menu { display: inline-flex; }" in mobile_block

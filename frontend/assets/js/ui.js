@@ -24,6 +24,7 @@ const ICON_PATHS = {
   'bell-off': 'M8.7 3A6 6 0 0 1 18 8c0 2.3.4 4 .9 5.3|M17 17H3s3-2 3-9a6 6 0 0 1 .5-2.4|M10.3 21a1.94 1.94 0 0 0 3.4 0|M2 2l20 20',
   search: 'M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16z|M21 21l-4.35-4.35',
   x: 'M18 6 6 18|M6 6l12 12',
+  menu: 'M3 6h18|M3 12h18|M3 18h18',
   check: 'M20 6 9 17l-5-5',
   'check-check': 'M18 6 7 17l-4-4|M22 10l-7.5 7.5L13 16',
   clock: 'M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z|M12 6v6l4 2',
@@ -186,6 +187,9 @@ let toastRegion = null;
 
 function ensureToastRegion() {
   if (toastRegion?.isConnected) return toastRegion;
+  // Top-of-viewport region (see components.css). It sits BELOW the
+  // application header so a toast can never cover the hamburger, the theme
+  // control or the profile control.
   toastRegion = el('div', { class: 'toast-region', id: 'nx-toasts', 'aria-live': 'polite', 'aria-atomic': 'false' });
   document.body.append(toastRegion);
   return toastRegion;

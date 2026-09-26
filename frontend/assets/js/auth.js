@@ -11,6 +11,7 @@
 
 import { ApiError, api, apiEvents, tokenStore } from './api.js';
 import { Emitter, prefs } from './utils.js';
+import { realtime } from './websocket.js';
 
 export const authEvents = new Emitter();
 
@@ -210,6 +211,10 @@ export async function changePin({ currentPin, newPin, confirmPin }) {
 export async function logout({ silent = false } = {}) {
   if (signingOut) return;
   signingOut = true;
+  // Kill the realtime transport first: timers, heartbeat, queued events and
+  // reconnection all stop before the credential is invalidated, so a logout
+  // can never leave a socket retrying against a dead session.
+  realtime.stop('logout');
   try {
     await api.auth.logout();
   } catch {
@@ -295,6 +300,9 @@ apiEvents.on('unauthorized', () => {
   if (signingOut) return;
   if (!currentUser) return;
   tokenStore.clear();
+  // The session is gone: the socket must not keep reconnecting behind the
+  // "session expired" screen.
+  realtime.stop('session-expired');
   setUser(null);
   authEvents.emit('session-expired');
 });

@@ -12,8 +12,12 @@
  *   3. local-development detection: when the page is served from a known
  *      static-dev-server port (5500, 5501, 8080, 3000, 5173 …) the API is
  *      assumed to be Django on the SAME HOSTNAME at port 8000
- *   4. same origin — the recommended production layout (one reverse proxy
- *      serving both the static frontend and Django)
+ *   4. the deployed backend origin (PRODUCTION_API_ORIGIN below) — this
+ *      deployment serves the frontend from Vercel and the API from Render, so
+ *      "same origin" would resolve to the static host and every request would
+ *      404 (and every WebSocket would fail forever)
+ *   5. same origin — used only when the page is already being served by the
+ *      backend itself (single reverse proxy / devserver.py layout)
  *
  * Step 3 deliberately preserves the hostname: browsers scope cookies by host
  * and ignore the port, so a page on http://127.0.0.1:5500 must talk to
@@ -65,6 +69,19 @@ export const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1', '0
 /** Default port Django/uvicorn listens on in development. */
 export const LOCAL_API_PORT = String(RUNTIME.localApiPort || readMeta('nexora-local-api-port') || '8000');
 
+/**
+ * The deployed backend for hosted (non-local) builds.
+ *
+ * This is the ONE place in the frontend allowed to name a backend host. It is
+ * a fallback, not a lock-in: `window.NEXORA_RUNTIME.apiBase`, the
+ * `nexora-api-base` meta tag or the `nexora-config` JSON blob all override it,
+ * which is how a different environment (staging, self-hosted, same-origin
+ * reverse proxy) is pointed somewhere else without touching any module.
+ *
+ * Set it to 'same-origin' to restore pure same-origin behaviour.
+ */
+export const PRODUCTION_API_ORIGIN = 'https://nexora-backend-ptsc.onrender.com';
+
 export function isLocalHostname(hostname) {
   return LOCAL_HOSTS.has(String(hostname || '').toLowerCase());
 }
@@ -106,19 +123,30 @@ export function toHttpOrigin(wsOrigin) {
 
 export function resolveApiOrigin(location = globalThis.location) {
   const explicit = trimSlashes(RUNTIME.apiBase || RUNTIME.apiOrigin || readMeta('nexora-api-base'));
-  if (explicit) return explicit;
+  if (explicit) {
+    // An explicit "same-origin" marker is how a reverse-proxy deployment opts
+    // out of the hosted default below.
+    return /^same[-_]?origin$/i.test(explicit) ? '' : explicit;
+  }
 
-  if (!location) return '';
+  if (!location) return PRODUCTION_API_ORIGIN;
 
   if (isLocalDevFrontend(location)) {
+    // The hostname is preserved on purpose: cookies are scoped by host and
+    // ignore the port, so a page on http://127.0.0.1:5500 must talk to
+    // http://127.0.0.1:8000 — never localhost:8000 — or the session and CSRF
+    // cookies are simply not sent.
     const host = location.protocol === 'file:' ? '127.0.0.1' : location.hostname;
     const protocol = location.protocol === 'https:' ? 'https:' : 'http:';
     return `${protocol}//${host}:${LOCAL_API_PORT}`;
   }
 
-  // Same-origin deployment: an empty origin keeps every request relative,
-  // which also means no CORS preflight and no cookie-domain surprises.
-  return '';
+  // Already served BY the backend (reverse proxy / devserver.py): stay
+  // relative — no CORS preflight, no cookie-domain surprises.
+  if (location.origin && location.origin === PRODUCTION_API_ORIGIN) return '';
+
+  // Hosted frontend (Vercel) with the API on its own origin (Render).
+  return PRODUCTION_API_ORIGIN;
 }
 
 const API_ORIGIN = resolveApiOrigin();
@@ -178,6 +206,14 @@ export const config = Object.freeze({
   UPLOAD_TIMEOUT: Number(RUNTIME.uploadTimeout) || 0,
   SOCKET_PATH: RUNTIME.socketPath || readMeta('nexora-ws-path') || '/ws/app/',
   IS_LOCAL_DEV: isLocalDevFrontend(),
+  /**
+   * Verbose transport diagnostics (WebSocket URL, close codes, state changes).
+   * On by default in local development only; a hosted deployment can turn it
+   * on deliberately and temporarily with
+   *   window.NEXORA_RUNTIME = { debug: true }
+   * Diagnostics never include cookies, tokens, PINs or message content.
+   */
+  DEBUG: RUNTIME.debug === true || isLocalDevFrontend(),
 });
 
 export default config;

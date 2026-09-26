@@ -12,7 +12,7 @@
  * client can classify, never a stale message list.
  */
 
-const VERSION = 'v1.1.0';
+const VERSION = 'v1.2.0';
 const PRECACHE = `nexora-shell-${VERSION}`;
 const RUNTIME = `nexora-static-${VERSION}`;
 const OFFLINE_URL = 'offline.html';
@@ -152,14 +152,45 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Static same-origin assets: cache-first, revalidate in the background.
+  // Application CODE (js/css/manifest): network-first.
+  //
+  // Cache-first was able to keep an old build alive across reloads, which is
+  // exactly how a fixed bug appears to "survive a refresh". The cached copy is
+  // still kept and is still served instantly when the network fails, so
+  // offline behaviour is unchanged.
+  if (isCodeAsset(url.pathname)) {
+    event.respondWith(networkFirst(request));
+    return;
+  }
+
+  // Immutable-ish media/fonts: cache-first, revalidated in the background.
   if (isStaticAsset(url.pathname)) {
     event.respondWith(staleWhileRevalidate(request));
   }
 });
 
+function isCodeAsset(pathname) {
+  return /\.(?:css|js|mjs|webmanifest)$/i.test(pathname);
+}
+
 function isStaticAsset(pathname) {
-  return /\.(?:css|js|mjs|png|jpg|jpeg|webp|svg|ico|woff2?|webmanifest)$/i.test(pathname);
+  return /\.(?:png|jpg|jpeg|webp|svg|ico|woff2?)$/i.test(pathname);
+}
+
+/** Fresh code when online, cached code when not. Never used for /api/. */
+async function networkFirst(request) {
+  const cache = await caches.open(RUNTIME);
+  try {
+    const response = await fetch(request);
+    if (response && response.ok && response.type === 'basic') {
+      cache.put(request, response.clone()).catch(() => {});
+    }
+    return response;
+  } catch {
+    const cached = (await cache.match(request)) || (await caches.open(PRECACHE).then((c) => c.match(request)));
+    if (cached) return cached;
+    throw new Error('offline');
+  }
 }
 
 /**

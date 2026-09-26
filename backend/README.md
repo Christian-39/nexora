@@ -20,7 +20,7 @@ Security-first, independently deployed Django/DRF/Channels backend. Each install
 - Redis-backed multi-process presence with authorized contact scopes, connection counters, offline last-seen updates, and user privacy controls; local-memory presence is development-only.
 - Member profile preferences for theme, phone visibility, last-seen privacy, and push enablement.
 - Initial database migrations and automated authorization, group-permission, cross-conversation reply, idempotency, credential, media-IDOR, and upload tests.
-- Container deployment assets for ASGI API, MySQL, authenticated Redis, durable push worker and media worker, plus liveness/readiness probes.
+- Non-containerised deployment assets (`render.yaml`, `bin/render-build.sh`, `gunicorn.conf.py`) for an ASGI web service plus separate push/media/upload background workers, against external managed MySQL, Redis and object storage, with liveness/readiness probes. This project does not use Docker.
 
 ## Local development
 
@@ -43,9 +43,29 @@ Use an international phone number when `createsuperuser` asks for the username. 
 
 ## Production topology
 
-Static frontend → HTTPS reverse proxy → ASGI workers → independent MySQL 8 database + Redis + private S3-compatible bucket. Run migrations before switching traffic. Use `uvicorn` workers behind Gunicorn or Daphne. Redis is mandatory with multiple ASGI processes; the in-memory layer is development-only.
+Static frontend (Vercel, or any static host / reverse proxy) → HTTPS → **ASGI** web service → independent MySQL 8 database + **external managed Redis** + private S3-compatible bucket. No Docker is involved at any layer.
 
-Set a unique `SECRET_KEY`, database credentials, exact `ALLOWED_HOSTS`, `CORS_ALLOWED_ORIGINS`, `CSRF_TRUSTED_ORIGINS`, Redis URL, private storage credentials and VAPID keys per deployment. Install FFmpeg/ffprobe on API and media-worker hosts. Never share a database, bucket or credential set between organizations.
+Start command — ASGI only; `config.wsgi` cannot serve WebSockets:
+
+```bash
+gunicorn config.asgi:application -k uvicorn.workers.UvicornWorker -c gunicorn.conf.py
+```
+
+`gunicorn.conf.py` binds `0.0.0.0:$PORT` so a platform-assigned port is honoured, and trusts `X-Forwarded-Proto` so TLS termination upstream is detected.
+
+Redis is mandatory in production (channel layer, cache, presence) and the boot fails clearly without it; the in-memory layer is development-only and can never be substituted in production. Use `rediss://` for TLS, and `REDIS_SSL_CERT_REQS=none` only when a managed provider's certificate chain is not verifiable.
+
+Run migrations before switching traffic (`bin/render-build.sh` does this for the web service only, so parallel worker deploys cannot race).
+
+Set a unique `SECRET_KEY`, database credentials, exact `ALLOWED_HOSTS`, `CORS_ALLOWED_ORIGINS`, `CSRF_TRUSTED_ORIGINS`, `REDIS_URL`, private storage credentials and VAPID keys per deployment. When the frontend is on another site, also set `COOKIE_SAMESITE=None` and `COOKIE_SECURE=True`, or the browser will not send the session cookies. Provide FFmpeg/ffprobe to the API and media-worker hosts (`bin/render-build.sh` installs a static build into `backend/bin/`). Never share a database, bucket or credential set between organizations.
+
+Background processing runs as its own services, never inside the web service:
+
+```bash
+python manage.py push_worker
+python manage.py media_worker
+python manage.py finalize_uploads
+```
 
 ## API
 

@@ -42,13 +42,31 @@ class BaseAuthenticatedConsumer(AsyncJsonWebsocketConsumer):
         # the default json encoder would raise on them mid-broadcast.
         return json.dumps(content, cls=DjangoJSONEncoder)
 
+    #: Close code reserved for "your credential is not (or no longer) valid".
+    #: It is deliberately in the 4400 range so the client can tell an
+    #: authentication failure apart from a network failure and stop retrying.
+    AUTH_CLOSE_CODE = 4401
+
     async def _authenticate(self) -> bool:
+        """Authenticate the handshake, telling the client *why* it failed.
+
+        A handshake rejected before ``accept()`` reaches the browser as close
+        code 1006 with no reason — indistinguishable from a dropped network,
+        which is exactly what makes a client reconnect forever against an
+        expired session. So the socket is accepted just long enough to deliver
+        one typed ``auth.error`` frame and is then closed. No group is joined,
+        no data is sent, and no inbound frame is ever processed.
+        """
         user = self.scope.get("user")
-        if not user or not user.is_authenticated:
-            await self.close(code=4003)
-            return False
-        self.user = user
-        return True
+        if user and user.is_authenticated:
+            self.user = user
+            return True
+
+        code = self.scope.get("auth_error") or "UNAUTHENTICATED"
+        await self.accept()
+        await self.send_json({"type": "auth.error", "code": code})
+        await self.close(code=self.AUTH_CLOSE_CODE)
+        return False
 
     def _start_expiry_watch(self) -> None:
         self.expiry_task = asyncio.create_task(self._expire())
@@ -106,7 +124,9 @@ class AppConsumer(BaseAuthenticatedConsumer):
         )
 
     async def disconnect(self, code):
-        for task in (*self.typing_tasks.values(), getattr(self, "expiry_task", None)):
+        # A socket rejected during authentication never reached the setup below,
+        # so nothing may be assumed to exist here.
+        for task in (*getattr(self, "typing_tasks", {}).values(), getattr(self, "expiry_task", None)):
             if task:
                 task.cancel()
         if not hasattr(self, "user"):
@@ -391,7 +411,11 @@ class ConversationConsumer(BaseAuthenticatedConsumer):
             return
         self.conversation_id = self.scope["url_route"]["kwargs"]["conversation_id"]
         if not await self._allowed():
-            await self.close(code=4003)
+            # Authenticated but not a participant: a permanent refusal, so the
+            # client is told explicitly instead of being left to reconnect.
+            await self.accept()
+            await self.send_json({"type": "auth.error", "code": "FORBIDDEN"})
+            await self.close(code=4403)
             return
         self.group = realtime.conversation_group(self.conversation_id)
         await self.channel_layer.group_add(self.group, self.channel_name)
