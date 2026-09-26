@@ -1,404 +1,348 @@
-# nexora
-Admin managed platform similar to whatsapp.
-# NEXORA backend
+# NEXORA
 
-Security-first, independently deployed Django/DRF/Channels backend. Each installation has one database, one storage bucket and one secret set. There is deliberately no tenant model or cross-instance registry.
+A private, administrator-controlled messaging platform. Each deployment is an
+independent installation for one organization: its own database, its own
+storage bucket, its own secrets, its own users and its own branding. There is
+no tenant registry, no shared database and no shared bucket.
 
-## Implemented foundation
-
-- UUID custom users; ADMIN/MEMBER roles; centralized E.164 phone normalization; hashed initial six-digit PIN.
-- HttpOnly-cookie JWT access/refresh tokens, refresh replay detection, server-side device-session records, per-session revocation, blacklist-backed logout, throttling, temporary PIN lockout, and backend-enforced first-login PIN change.
-- Admin-only member creation (no registration route), activation/deactivation, session-revoking credential reset, and auditable lifecycle actions.
-- Integrity-constrained admin/member private conversations, participant authorization, cursor-paginated messages, authorized text/member/group/date/media-type search, sender/client UUID idempotency, edit/delete windows, controlled reactions, aggregate delivery/read states, and WebSocket message/receipt/change/typing events.
-- Admin-created groups with validated active membership, transactional add/remove membership, matching conversation authorization, configurable send permissions, archive support, and audit records.
-- Persistent notifications, user-scoped push-subscription APIs, durable push-delivery queue, retry/backoff, automatic invalid-subscription cleanup, and a locking-safe `push_worker` management command.
-- Authorized image/video/voice upload and download endpoints, signature/extension/size validation, disk-backed large uploads, random private storage keys, image verification, ffprobe duration/codec/dimension checks, media receipts/notifications/WebSocket events, and private S3-compatible storage.
-- Resumable S3-compatible multipart upload sessions with signed part URLs, size verification, cancellation, idempotent client IDs, private keys, and a durable finalizer that validates content before publishing a message.
-- Durable locking-safe media worker that streams originals to temporary disk, creates bounded WebP image derivatives and video posters with Pillow/FFmpeg, records processing state, and serves every variant through the same conversation authorization check.
-- Database-driven message/media/edit/delete/profile policies with bounded serializer validation, short-lived cache invalidation, and audit records for settings and branding changes.
-- Validated logo/favicon uploads with random private storage keys and controlled public proxy endpoints.
-- Safe public configuration allowlist, cookie-authentication CSRF enforcement and bootstrap endpoint, restricted CORS, CSP, Permissions-Policy, secure production cookie/header defaults, and normalized API errors.
-- Fail-closed production startup when a strong secret, MySQL-compatible database, Redis, or private object storage is missing.
-- Redis-backed multi-process presence with authorized contact scopes, connection counters, offline last-seen updates, and user privacy controls; local-memory presence is development-only.
-- Member profile preferences for theme, phone visibility, last-seen privacy, and push enablement.
-- Initial database migrations and automated authorization, group-permission, cross-conversation reply, idempotency, credential, media-IDOR, and upload tests.
-- Container deployment assets for ASGI API, MySQL, authenticated Redis, durable push worker and media worker, plus liveness/readiness probes.
-
-## Local development
-
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env                 # export values with your preferred env loader
-export DEBUG=True SECRET_KEY='dev-only-change-me'
-python manage.py makemigrations
-python manage.py migrate
-python manage.py createsuperuser
-uvicorn config.asgi:application --host 0.0.0.0 --port 8000
-python manage.py push_worker              # separate durable push worker
-python manage.py finalize_uploads          # validates completed direct uploads
-python manage.py media_worker             # image/video derivative worker
-pytest
-```
-
-Use an international phone number when `createsuperuser` asks for the username. Never ship a predefined administrator.
-
-## Production topology
-
-Static frontend → HTTPS reverse proxy → ASGI workers → independent MySQL 8 database + Redis + private S3-compatible bucket. Run migrations before switching traffic. Use `uvicorn` workers behind Gunicorn or Daphne. Redis is mandatory with multiple ASGI processes; the in-memory layer is development-only.
-
-Set a unique `SECRET_KEY`, database credentials, exact `ALLOWED_HOSTS`, `CORS_ALLOWED_ORIGINS`, `CSRF_TRUSTED_ORIGINS`, Redis URL, private storage credentials and VAPID keys per deployment. Install FFmpeg/ffprobe on API and media-worker hosts. Never share a database, bucket or credential set between organizations.
-
-## API
-
-- `GET /api/auth/csrf/`, `/api/me/`, `/api/auth/sessions/`; `POST /api/auth/login/`, `/logout/`, `/refresh/`, `/change-pin/`; `DELETE /api/auth/sessions/{uuid}/`
-- `/api/members/` plus `/{uuid}/activate/`, `/deactivate/`, and `/reset-pin/` (administrator only)
-- `/api/conversations/`; `/api/conversations/{uuid}/messages/`; `/read/`
-- `/api/messages/search/`; `/api/messages/{uuid}/`; `/api/messages/{uuid}/reaction/`
-- `/api/groups/`; `/api/groups/{uuid}/members/`; `/api/groups/{uuid}/leave/`; `/api/groups/{uuid}/archive/`
-- `GET /api/security/` and `GET /api/audit/` with administrator-only filtering
-- `GET /api/unread/` for authoritative global and per-conversation unread counts
-- `POST /api/media/`; `GET /api/media/{attachment_uuid}/`
-- `/api/uploads/`; `/api/uploads/{uuid}/part/`; `/complete/`; abort/status via `/api/uploads/{uuid}/`
-- `/api/notifications/`; `/api/notifications/read/`; `/api/push/`
-- `GET/PATCH /api/settings/`; `POST /api/settings/branding/`; `GET /api/audit/` (administrator only)
-- `GET /api/public/config/`; `GET /api/public/branding/logo/`; `/favicon/`
-- WebSockets: `/ws/conversations/{uuid}/` and `/ws/presence/`, authenticated by an active access-cookie device session.
-
-Responses use `{success,message,data}` or `{success,message,code,errors}`. Access cookies are short lived. A frontend should call refresh with credentials included and keep tokens out of JavaScript storage.
-
-## Media and push
-
-The models reserve private storage keys rather than public URLs. Production media endpoints must issue short-lived signed URLs only after conversation authorization. Upload completion should validate signatures with libmagic/Pillow/ffprobe and verify object metadata. Push subscriptions are persisted; delivery workers should use VAPID environment secrets and deactivate HTTP 404/410 subscriptions.
-
-## Security notes
-
-PINs are only passed to Django's password hasher. They must never be logged. UUIDs do not replace object authorization. Conversation querysets and WebSockets both verify membership. Use TLS, Redis authentication, private object ACLs, request-size limits at the proxy, malware scanning, CSP at the frontend, database backups, key rotation and centralized redacted logs.
-
-## Current scope boundary
-
-This repository is a production-oriented core, not a claim that every item in the supplied 80-section specification is finished. Before launch, complete and independently review: resumable/direct-to-object-storage uploads, generated video posters and image derivatives, presence/last-seen privacy controls, richer profile/settings controls, notification aggregation, deployment manifests, operational monitoring, backup/restore drills, malware scanning, migrations review, and the complete acceptance/security/load-test matrix.
-
-
-# NEXORA — Frontend
-
-Pure HTML + CSS + vanilla JavaScript (ES modules). No frameworks, no build step,
-no bundler, no runtime dependencies. It is a static bundle that talks to the
-Django / DRF / Channels backend over REST and WebSockets.
+* **Backend** — Django 5 + Django REST Framework + Channels (ASGI), MySQL 8,
+  Redis, S3-compatible private object storage.
+* **Frontend** — vanilla JavaScript ES modules, no build step, no framework,
+  installable as a PWA.
+* **Authentication** — phone number + six-digit PIN, delivered as HttpOnly
+  cookies carrying rotating JWTs bound to revocable device sessions.
+* **No email architecture.** NEXORA never sends email. There is no SMTP
+  configuration, no verification flow and no email-based password reset. An
+  email address exists only as an optional contact field.
 
 ---
 
-## 1. Layout
+## 1. Two kinds of configuration
+
+This distinction runs through the whole codebase and is the single most
+important thing to understand before changing anything.
+
+| | **Environment configuration** | **Database configuration** |
+|---|---|---|
+| Lives in | `backend/.env` (and the real process environment) | the `PlatformConfiguration` row |
+| Read by | `backend/config/env.py` → `backend/config/settings.py`, **once** | `apps.platform_settings.services.messaging_policy()` |
+| Contains | `SECRET_KEY`, database, Redis, storage credentials, VAPID keys, allowed hosts/origins, hard ceilings | organization name, branding, colours, policy text, messaging limits, feature switches, group defaults, security policy |
+| Changed by | a deployment engineer, with a restart | the administrator, in **Settings**, effective immediately |
+| Exposed to the frontend | **never** | via `GET /api/public/config/`, through an explicit allow-list |
+
+Application code never calls `os.getenv` or `os.environ.get`. Every value is
+read through `from decouple import config` in `config/env.py`, and everything
+else reads `django.conf.settings`. `config/env.py` is the only module permitted
+to touch the environment.
+
+Values set in the admin Settings screen genuinely change backend behaviour —
+lowering `max_message_length` causes the API to reject longer messages;
+turning off reactions makes `POST /api/messages/{id}/reactions/` return 403;
+disabling previews changes the text stored in notifications and pushed to
+devices. They are not cosmetic.
+
+---
+
+## 2. Requirements
+
+| | Development | Production |
+|---|---|---|
+| Python | 3.11+ | 3.11+ |
+| Database | SQLite (automatic fallback) | **MySQL 8+ (required)** |
+| Redis | optional (in-memory fallbacks) | **required** |
+| Object storage | local filesystem | **S3-compatible bucket (required)** |
+| `ffmpeg` / `ffprobe` | optional | **required for video posters and duration probing** |
+
+Production start-up refuses to boot without `SECRET_KEY`, `ALLOWED_HOSTS`,
+`REDIS_URL`, a non-SQLite database, `STORAGE_BUCKET` and at least one
+CORS/CSRF origin. That is deliberate: a misconfigured deployment should fail
+loudly, not quietly serve an insecure app.
+
+---
+
+## 3. Local development
+
+### 3.1 Backend
+
+```bash
+cd backend
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+cp .env.example .env          # then edit SECRET_KEY at minimum
+python manage.py migrate
+python manage.py createsuperuser --phone +2348030000000   # the first administrator
+
+python -m uvicorn config.asgi:application --reload --host 0.0.0.0 --port 8000
+```
+
+With `DATABASE_URL` and `DATABASE_NAME` empty and `DEBUG=True`, SQLite is used
+automatically. With `REDIS_URL` empty, Channels uses the in-memory layer and
+the cache uses local memory — fine for one process, **not** for production.
+
+Background workers (optional locally, required in production):
+
+```bash
+python manage.py media_worker     # image/video/voice derivatives
+python manage.py push_worker      # durable web-push delivery
+```
+
+Both accept `--once` to drain the queue and exit, and can be run several times
+in parallel: they claim work with `SELECT … FOR UPDATE SKIP LOCKED`.
+
+### 3.2 Frontend
+
+The frontend is static. Serve `frontend/` with anything:
+
+```bash
+cd frontend
+python -m http.server 5500        # or: npx serve -l 5500, or VS Code Live Server
+```
+
+Then open <http://127.0.0.1:5500/login.html>.
+
+**No file needs editing to point the frontend at the backend.**
+`frontend/assets/js/config.js` resolves the API origin in this order:
+
+1. `window.NEXORA_RUNTIME = { apiBase: '…' }` (or a `<script id="nexora-config" type="application/json">` blob) injected by the deployment;
+2. `<meta name="nexora-api-base" content="https://api.example.org">`;
+3. **local-dev detection** — a page served from `localhost`/`127.0.0.1` on a
+   known static-server port (5500, 5501, 8080, 3000, 5173 …) assumes Django is
+   on **the same hostname**, port 8000;
+4. **same origin** — the recommended production layout.
+
+Step 3 preserves the hostname on purpose. Browsers scope cookies by host and
+ignore the port, so a page on `http://127.0.0.1:5500` must call
+`http://127.0.0.1:8000` — not `localhost:8000` — or the session and CSRF
+cookies are never sent. Use `127.0.0.1` on both sides, or `localhost` on both
+sides. Verified working on `127.0.0.1:5500`, `localhost:5500` and
+`localhost:8080`.
+
+The WebSocket origin is always derived from the resolved API origin by swapping
+the scheme (`http→ws`, `https→wss`), so TLS can never be mismatched.
+
+### 3.3 Everything on one origin (optional)
+
+`python devserver.py` serves the static frontend and the Django ASGI app from
+port 5500, mirroring the production reverse-proxy layout. It is a convenience
+for demos and same-origin testing; nothing in the application depends on it.
+
+### 3.4 First sign-in
+
+The administrator creates members; members never self-register. A new member's
+initial PIN is **the first six digits of their normalized phone number**
+(`+2348012345678` → `234801`). It is never returned by the API and never
+logged. The member must change it before any other endpoint will respond — the
+API returns `403 PERMISSION_DENIED` until they do.
+
+---
+
+## 4. Production deployment
+
+### 4.1 Same origin (recommended)
+
+One reverse proxy (nginx/Caddy) serves the static `frontend/` directory and
+forwards `/api/`, `/ws/`, `/static/` and `/health/` to the ASGI server. No CORS
+is involved, cookies stay `SameSite=Lax`, and `config.js` resolves to the same
+origin with no configuration at all.
+
+```
+COOKIE_SAMESITE=Lax
+COOKIE_SECURE=True
+CSRF_TRUSTED_ORIGINS=https://app.example.org
+```
+
+### 4.2 Separate origins
+
+The frontend is on `https://app.example.org`, the API on
+`https://api.example.org`:
+
+```
+# backend/.env
+ALLOWED_HOSTS=api.example.org
+CORS_ALLOWED_ORIGINS=https://app.example.org
+CSRF_TRUSTED_ORIGINS=https://app.example.org,https://api.example.org
+COOKIE_SAMESITE=None          # required for cross-site cookies
+COOKIE_SECURE=True            # enforced: SameSite=None without Secure is refused
+```
+
+```html
+<!-- every page in frontend/ -->
+<meta name="nexora-api-base" content="https://api.example.org">
+```
+
+`CORS_ALLOW_ALL_ORIGINS` is never enabled, in any mode.
+
+### 4.3 Running
+
+```bash
+python -m uvicorn config.asgi:application --host 0.0.0.0 --port 8000 \
+  --workers 4 --proxy-headers --forwarded-allow-ips='*'
+python manage.py media_worker
+python manage.py push_worker
+```
+
+Both HTTP and WebSocket traffic go through the ASGI app; do not run the WSGI
+entry point if you want realtime.
+
+### 4.4 Web push keys
+
+```bash
+python -c "from py_vapid import Vapid01; v=Vapid01(); v.generate_keys(); print(v.public_key, v.private_key)"
+```
+
+Set `PUSH_PUBLIC_KEY`, `PUSH_PRIVATE_KEY` and `PUSH_CONTACT`. The public key is
+served to browsers through `/api/public/config/`; the private key never leaves
+the backend and never appears in any response or log.
+
+---
+
+## 5. Architecture
 
 ```
 frontend/
-├── index.html          session probe → admin.html or chat.html
-├── login.html          sign-in + enforced first-login PIN change
-├── chat.html           conversation list + thread + composer (both roles)
-├── groups.html         group directory, creation, group information
-├── members.html        admin member management
-├── admin.html          admin dashboard
-├── settings.html       full settings surface (role-aware)
-├── profile.html        personal subset of settings
-├── 403 / 404 / 500 / offline.html
-├── manifest.webmanifest
-├── sw.js               service worker (shell cache, push, notification click)
-├── robots.txt
-└── assets/
-    ├── css/  variables · themes · typography · main · components · chat · admin · responsive
-    ├── js/   api · auth · websocket · messages · chat · media · voice · presence
-    │         notifications · push · members · groups · settings · navigation
-    │         theme · pin · ui · utils
-    └── images/ icon-192 · icon-512 · icon-maskable-512
+  assets/js/config.js   runtime configuration — the ONLY place origins are resolved
+  assets/js/api.js      the ONLY HTTP layer: CSRF, credentials, timeouts,
+                        retries, refresh-on-401, normalized errors, uploads
+  assets/js/websocket.js single multiplexed socket with bounded backoff
+  sw.js                 PWA shell cache; /api/ is always network-only
+backend/
+  config/env.py         the ONLY module that reads the environment
+  config/settings.py    all configuration, read once, through decouple
+  apps/accounts/        users, PINs, device sessions, profile, member admin
+  apps/conversations/   conversations, messages, receipts, reactions,
+                        realtime.py (every server event) and consumers.py
+  apps/media/           validation, private storage, signed URLs, derivatives
+  apps/groups/          groups, membership, per-group permission flags
+  apps/notifications/   persistent notifications + durable web push
+  apps/platform_settings/ the organization's database configuration
+  apps/audit/ apps/security/  audit trail and security event log
 ```
 
-Every module has one responsibility. No file is a catch-all, and there are no
-circular imports (`ui` and `utils` are leaves; `api` depends only on `utils`).
+### 5.1 Response envelope
 
----
-
-## 2. Deployment configuration
-
-Configuration is read at load time from `<meta>` tags (or `window.NEXORA_RUNTIME`
-if you prefer to inject it):
-
-| Meta name | Default | Meaning |
-|---|---|---|
-| `nexora-api-base` | `""` (same origin) | Backend origin, e.g. `https://api.example.org` |
-| `nexora-api-prefix` | `/api` | API path prefix |
-| `nexora-auth-mode` | `cookie` | `cookie` (HttpOnly session — recommended) or `bearer` |
-
-**Recommended deployment:** serve this directory from the same origin as Django
-(reverse proxy `/api/` and `/ws/` to the backend). That keeps the session cookie
-`SameSite=Lax`, avoids CORS entirely, and lets the service worker cache the shell.
-
-If you serve it cross-origin, the backend must send
-`Access-Control-Allow-Credentials: true` and an explicit
-`Access-Control-Allow-Origin`, and the session cookie must be
-`SameSite=None; Secure`.
-
-### Authentication transport
-
-* **cookie mode (default).** The browser holds an HttpOnly session cookie.
-  Nothing is duplicated into `localStorage`. CSRF is read from the `csrftoken`
-  cookie and sent as `X-CSRFToken` on unsafe methods.
-* **bearer mode.** The access token is kept **in memory only** (`api.js`
-  `tokenStore`) and is never persisted. A page reload re-establishes the session
-  via `POST /api/auth/refresh/` using the refresh cookie.
-
-Concurrent 401s trigger exactly one de-duplicated refresh attempt; if it fails,
-an `unauthorized` event is emitted and the user is routed to sign-in.
-
----
-
-## 3. Backend contract
-
-All paths are relative to the API prefix. Responses may use the normalized
-envelope `{ success, message, data }` **or** plain DRF payloads — `api.js`
-unwraps both. Errors are normalized into `ApiError { status, code, message,
-errors, retryAfter }`.
-
-### Auth & identity
-```
-POST   /auth/login/            { identifier, phone, pin } → { user, access? }
-POST   /auth/logout/
-POST   /auth/refresh/
-POST   /auth/change-pin/       { current_pin?, new_pin, confirm_pin }
-GET    /auth/sessions/         → [{ id, platform, browser, last_active_at, is_current }]
-DELETE /auth/sessions/{id}/
-GET    /me/                    → user  (see flags below)
-PATCH  /me/                    { display_name, phone_visible, presence_visible }
-POST   /me/avatar/             multipart
-GET    /me/preferences/  ·  PATCH /me/preferences/
-```
-
-The `/me/` payload drives role-based UX:
+Every JSON response has one shape, enforced by
+`apps.core.renderers.EnvelopeJSONRenderer`:
 
 ```jsonc
-{
-  "id": "…", "display_name": "…", "phone": "…", "login_identifier": "…",
-  "is_admin": true,                 // or "role": "admin" | "member"
-  "must_change_pin": false,         // or requires_pin_change / is_default_pin
-  "avatar_url": "…", "phone_visible": true, "presence_visible": true,
-  "editable_fields": ["display_name", "avatar", "phone_visible"]
-}
+{ "success": true,  "message": "Message sent", "data": { … } }
+{ "success": false, "message": "…", "code": "PERMISSION_DENIED", "errors": {} }
 ```
 
-### Public configuration (drives all branding)
-```
-GET /public/config/
-```
-```jsonc
-{
-  "app_name": "…", "app_short_name": "…", "organization_name": "…",
-  "logo_url": "…", "favicon_url": "…",
-  "primary_color": "#33526E", "secondary_color": "#1E7A4E",
-  "contact_phone": "…", "contact_email": "…", "address": "…", "website": "…",
-  "about": "…", "support": "…",
-  "policies": [{ "key": "privacy", "title": "Privacy Policy", "body": "…", "url": null }],
-  "limits":   { "max_message_length": 4000, "max_image_size": 10485760,
-                "max_video_size": 104857600, "max_voice_duration": 300,
-                "allowed_image_types": [...], "allowed_video_types": [...] },
-  "features": { "replies": true, "reactions": false, "message_editing": false,
-                "delete_for_everyone": true, "voice_notes": true,
-                "video_messages": true, "presence": true, "typing": true,
-                "push": true, "member_leave_group": false }
-}
-```
-Nothing about the organization is hard-coded. `features` gates which controls
-are offered; `limits` gates client-side validation. Both are advisory — the
-backend still enforces them.
+Lists are cursor-paginated: `data: { next, previous, results }`.
 
-### Conversations, messages, groups, media
-```
-GET  /conversations/                      ?search= &type= &unread= &cursor= &limit=
-GET  /conversations/unread-summary/
-GET  /conversations/{id}/
-GET  /conversations/{id}/messages/        ?limit= &cursor=   (newest page first)
-POST /conversations/{id}/messages/        JSON text, or multipart for media
-POST /conversations/{id}/read/            { last_message_id }
-POST /conversations/{id}/typing/          { typing }          (WS preferred)
+### 5.2 Authorization model
 
-GET  /messages/{id}/   ·  PATCH /messages/{id}/   ·  DELETE /messages/{id}/?scope=self|everyone
-POST /messages/{id}/reactions/  ·  DELETE /messages/{id}/reactions/?reaction=
+* An administrator may message any member privately.
+* A member has exactly one private conversation: with an administrator.
+* **Member ↔ member private conversations cannot be created**, by any route.
+* Members interact with each other only inside groups an administrator put
+  them in, and only as far as that group's flags allow (`members_can_send`,
+  `members_can_send_media`, `members_can_send_voice`, `members_can_reply`,
+  `members_can_react`, `members_can_view_members`, `members_can_leave`).
+* Every conversation, message and attachment lookup is scoped to the caller's
+  participation. An unauthorized UUID returns **404**, not 403, so identifiers
+  cannot be probed.
 
-GET/POST /groups/            ·  GET/PATCH/DELETE /groups/{id}/
-POST /groups/{id}/archive/   ·  /unarchive/   ·  /leave/
-GET/POST /groups/{id}/members/  ·  DELETE /groups/{id}/members/{memberId}/
-POST /groups/{id}/image/     multipart
+### 5.3 Realtime
 
-GET  /media/{id}/url/        → { url, thumbnail_url, expires_at }   (signed URLs)
+One multiplexed socket per tab: `/ws/app/`.
+(`/ws/conversations/{uuid}/` remains for single-thread clients.)
 
-GET  /members/ ?search= &is_active= &selectable=   ·  POST /members/
-GET/PATCH /members/{id}/  ·  POST /members/{id}/activate|deactivate|reset-pin/
-GET  /members/{id}/activity/  ·  GET /members/{id}/conversation/
+Client → server: `conversation.join`, `conversation.leave`, `typing`,
+`message.read`, `message.delivered`, `presence.ping`, `ping`.
 
-GET  /notifications/  ·  POST /notifications/read/  { ids | all }
-GET  /push/  → { vapid_public_key }  ·  POST /push/subscribe/  ·  /unsubscribe/
-GET/PATCH /settings/  ·  POST /settings/assets/{logo|favicon}/  ·  /settings/policies/
-GET  /dashboard/  ·  GET /audit/  ·  GET /security/events/  ·  GET/PATCH /security/
-GET  /search/
-```
-
-**Message payload** — the frontend accepts flexible field names and normalizes:
-
-```jsonc
-{
-  "id": "…", "client_id": "…",           // client_id enables idempotent retries
-  "conversation_id": "…",
-  "kind": "text|image|video|voice|file|system",
-  "text": "…", "caption": "…",
-  "created_at": "…", "edited_at": null, "is_deleted": false,
-  "status": "sent|delivered|read",        // backend-authoritative
-  "sender": { "id": "…", "display_name": "…", "avatar_url": "…" },
-  "media": { "id": "…", "url": "…", "thumbnail_url": "…", "mime_type": "…",
-             "size": 0, "width": 0, "height": 0, "duration": 0,
-             "status": "ready|processing", "expires_at": null },
-  "reply_to": { "id": "…", "preview": "…", "sender": {...} },
-  "reactions": [{ "reaction": "👍", "count": 2, "is_mine": true }],
-  "can_edit": false, "can_delete_for_self": true, "can_delete_for_everyone": false
-}
-```
-
-> **`client_id` is required for duplicate protection.** The client sends the
-> same `client_id` for the original attempt and every retry. The backend must
-> treat a repeat as idempotent and echo `client_id` back in the created message.
-
-### WebSocket
-Endpoint: `/ws/app/` on the API origin (`ws://`/`wss://` derived automatically).
-In bearer mode a short-lived `?token=` query parameter is appended.
-
-Frames are `{ "type": "...", ...payload }`. Client → server:
-`conversation.join`, `conversation.leave`, `typing`, `message.read`,
-`message.delivered`, `presence.ping`, `ping`.
-
-Server → client: `message.new`, `message.updated`, `message.edited`,
+Server → client: `connection.ready`, `conversation.joined`,
+`conversation.denied`, `message.new`, `message.updated`, `message.edited`,
 `message.deleted`, `message.delivered`, `message.read`, `message.reaction`,
-`media.ready`, `typing` / `typing.start` / `typing.stop`, `presence.update` /
-`presence.online` / `presence.offline`, `conversation.created` /
-`conversation.updated`, `conversation.unread`, `unread.update`,
-`group.membership`, `group.removed`, `notification.new`, `notification.read`,
-`dashboard.update`, `pong`, and `auth.error` (or close code `4003`) for
-rejected authentication.
+`typing.start`, `typing.stop`, `presence.online`, `presence.offline`,
+`presence.update`, `unread.update`, `conversation.unread`,
+`conversation.created`, `conversation.updated`, `group.membership`,
+`group.removed`, `notification.new`, `notification.read`, `media.ready`,
+`auth.error`, `pong`.
+
+Every one of them is emitted from `apps/conversations/realtime.py` and nowhere
+else. A socket is closed when the access token that opened it expires
+(code 4401); the client refreshes over HTTP and reconnects with bounded
+exponential backoff and jitter. Authentication failures close with 4003 and
+are not retried.
+
+### 5.4 Media
+
+Upload is a single multipart `POST /api/conversations/{id}/messages/` carrying
+`kind`, `client_id`, `file` and optionally `caption`, `reply_to`, `duration`,
+`poster`. Message, attachment, receipts and the realtime event are created in
+one transaction. A resumable chunked API (`/api/uploads/…`) exists for very
+large files.
+
+Validation order: declared size → **content signature (magic bytes)** →
+declared MIME must agree → extension must match the signature → structural
+decode and pixel limits for images → probed duration for audio/video. A file
+is stored under a generated, unguessable key; the client's filename never
+touches the filesystem. Executables, archives and PDFs are rejected outright.
+
+Files are private. `GET /api/media/{uuid}/` authorizes the caller and then
+streams the object with HTTP range support; `GET /api/media/{uuid}/url/`
+authorizes first and then issues a short-lived signed URL (S3-compatible
+storage only). Derivatives — thumbnail, optimized WebP, video poster — are
+produced by `media_worker` out of band; a derivative failure never destroys
+the original, and `media.ready` tells connected clients when they exist.
 
 ---
 
-## 4. Correctness guarantees
-
-**Delivery status is never faked.** Local states are only `sending`,
-`unconfirmed` and `failed`. `sent` / `delivered` / `read` come exclusively from
-the backend. If a send times out or the connection drops mid-flight, the message
-shows *"Message status is being confirmed"* and a reconciliation pass re-fetches
-the newest page; `client_id` matching either promotes the message to its real
-server state or marks it genuinely failed with a retry action.
-
-**Realtime events are reconciled, not trusted blindly.** Every handler is
-idempotent, status only ever moves forward (`sending < unconfirmed < sent <
-delivered < read`), and out-of-order inserts are placed by timestamp. On
-reconnect, every open conversation is reconciled against REST.
-
-**Rendering is XSS-safe.** No user or backend string is ever assigned to
-`innerHTML`; `utils.el()` actively throws if you pass an `html` property.
-Message bodies go through `renderTextWithLinks()`, which emits text nodes and
-only linkifies scheme-qualified `http(s)` URLs.
-
-**Branding can't inject CSS.** Colours are applied only after strict
-`#RRGGBB` validation, into CSS custom properties. Logo/favicon URLs must resolve
-to `http(s)` and have graceful fallbacks.
-
-**Memory and DOM are bounded.** Each conversation retains at most 300 messages;
-conversation stores are held in a 12-entry LRU. Nothing renders thousands of
-nodes. Scroll position is preserved exactly when older pages load.
-
-**No polling.** Unread counts come from `unread-summary` plus WebSocket deltas,
-refreshed on reconnect and on tab focus only.
-
-**Media is lazy.** Images and video posters load via `IntersectionObserver`;
-video files are never fetched to render a list — only on explicit playback.
-Voice notes fetch audio only on first play. Expiring signed URLs are
-re-resolved automatically on load failure.
-
----
-
-## 5. Security posture
-
-* Role checks in the UI are **UX only**. Hidden buttons are not a control —
-  every action is authorized server-side, and 403 responses are surfaced.
-* PINs are masked, never logged, never stored, and the input is wiped after
-  submission. Sign-in failures return a deliberately generic message so account
-  existence is not disclosed.
-* The service worker **never** caches `/api/` responses, private media, or
-  anything authenticated. Only the public application shell and static assets
-  are cached (`network-only` for API, `stale-while-revalidate` for assets,
-  `network-first + offline.html` for navigations).
-* Notification click routing accepts only same-scope relative paths, focuses an
-  existing window when possible, and re-authenticates on cold start — a
-  notification URL can never expose conversation data to an unauthenticated
-  session.
-* Push content is composed server-side. When previews are disabled the backend
-  must send a generic body; the service worker never invents message content.
-* `localStorage` holds only non-sensitive preferences (theme, collapsed nav,
-  last-opened conversation id, cached **public** branding).
-
----
-
-## 6. Accessibility
-
-Semantic landmarks and skip links on every page · visible `:focus-visible`
-outlines that are never removed · `aria-label` on every icon-only control ·
-`role="log"` + `aria-live` on the message thread · polite/assertive live regions
-for status announcements (`ui.announce`) · focus trapping and restoration in
-modals, sheets and the lightbox · keyboard-operable voice scrubber
-(arrows/Home/End/Space) · six-digit PIN entry with per-cell labels, arrow and
-backspace navigation, and paste distribution · status conveyed by icon + text,
-never colour alone · `prefers-reduced-motion` and `prefers-contrast` honoured.
-
----
-
-## 7. Responsive behaviour
-
-Verified breakpoints: 320 · 360 · 375 · 390 · 393 · 414 · 430 · 480 · 600 · 768
-· 1024 · 1280 · 1440+.
-
-* ≤767px — single pane: list ⇄ full-screen thread with back navigation, primary
-  nav becomes a bottom bar (hidden while a thread is open), modals become bottom
-  sheets, tables reflow into stacked labelled rows.
-* 768–1023px — icon-only nav rail, two-pane chat.
-* ≥1024px — full sidebar, optional details panel (overlay drawer below 1280px).
-* Safe-area insets applied to headers, composer, nav and sheets; the composer
-  uses a ≥16px font so iOS does not zoom on focus, and
-  `interactive-widget=resizes-content` keeps it above the keyboard.
-
-There is **no** `overflow-x: hidden` anywhere. Overflow is prevented at the
-source with `min-width: 0` on flex/grid children, `overflow-wrap: anywhere` on
-user content, and constrained media widths.
-
----
-
-## 8. PWA
-
-* `manifest.webmanifest` with maskable icon and shortcuts. For fully dynamic
-  PWA branding, serve this file from Django and inject `name` / `short_name` /
-  `theme_color` / `icons` from the same configuration as `/public/config/`; the
-  static file here is the fallback. Document metadata (`theme-color`,
-  `application-name`, `apple-mobile-web-app-title`, favicon) is always updated
-  dynamically at runtime.
-* Updates are non-destructive: a new worker installs but does not activate until
-  the user accepts a "Reload" toast, which sends `NEXORA_SKIP_WAITING`.
-* `navigator.setAppBadge()` reflects unread state where supported, with a silent
-  fallback elsewhere; the backend's `unread_total` on a push payload keeps the
-  badge accurate while the app is closed.
-
----
-
-## 9. Running locally
+## 6. Tests
 
 ```bash
-python3 -m http.server 8080 --directory frontend
+cd backend
+DJANGO_ENV=test python -m pytest        # in-memory SQLite, no services needed
 ```
 
-Point `nexora-api-base` at your Django dev server, or (better) run both behind
-one reverse proxy so cookies and the service worker share an origin.
+96 tests covering authentication and lockout, CSRF, authorization and IDOR,
+messaging idempotency/ordering/receipts, media validation and streaming,
+WebSocket authorization and every emitted event, push subscription and
+aggregation, database-driven settings, and — in
+`tests/test_frontend_contract.py` — the frontend↔backend contract itself:
+every endpoint `api.js` calls is asserted against the real URL map, every
+socket event the UI listens for is asserted against the backend source, and
+the frontend is scanned for raw `fetch`, hardcoded origins, `innerHTML`/`eval`
+sinks and sensitive values in web storage.
 
-Service workers and `getUserMedia` (voice notes) require a secure context:
-`https://` or `http://localhost`.
+`DJANGO_ENV=test` selects in-memory SQLite and disables global throttling;
+`backend/conftest.py` sets it automatically.
+
+---
+
+## 7. Security posture
+
+* Six-digit PIN, hashed by Django's password hasher; never logged, never
+  returned, never stored in the browser.
+* Forced PIN change on first sign-in and after an administrative reset;
+  changing a PIN revokes every session.
+* Failed-attempt lockout and throttling, both administrator-configurable.
+  Sign-in responses are identical for unknown phone, wrong PIN, locked and
+  deactivated accounts — no account enumeration.
+* Tokens live in HttpOnly cookies; the refresh cookie is scoped to
+  `/api/auth/` and rotates on every use, with the old token blacklisted.
+* CSRF is enforced on every unsafe request **including sign-in** (DRF exempts
+  views from the CSRF middleware, so the check is explicit). The frontend
+  bootstraps the cookie from `/api/auth/csrf/` before its first unsafe call.
+* Security headers: HSTS, CSP, `nosniff`, `Referrer-Policy`,
+  `Permissions-Policy`, `X-Frame-Options: DENY`, Secure + SameSite cookies.
+* No `innerHTML`, no `eval`, no `new Function` in frontend code; all
+  user-generated text is inserted as `textContent`.
+* The service worker never caches anything under `/api/` — neither
+  authenticated JSON nor private media — so nothing survives sign-out in a
+  shared cache.
+* Audit and security logs strip any key resembling a PIN, password, token or
+  secret before writing.
+
+---
+
+## 8. Accessibility and responsiveness
+
+Layouts are fluid from 320 px upward with breakpoints at 360, 430, 768, 1024,
+1280 and 1440 px, plus coarse-pointer and short-landscape handling. There is no
+global `overflow-x: hidden`; the only horizontal-overflow rules are on named
+scroll containers that also set `overflow-y: auto`. Interactive elements are
+real semantic controls with visible focus, keyboard operation, ARIA labelling
+and live regions, and `prefers-reduced-motion` is respected.

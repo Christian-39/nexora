@@ -1,36 +1,196 @@
+"""
+NEXORA — conversation/message business logic.
+
+Authorization model (enforced here, never in the UI):
+  * A member may hold exactly one private conversation: with an administrator.
+  * A member may hold group conversations only where an administrator has
+    explicitly granted membership.
+  * Member ↔ member private conversations are impossible to create.
+"""
+
+from __future__ import annotations
+
 from django.db import transaction
-from django.db.models import Q
 from django.utils import timezone
-from rest_framework.exceptions import PermissionDenied,ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError
+
 from apps.accounts.models import User
-from .models import *
-def can_access(user,c):return c.is_active and c.participants.filter(user=user,is_active=True).exists()
+
+from .models import Conversation, ConversationParticipant, Message, MessageReceipt
+
+
+def can_access(user, conversation) -> bool:
+    if not getattr(user, "is_authenticated", False) or conversation is None:
+        return False
+    return (
+        conversation.is_active
+        and conversation.participants.filter(user=user, is_active=True).exists()
+    )
+
+
 @transaction.atomic
-def private_conversation(actor,target):
- if actor.role=='MEMBER' and target.role!='ADMIN':raise PermissionDenied()
- if actor.role=='ADMIN' and target.role!='MEMBER':raise ValidationError('Private chats require one admin and one member.')
- admin=actor if actor.role=='ADMIN' else target;member=target if actor.role=='ADMIN' else actor
- c,_=Conversation.objects.get_or_create(kind=Conversation.Kind.PRIVATE,admin=admin,member=member)
- ConversationParticipant.objects.bulk_create([ConversationParticipant(conversation=c,user=admin),ConversationParticipant(conversation=c,user=member)],ignore_conflicts=True);return c
+def private_conversation(actor, target):
+    """Get-or-create the unique admin↔member private conversation."""
+    if actor.id == target.id:
+        raise ValidationError("You cannot start a conversation with yourself.")
+    if actor.role == "MEMBER" and target.role != "ADMIN":
+        # A member may only ever reach an administrator.
+        raise PermissionDenied("Members can only message an administrator.")
+    if actor.role == "ADMIN" and target.role != "MEMBER":
+        raise ValidationError("Private chats require one administrator and one member.")
+
+    admin = actor if actor.role == "ADMIN" else target
+    member = target if actor.role == "ADMIN" else actor
+
+    conversation, created = Conversation.objects.get_or_create(
+        kind=Conversation.Kind.PRIVATE, admin=admin, member=member
+    )
+    ConversationParticipant.objects.bulk_create(
+        [
+            ConversationParticipant(conversation=conversation, user=admin),
+            ConversationParticipant(conversation=conversation, user=member),
+        ],
+        ignore_conflicts=True,
+    )
+    ConversationParticipant.objects.filter(conversation=conversation).update(is_active=True)
+    if not conversation.is_active:
+        conversation.is_active = True
+        conversation.save(update_fields=["is_active", "updated_at"])
+    return conversation, created
+
+
+def _enforce_group_policy(user, conversation, *, kind, reply_to):
+    if conversation.kind != Conversation.Kind.GROUP or user.role != "MEMBER":
+        return
+    group = getattr(conversation, "group", None)
+    if group is None or not group.is_active:
+        raise PermissionDenied("This group is no longer available.")
+    if not group.members_can_send:
+        raise PermissionDenied("Members cannot send messages in this group.")
+    if kind == "IMAGE" and not group.members_can_send_media:
+        raise PermissionDenied("Members cannot send media in this group.")
+    if kind == "VIDEO" and not group.members_can_send_media:
+        raise PermissionDenied("Members cannot send media in this group.")
+    if kind == "VOICE" and not group.members_can_send_voice:
+        raise PermissionDenied("Members cannot send voice notes in this group.")
+    if reply_to and not group.members_can_reply:
+        raise PermissionDenied("Members cannot reply in this group.")
+
+
+def _enforce_platform_policy(kind, text, reply_to):
+    from apps.platform_settings.services import messaging_policy
+
+    policy = messaging_policy()
+    if kind == "TEXT":
+        if not (text or "").strip():
+            raise ValidationError({"text": "Message text is required."})
+        if len(text) > policy["max_message_length"]:
+            raise ValidationError({"text": "Message exceeds the configured length limit."})
+    if kind == "IMAGE" and not policy["allow_image_messages"]:
+        raise PermissionDenied("Image messages are disabled for this organization.")
+    if kind == "VIDEO" and not policy["allow_video_messages"]:
+        raise PermissionDenied("Video messages are disabled for this organization.")
+    if kind == "VOICE" and not policy["allow_voice_notes"]:
+        raise PermissionDenied("Voice notes are disabled for this organization.")
+    if reply_to and not policy["allow_replies"]:
+        raise PermissionDenied("Replies are disabled for this organization.")
+
+
 @transaction.atomic
-def send_message(*,user,conversation,client_id,text,type='TEXT',reply_to=None):
- if not can_access(user,conversation):raise PermissionDenied()
- if conversation.kind==Conversation.Kind.GROUP and user.role=='MEMBER':
-  group=conversation.group
-  if not group.members_can_send:raise PermissionDenied('Members cannot send in this group.')
-  if type in ('IMAGE','VIDEO') and not group.members_can_send_media:raise PermissionDenied('Members cannot send media in this group.')
-  if type=='VOICE' and not group.members_can_send_voice:raise PermissionDenied('Members cannot send voice notes in this group.')
-  if reply_to and not group.members_can_reply:raise PermissionDenied('Members cannot reply in this group.')
- if reply_to and reply_to.conversation_id!=conversation.id:raise ValidationError('Reply target must belong to this conversation.')
- if type=='TEXT' and not text.strip():raise ValidationError('Text is required.')
- from apps.platform_settings.services import messaging_policy
- if type=='TEXT' and len(text)>messaging_policy()['max_message_length']:raise ValidationError('Message exceeds the configured length limit.')
- m,created=Message.objects.get_or_create(sender=user,client_id=client_id,defaults={'conversation':conversation,'text':text,'type':type,'reply_to':reply_to})
- if not created and m.conversation_id!=conversation.id:raise ValidationError('Invalid idempotency key.')
- if created:
-  recipients=conversation.participants.filter(is_active=True).exclude(user=user).values_list('user_id',flat=True)
-  recipient_ids=list(recipients)
-  MessageReceipt.objects.bulk_create([MessageReceipt(message=m,recipient_id=x) for x in recipient_ids])
-  from apps.notifications.services import create_notification
-  for recipient_id in recipient_ids:create_notification(recipient_id=recipient_id,type='NEW_MESSAGE',title='New message',message='You have a new message.',related_id=m.id)
- return m,created
+def send_message(*, user, conversation, client_id, text="", type="TEXT", reply_to=None):
+    """Create a message idempotently.
+
+    ``client_id`` is generated by the client and unique per sender, so a retry
+    after a timeout returns the original message instead of duplicating it.
+    Returns ``(message, created)``.
+    """
+    kind = str(type or "TEXT").upper()
+    client_id = str(client_id).strip()
+    if not client_id or len(client_id) > 64:
+        raise ValidationError({"client_id": "A client_id of 1-64 characters is required."})
+
+    if not can_access(user, conversation):
+        raise PermissionDenied()
+
+    _enforce_group_policy(user, conversation, kind=kind, reply_to=reply_to)
+    _enforce_platform_policy(kind, text, reply_to)
+
+    if reply_to is not None and reply_to.conversation_id != conversation.id:
+        raise ValidationError({"reply_to": "The reply target must belong to this conversation."})
+
+    message, created = Message.objects.get_or_create(
+        sender=user,
+        client_id=client_id,
+        defaults={
+            "conversation": conversation,
+            "text": text if kind == "TEXT" else "",
+            "type": kind,
+            "reply_to": reply_to,
+        },
+    )
+    if not created:
+        if message.conversation_id != conversation.id:
+            raise ValidationError({"client_id": "This idempotency key belongs to another conversation."})
+        return message, False
+
+    recipient_ids = list(
+        conversation.participants.filter(is_active=True)
+        .exclude(user=user)
+        .values_list("user_id", flat=True)
+    )
+    MessageReceipt.objects.bulk_create(
+        [MessageReceipt(message=message, recipient_id=rid) for rid in recipient_ids]
+    )
+    Conversation.objects.filter(pk=conversation.pk).update(updated_at=timezone.now())
+
+    from apps.notifications.services import notify_new_message
+
+    notify_new_message(message=message, recipient_ids=recipient_ids)
+    return message, True
+
+
+def caption_for(message, caption: str) -> None:
+    """Attach a caption to a media message (stored in ``text``)."""
+    caption = (caption or "").strip()
+    if caption and not message.text:
+        from apps.platform_settings.services import messaging_policy
+
+        limit = messaging_policy()["max_message_length"]
+        message.text = caption[:limit]
+        message.save(update_fields=["text", "updated_at"])
+
+
+def recipients_of(message) -> list:
+    return list(
+        message.conversation.participants.filter(is_active=True)
+        .exclude(user_id=message.sender_id)
+        .values_list("user_id", flat=True)
+    )
+
+
+def unread_map(user) -> dict:
+    from django.db.models import Count
+
+    rows = (
+        MessageReceipt.objects.filter(
+            recipient=user, read_at__isnull=True, message__conversation__is_active=True
+        )
+        .values("message__conversation_id")
+        .annotate(count=Count("id"))
+        .order_by()
+    )
+    return {str(row["message__conversation_id"]): row["count"] for row in rows}
+
+
+def visible_members_for(user):
+    """Users this account may legitimately discover through search/listings."""
+    if user.role == "ADMIN":
+        return User.objects.filter(role="MEMBER")
+    # A member may only discover administrators and their own group peers.
+    return User.objects.filter(role="ADMIN", is_active=True) | User.objects.filter(
+        conversation_memberships__conversation__kind="GROUP",
+        conversation_memberships__is_active=True,
+        conversation_memberships__conversation__participants__user=user,
+        conversation_memberships__conversation__participants__is_active=True,
+        is_active=True,
+    )

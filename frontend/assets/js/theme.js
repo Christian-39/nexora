@@ -240,8 +240,71 @@ export function applyBranding(config = currentConfig) {
   const manifestName = safeText(config.pwa?.name) || brandName;
   document.querySelector('meta[name="application-name"]')?.setAttribute('content', manifestName);
   document.querySelector('meta[name="apple-mobile-web-app-title"]')?.setAttribute('content', safeText(config.app_short_name) || manifestName);
+  applyManifest(config, { name: manifestName, shortName: safeText(config.app_short_name) || manifestName, icon: faviconUrl || logoUrl });
 
   themeEvents.emit('branding', config);
+}
+
+/** Blob URL of the last generated manifest, revoked before it is replaced. */
+let generatedManifestUrl = null;
+
+/**
+ * Rewrite the installable-app metadata from the organization's configuration.
+ *
+ * The static manifest.webmanifest is the fallback shipped with the build; once
+ * the backend has told us the organization's real name, colours and logo, the
+ * manifest is regenerated so the installed PWA carries that branding instead
+ * of the generic one. Values are sanitised the same way as the rest of the
+ * branding: only plain text and validated #RRGGBB colours are used.
+ */
+function applyManifest(config, { name, shortName, icon }) {
+  const link = document.querySelector('link[rel="manifest"]');
+  if (!link) return;
+
+  const base = new URL(link.dataset.baseHref || link.getAttribute('href'), window.location.href);
+  if (!link.dataset.baseHref) link.dataset.baseHref = base.href;
+
+  const themeColor = isHexColor(config.pwa?.theme_color) ? config.pwa.theme_color : (isHexColor(config.primary_color) ? config.primary_color : null);
+  const backgroundColor = isHexColor(config.pwa?.background_color) ? config.pwa.background_color : null;
+  if (!name && !themeColor && !icon) return;
+
+  fetch(base.href, { credentials: 'omit', cache: 'no-store' })
+    .then((response) => (response.ok ? response.json() : {}))
+    .catch(() => ({}))
+    .then((template) => {
+      const manifest = { ...template };
+      // Resolve the template's relative URLs against the original location so
+      // the blob-hosted manifest still points at real files.
+      for (const key of ['start_url', 'scope']) {
+        if (manifest[key]) manifest[key] = new URL(manifest[key], base).href;
+      }
+      if (Array.isArray(manifest.icons)) {
+        manifest.icons = manifest.icons.map((entry) => ({ ...entry, src: new URL(entry.src, base).href }));
+      }
+      if (Array.isArray(manifest.shortcuts)) {
+        manifest.shortcuts = manifest.shortcuts.map((entry) => ({
+          ...entry,
+          url: entry.url ? new URL(entry.url, base).href : entry.url,
+          icons: Array.isArray(entry.icons) ? entry.icons.map((i) => ({ ...i, src: new URL(i.src, base).href })) : entry.icons,
+        }));
+      }
+
+      if (name) manifest.name = name;
+      if (shortName) manifest.short_name = shortName.slice(0, 24);
+      if (themeColor) manifest.theme_color = themeColor;
+      if (backgroundColor) manifest.background_color = backgroundColor;
+      if (icon && isSafeHttpUrl(icon)) {
+        manifest.icons = [{ src: icon, sizes: 'any', type: 'image/png', purpose: 'any' }, ...(manifest.icons || [])];
+      }
+
+      const blobUrl = URL.createObjectURL(new Blob([JSON.stringify(manifest)], { type: 'application/manifest+json' }));
+      if (generatedManifestUrl) URL.revokeObjectURL(generatedManifestUrl);
+      generatedManifestUrl = blobUrl;
+      link.setAttribute('href', blobUrl);
+    })
+    .catch(() => {
+      /* keep the static manifest */
+    });
 }
 
 function applyLogo(node, url, name) {

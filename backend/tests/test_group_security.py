@@ -1,19 +1,83 @@
-import uuid
+"""Group authorization: only the administrator controls groups and membership."""
+
 import pytest
-from apps.accounts.models import User
-from apps.conversations.services import private_conversation,send_message
-from apps.groups.models import Group,GroupMembership
-from apps.conversations.models import Conversation,ConversationParticipant
-from tests.test_api import authed
+
+from apps.conversations.services import private_conversation, send_message
+from tests.conftest import authed, client_id
+
+
 @pytest.mark.django_db
-def test_member_cannot_patch_group_or_cross_conversation_reply():
- admin=User.objects.create_superuser('+2348030000000','987654',full_name='Admin');a=User.objects.create_user('+2348012345678','123456',full_name='A',role='MEMBER');b=User.objects.create_user('+2348098765432','123456',full_name='B',role='MEMBER')
- gc=Conversation.objects.create(kind='GROUP',admin=admin);g=Group.objects.create(name='G',creator=admin,conversation=gc);GroupMembership.objects.create(group=g,user=a);ConversationParticipant.objects.bulk_create([ConversationParticipant(conversation=gc,user=admin),ConversationParticipant(conversation=gc,user=a)])
- assert authed(a).patch(f'/api/groups/{g.id}/',{'name':'Hacked'},format='json').status_code==403
- private=private_conversation(admin,b);other,_=send_message(user=admin,conversation=private,client_id=uuid.uuid4(),text='private')
- with pytest.raises(Exception):send_message(user=a,conversation=gc,client_id=uuid.uuid4(),text='bad reply',reply_to=other)
+def test_member_cannot_modify_group(group_thread, member_a):
+    assert authed(member_a).patch(f"/api/groups/{group_thread.id}/", {"name": "Hacked"}, format="json").status_code == 403
+
+
 @pytest.mark.django_db
-def test_member_cannot_react_when_disabled():
- admin=User.objects.create_superuser('+2348030000000','987654',full_name='Admin');a=User.objects.create_user('+2348012345678','123456',full_name='A',role='MEMBER')
- c=Conversation.objects.create(kind='GROUP',admin=admin);g=Group.objects.create(name='G',creator=admin,conversation=c,members_can_react=False);GroupMembership.objects.create(group=g,user=a);ConversationParticipant.objects.bulk_create([ConversationParticipant(conversation=c,user=admin),ConversationParticipant(conversation=c,user=a)]);m,_=send_message(user=admin,conversation=c,client_id=uuid.uuid4(),text='hello')
- assert authed(a).post(f'/api/messages/{m.id}/reaction/',{'reaction':'LIKE'},format='json').status_code==403
+def test_member_cannot_add_members_to_group(group_thread, member_a, member_b):
+    response = authed(member_a).post(
+        f"/api/groups/{group_thread.id}/members/", {"member_ids": [str(member_b.id)]}, format="json"
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.django_db
+def test_member_cannot_see_group_they_do_not_belong_to(group_thread, member_b):
+    listing = authed(member_b).get("/api/groups/").json()["data"]["results"]
+    assert listing == []
+    assert authed(member_b).get(f"/api/groups/{group_thread.id}/").status_code == 404
+
+
+@pytest.mark.django_db
+def test_member_cannot_read_group_conversation_they_are_not_in(group_thread, member_b):
+    response = authed(member_b).get(f"/api/conversations/{group_thread.conversation_id}/messages/")
+    assert response.status_code == 404
+
+
+@pytest.mark.django_db
+def test_reply_target_must_belong_to_the_same_conversation(admin, member_a, member_b, group_thread):
+    private, _ = private_conversation(admin, member_b)
+    other, _ = send_message(user=admin, conversation=private, client_id=client_id(), text="private")
+    with pytest.raises(Exception):
+        send_message(
+            user=member_a,
+            conversation=group_thread.conversation,
+            client_id=client_id(),
+            text="bad reply",
+            reply_to=other,
+        )
+
+
+@pytest.mark.django_db
+def test_member_cannot_react_when_group_forbids_it(group_thread, admin, member_a):
+    group_thread.members_can_react = False
+    group_thread.save(update_fields=["members_can_react"])
+    message, _ = send_message(
+        user=admin, conversation=group_thread.conversation, client_id=client_id(), text="hello"
+    )
+    response = authed(member_a).post(
+        f"/api/messages/{message.id}/reactions/", {"reaction": "LIKE"}, format="json"
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.django_db
+def test_member_cannot_send_when_group_is_read_only(group_thread, member_a):
+    group_thread.members_can_send = False
+    group_thread.save(update_fields=["members_can_send"])
+    response = authed(member_a).post(
+        f"/api/conversations/{group_thread.conversation_id}/messages/",
+        {"client_id": client_id(), "text": "hi"},
+        format="json",
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.django_db
+def test_admin_creates_group_and_members_receive_it(admin, member_a):
+    response = authed(admin).post(
+        "/api/groups/", {"name": "Ops", "member_ids": [str(member_a.id)]}, format="json"
+    )
+    assert response.status_code == 201, response.data
+    group_id = response.json()["data"]["id"]
+
+    listing = authed(member_a).get("/api/groups/").json()["data"]["results"]
+    assert [g["id"] for g in listing] == [group_id]

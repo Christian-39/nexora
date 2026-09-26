@@ -12,7 +12,7 @@
  * client can classify, never a stale message list.
  */
 
-const VERSION = 'v1.0.0';
+const VERSION = 'v1.1.0';
 const PRECACHE = `nexora-shell-${VERSION}`;
 const RUNTIME = `nexora-static-${VERSION}`;
 const OFFLINE_URL = 'offline.html';
@@ -41,6 +41,7 @@ const PRECACHE_URLS = [
   'assets/css/admin.css',
   'assets/css/responsive.css',
   'assets/js/api.js',
+  'assets/js/config.js',
   'assets/js/auth.js',
   'assets/js/chat.js',
   'assets/js/groups.js',
@@ -62,7 +63,14 @@ const PRECACHE_URLS = [
   'assets/images/icon-512.png',
 ];
 
-/** Paths whose responses must never be cached. */
+/**
+ * Paths whose responses must never be cached.
+ *
+ * Everything under /api/ (authenticated JSON *and* private media, which is
+ * served from /api/media/) plus the avatar/branding endpoints. A shared
+ * Cache Storage entry would outlive sign-out and could be read by the next
+ * person to use the device, so these are always network-only.
+ */
 const PRIVATE_PATH = /\/api\//;
 
 /* ============================================================

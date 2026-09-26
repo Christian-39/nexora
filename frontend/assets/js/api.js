@@ -15,42 +15,25 @@
  */
 
 import { Emitter, backoffDelay, getCookie, isSafeHttpUrl, sleep } from './utils.js';
+import { config as runtimeConfig, resolveMediaUrl as resolveMedia, toWebSocketOrigin } from './config.js';
 
 /* ============================================================
    Runtime configuration
+   Resolved once, centrally, in config.js — never re-derived here.
    ============================================================ */
 
-function readMeta(name) {
-  const node = document.querySelector(`meta[name="${name}"]`);
-  const value = node?.getAttribute('content')?.trim();
-  return value || null;
-}
-
-const RUNTIME = globalThis.NEXORA_RUNTIME || {};
-
-function normalizeBase(value) {
-  if (!value) return '';
-  return String(value).replace(/\/+$/, '');
-}
-
-/**
- * Backend origin. Resolution order:
- *  1. window.NEXORA_RUNTIME.apiBase (set by deployment)
- *  2. <meta name="nexora-api-base" content="https://api.example.org">
- *  3. same origin (reverse-proxied Django) — the recommended deployment
- */
-const API_ORIGIN = normalizeBase(RUNTIME.apiBase || readMeta('nexora-api-base') || '');
-const API_PREFIX = normalizeBase(RUNTIME.apiPrefix || readMeta('nexora-api-prefix') || '/api');
+const API_ORIGIN = runtimeConfig.API_ORIGIN;
+const API_PREFIX = runtimeConfig.API_PREFIX;
 
 /** Auth transport: 'cookie' (HttpOnly session — preferred) or 'bearer'. */
-const AUTH_MODE = (RUNTIME.authMode || readMeta('nexora-auth-mode') || 'cookie').toLowerCase();
+const AUTH_MODE = runtimeConfig.AUTH_MODE;
 
 const DEFAULTS = {
-  timeout: Number(RUNTIME.requestTimeout) || 20000,
-  uploadTimeout: Number(RUNTIME.uploadTimeout) || 0, // 0 = no client timeout for uploads
+  timeout: runtimeConfig.REQUEST_TIMEOUT,
+  uploadTimeout: runtimeConfig.UPLOAD_TIMEOUT, // 0 = no client timeout for uploads
   retries: 2,
-  csrfCookie: RUNTIME.csrfCookie || 'csrftoken',
-  csrfHeader: RUNTIME.csrfHeader || 'X-CSRFToken',
+  csrfCookie: runtimeConfig.CSRF_COOKIE,
+  csrfHeader: runtimeConfig.CSRF_HEADER,
 };
 
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
@@ -175,7 +158,7 @@ export function resolveMediaUrl(value) {
   if (/^https?:\/\//i.test(value)) return isSafeHttpUrl(value) ? value : null;
   if (value.startsWith('blob:') || value.startsWith('data:')) return value;
   try {
-    return new URL(value, `${API_ORIGIN || window.location.origin}/`).toString();
+    return resolveMedia(value) || new URL(value, `${API_ORIGIN || window.location.origin}/`).toString();
   } catch {
     return null;
   }
@@ -281,6 +264,37 @@ function composeSignal(externalSignal, timeout) {
   };
 }
 
+/* ------------------------------------------------------------
+   CSRF bootstrap
+
+   Django's CSRF cookie is only issued once a view has been reached with
+   `ensure_csrf_cookie`. Cookie-mode clients therefore fetch it once, before
+   their first unsafe request, so sign-in itself is CSRF-protected too.
+   ------------------------------------------------------------ */
+
+let csrfPromise = null;
+
+export async function ensureCsrfToken() {
+  if (AUTH_MODE !== 'cookie') return null;
+  const existing = getCookie(DEFAULTS.csrfCookie);
+  if (existing) return existing;
+  if (!csrfPromise) {
+    csrfPromise = fetch(buildUrl('/api/auth/csrf/'), {
+      method: 'GET',
+      credentials: 'include',
+      cache: 'no-store',
+      headers: { Accept: 'application/json' },
+    })
+      .then(() => getCookie(DEFAULTS.csrfCookie))
+      .catch(() => null)
+      .finally(() => {
+        // Allow a later retry if the bootstrap failed.
+        setTimeout(() => { csrfPromise = null; }, 0);
+      });
+  }
+  return csrfPromise;
+}
+
 function authHeaders(method, extra = {}) {
   const headers = { Accept: 'application/json', ...extra };
   if (!SAFE_METHODS.has(method)) {
@@ -363,6 +377,8 @@ export async function request(path, options = {}) {
       status: 0,
     });
   }
+
+  if (!SAFE_METHODS.has(verb)) await ensureCsrfToken();
 
   let attempt = 0;
   let refreshed = false;
@@ -506,7 +522,7 @@ export const del = (path, options = {}) => request(path, { ...options, method: '
 export function upload(path, formData, options = {}) {
   const { onProgress, signal, timeout = DEFAULTS.uploadTimeout, method = 'POST' } = options;
 
-  return new Promise((resolve, reject) => {
+  return ensureCsrfToken().then(() => new Promise((resolve, reject) => {
     if (navigator.onLine === false) {
       reject(new ApiError({ message: "You're offline. The upload will need to be retried.", code: 'OFFLINE', status: 0 }));
       return;
@@ -581,7 +597,7 @@ export function upload(path, formData, options = {}) {
     });
 
     xhr.send(formData);
-  });
+  }));
 }
 
 /* ============================================================
@@ -685,15 +701,18 @@ export const api = {
     list: (params, options) => request('/api/groups/', { ...options, method: 'GET', params, raw: true }),
     get: (id, options) => get(`/api/groups/${encodeURIComponent(id)}/`, null, options),
     create: (payload, options) => post('/api/groups/', payload, options),
-    createWithImage: (formData, options) => upload('/api/groups/', formData, options),
     update: (id, payload, options) => patch(`/api/groups/${encodeURIComponent(id)}/`, payload, options),
     updateImage: (id, formData, options) => upload(`/api/groups/${encodeURIComponent(id)}/image/`, formData, options),
+    removeImage: (id, options) => del(`/api/groups/${encodeURIComponent(id)}/image/`, options),
     remove: (id, options) => del(`/api/groups/${encodeURIComponent(id)}/`, options),
     archive: (id, archived, options) => post(`/api/groups/${encodeURIComponent(id)}/${archived ? 'archive' : 'unarchive'}/`, {}, options),
     members: (id, params, options) => request(`/api/groups/${encodeURIComponent(id)}/members/`, { ...options, method: 'GET', params, raw: true }),
-    addMembers: (id, memberIds, options) => post(`/api/groups/${encodeURIComponent(id)}/members/`, { members: memberIds }, options),
+    addMembers: (id, memberIds, options) =>
+      post(`/api/groups/${encodeURIComponent(id)}/members/`, { member_ids: memberIds }, options),
     removeMember: (id, memberId, options) =>
       del(`/api/groups/${encodeURIComponent(id)}/members/${encodeURIComponent(memberId)}/`, options),
+    removeMembers: (id, memberIds, options) =>
+      request(`/api/groups/${encodeURIComponent(id)}/members/`, { ...options, method: 'DELETE', body: { member_ids: memberIds } }),
     leave: (id, options) => post(`/api/groups/${encodeURIComponent(id)}/leave/`, {}, options),
     activity: (id, params, options) => request(`/api/groups/${encodeURIComponent(id)}/activity/`, { ...options, method: 'GET', params, raw: true }),
   },
@@ -704,7 +723,6 @@ export const api = {
     /** Ask the backend for a fresh authorized/signed URL when one expires. */
     resolve: (id, options) => get(`/api/media/${encodeURIComponent(id)}/url/`, null, options),
     create: (formData, options) => upload('/api/media/', formData, options),
-    remove: (id, options) => del(`/api/media/${encodeURIComponent(id)}/`, options),
   },
 
   /* ---- notifications ---- */
@@ -755,10 +773,14 @@ export const apiConfig = {
   origin: API_ORIGIN,
   prefix: API_PREFIX,
   authMode: AUTH_MODE,
-  /** Websocket origin derived from the API origin (ws:// or wss://). */
+  isLocalDev: runtimeConfig.IS_LOCAL_DEV,
+  socketPath: runtimeConfig.SOCKET_PATH,
+  /**
+   * WebSocket origin. Always derived from the resolved API origin so the
+   * scheme can never be mismatched (http↔ws, https↔wss).
+   */
   get wsOrigin() {
-    const base = API_ORIGIN || window.location.origin;
-    return base.replace(/^http/i, 'ws');
+    return runtimeConfig.WS_ORIGIN || toWebSocketOrigin(window.location.origin);
   },
 };
 

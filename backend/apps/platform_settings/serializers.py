@@ -5,6 +5,15 @@ class PlatformSerializer(serializers.ModelSerializer):
   model=PlatformConfiguration
   exclude=['singleton']
   read_only_fields=['created_at','updated_at']
+ def validate_max_voice_size_mb(self,v):
+  if not 1<=v<=200:raise serializers.ValidationError('Must be between 1 and 200 MB.')
+  return v
+ def validate_max_video_duration_seconds(self,v):
+  if not 5<=v<=86400:raise serializers.ValidationError('Must be between 5 and 86400 seconds.')
+  return v
+ def validate_notification_aggregation_window_seconds(self,v):
+  if v>3600:raise serializers.ValidationError('Cannot exceed one hour.')
+  return v
  def validate_max_message_length(self,v):
   if not 100<=v<=20000:raise serializers.ValidationError('Must be between 100 and 20000.')
   return v
