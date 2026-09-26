@@ -69,17 +69,7 @@ export const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1', '0
 /** Default port Django/uvicorn listens on in development. */
 export const LOCAL_API_PORT = String(RUNTIME.localApiPort || readMeta('nexora-local-api-port') || '8000');
 
-/**
- * The deployed backend for hosted (non-local) builds.
- *
- * This is the ONE place in the frontend allowed to name a backend host. It is
- * a fallback, not a lock-in: `window.NEXORA_RUNTIME.apiBase`, the
- * `nexora-api-base` meta tag or the `nexora-config` JSON blob all override it,
- * which is how a different environment (staging, self-hosted, same-origin
- * reverse proxy) is pointed somewhere else without touching any module.
- *
- * Set it to 'same-origin' to restore pure same-origin behaviour.
- */
+
 export const PRODUCTION_API_ORIGIN = 'https://nexora-backend-ptsc.onrender.com';
 
 export function isLocalHostname(hostname) {
