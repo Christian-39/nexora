@@ -116,56 +116,22 @@ AUTH_PASSWORD_VALIDATORS: list[dict] = []  # six-digit PINs are validated explic
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
-# Preferred: DATABASE_URL. Alternative: discrete DATABASE_* values (MySQL 8+).
-# SQLite is permitted for local development and the test-suite only; it is
-# rejected outright when DEBUG is off.
+_DEFAULT_DB = {
+    "ENGINE": config("DATABASE_ENGINE", default="django.db.backends.sqlite3"),
+    "NAME": config("DATABASE_NAME", default=BASE_DIR / "db.sqlite3"),
+    "USER": config("DATABASE_USER", default=""),
+    "PASSWORD": config("DATABASE_PASSWORD", default=""),
+    "HOST": config("DATABASE_HOST", default=""),
+    "PORT": config("DATABASE_PORT", default=""),
+    "CONN_MAX_AGE": 60,
+    "CONN_HEALTH_CHECKS": True,
+}
 
-DATABASE_URL = config("DATABASE_URL", default="")
-DATABASE_ENGINE = config("DATABASE_ENGINE", default="django.db.backends.mysql")
-DATABASE_NAME = config("DATABASE_NAME", default=config("DB_NAME", default=""))
-DATABASE_USER = config("DATABASE_USER", default=config("DB_USER", default=""))
-DATABASE_PASSWORD = config("DATABASE_PASSWORD", default=config("DB_PASSWORD", default=""))
-DATABASE_HOST = config("DATABASE_HOST", default=config("DB_HOST", default="127.0.0.1"))
-DATABASE_PORT = config("DATABASE_PORT", default=config("DB_PORT", default=3306), cast=int)
-DATABASE_CONN_MAX_AGE = config("DATABASE_CONN_MAX_AGE", default=60, cast=int)
+# STRICT_TRANS_TABLES is MySQL-only; SQLite rejects the SET statement.
+if "mysql" in _DEFAULT_DB["ENGINE"]:
+    _DEFAULT_DB["OPTIONS"] = {"init_command": "SET sql_mode='STRICT_TRANS_TABLES'"}
 
-if TESTING:
-    DATABASES = {
-        "default": {
-            "ENGINE": "django.db.backends.sqlite3",
-            "NAME": ":memory:",
-            "TEST": {"NAME": ":memory:"},
-        }
-    }
-elif DATABASE_URL:
-    DATABASES = {"default": dj_database_url.parse(DATABASE_URL, conn_max_age=DATABASE_CONN_MAX_AGE)}
-elif DATABASE_NAME:
-    DATABASES = {
-        "default": {
-            "ENGINE": DATABASE_ENGINE,
-            "NAME": DATABASE_NAME,
-            "USER": DATABASE_USER,
-            "PASSWORD": DATABASE_PASSWORD,
-            "HOST": DATABASE_HOST,
-            "PORT": str(DATABASE_PORT),
-            "CONN_MAX_AGE": DATABASE_CONN_MAX_AGE,
-            "OPTIONS": {"charset": "utf8mb4"} if "mysql" in DATABASE_ENGINE else {},
-        }
-    }
-else:
-    DATABASES = {
-        "default": {
-            "ENGINE": "django.db.backends.sqlite3",
-            "NAME": str(BASE_DIR / "db.sqlite3"),
-        }
-    }
-
-if "mysql" in DATABASES["default"].get("ENGINE", ""):
-    DATABASES["default"].setdefault("OPTIONS", {})
-    DATABASES["default"]["OPTIONS"].setdefault("charset", "utf8mb4")
-    DATABASES["default"]["OPTIONS"].setdefault(
-        "init_command", "SET sql_mode='STRICT_TRANS_TABLES'"
-    )
+DATABASES = {"default": _DEFAULT_DB}
 
 # ---------------------------------------------------------------------------
 # Static / local media root
