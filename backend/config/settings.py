@@ -266,9 +266,9 @@ SIMPLE_JWT = {
 ACCESS_COOKIE = config("ACCESS_COOKIE", default="nexora_access")
 REFRESH_COOKIE = config("REFRESH_COOKIE", default="nexora_refresh")
 REFRESH_COOKIE_PATH = "/api/auth/"
-#: "Lax" for same-site deployments; "None" is required when the frontend is
-#: served from a different site than the API (and then Secure must be on).
-COOKIE_SAMESITE = config("COOKIE_SAMESITE", default="None")
+#: "Lax" for local/same-site development; "None" is required when the
+#: production frontend is on another site (and then Secure must be on).
+COOKIE_SAMESITE = config("COOKIE_SAMESITE", default="Lax" if DEBUG else "None")
 COOKIE_SECURE = config("COOKIE_SECURE", default=not DEBUG, cast=boolean)
 COOKIE_DOMAIN = config("COOKIE_DOMAIN", default="") or None
 
@@ -279,7 +279,8 @@ LOGIN_FAILURE_LIMIT = config("LOGIN_FAILURE_LIMIT", default=5, cast=int)
 LOGIN_LOCKOUT_MINUTES = config("LOGIN_LOCKOUT_MINUTES", default=15, cast=int)
 
 CSRF_COOKIE_NAME = config("CSRF_COOKIE_NAME", default="csrftoken")
-CSRF_COOKIE_HTTPONLY = False  # the frontend must read it to echo X-CSRFToken
+# Readable for the same-origin fallback; cross-origin clients use /auth/csrf/ JSON.
+CSRF_COOKIE_HTTPONLY = False
 CSRF_COOKIE_SAMESITE = COOKIE_SAMESITE
 CSRF_COOKIE_SECURE = COOKIE_SECURE
 SESSION_COOKIE_HTTPONLY = True

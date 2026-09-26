@@ -144,10 +144,27 @@ def test_cross_site_cookies_are_none_and_secure_for_this_deployment():
     assert settings.SESSION_COOKIE_SECURE is True
     assert settings.CSRF_COOKIE_SAMESITE == "None"
     assert settings.CSRF_COOKIE_SECURE is True
-    # CSRF stays enabled and the cookie stays readable so the SPA can echo it.
+    # CSRF stays enabled. The cookie supports same-origin fallback while the
+    # cross-origin frontend consumes the endpoint's JSON token.
     assert settings.CSRF_COOKIE_HTTPONLY is False
     assert "django.middleware.csrf.CsrfViewMiddleware" in settings.MIDDLEWARE
     assert settings.SESSION_COOKIE_HTTPONLY is True
+
+
+def test_local_cookie_defaults_remain_usable_over_http():
+    settings = load_settings(
+        DJANGO_ENV="development",
+        DEBUG="True",
+        COOKIE_SAMESITE=None,
+        COOKIE_SECURE=None,
+        REDIS_URL=None,
+        STORAGE_BUCKET=None,
+        DATABASE_URL=None,
+    )
+    assert settings.COOKIE_SAMESITE == "Lax"
+    assert settings.COOKIE_SECURE is False
+    assert settings.CSRF_COOKIE_SAMESITE == "Lax"
+    assert settings.CSRF_COOKIE_SECURE is False
 
 
 def test_samesite_none_without_secure_is_refused():

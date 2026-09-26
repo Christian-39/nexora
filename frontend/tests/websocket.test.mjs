@@ -117,7 +117,22 @@ async function loadClient(refreshResponses = []) {
 
   const refreshCalls = [];
   globalThis.fetch = async (url) => {
-    refreshCalls.push(String(url));
+    const requestUrl = String(url);
+    if (requestUrl.endsWith('/api/auth/csrf/')) {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => 'application/json' },
+        json: async () => ({
+          success: true,
+          message: 'CSRF cookie set',
+          data: { csrf_token: 'websocket-test-csrf-token' },
+        }),
+        text: async () => '',
+      };
+    }
+
+    refreshCalls.push(requestUrl);
     const next = refreshResponses.shift() || { ok: false, status: 401 };
     if (next.network) throw new TypeError('Failed to fetch');
     return {
@@ -135,7 +150,8 @@ async function loadClient(refreshResponses = []) {
 }
 
 /** Let queued promise callbacks run. */
-const flush = async (times = 6) => {
+const flush = async (times = 20) => {
+  // CSRF bootstrap adds a few promise turns before the refresh request itself.
   for (let i = 0; i < times; i += 1) await Promise.resolve();
 };
 

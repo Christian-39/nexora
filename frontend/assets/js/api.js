@@ -267,30 +267,62 @@ function composeSignal(externalSignal, timeout) {
 /* ------------------------------------------------------------
    CSRF bootstrap
 
-   Django's CSRF cookie is only issued once a view has been reached with
-   `ensure_csrf_cookie`. Cookie-mode clients therefore fetch it once, before
-   their first unsafe request, so sign-in itself is CSRF-protected too.
+   The backend sets Django's CSRF cookie and returns the matching token in the
+   JSON response. The JSON token is retained in memory because JavaScript on a
+   cross-origin frontend cannot read the backend origin's cookie. Reading the
+   cookie remains a same-origin/local-development fallback only.
    ------------------------------------------------------------ */
 
+let csrfToken = null;
 let csrfPromise = null;
+
+function readableCsrfCookie() {
+  try {
+    return getCookie(DEFAULTS.csrfCookie);
+  } catch {
+    return null;
+  }
+}
 
 export async function ensureCsrfToken() {
   if (AUTH_MODE !== 'cookie') return null;
-  const existing = getCookie(DEFAULTS.csrfCookie);
-  if (existing) return existing;
+  if (csrfToken) return csrfToken;
+
+  const cookieToken = readableCsrfCookie();
+  if (cookieToken) {
+    csrfToken = cookieToken;
+    return csrfToken;
+  }
+
   if (!csrfPromise) {
-    csrfPromise = fetch(buildUrl('/api/auth/csrf/'), {
-      method: 'GET',
-      credentials: 'include',
-      cache: 'no-store',
-      headers: { Accept: 'application/json' },
-    })
-      .then(() => getCookie(DEFAULTS.csrfCookie))
-      .catch(() => null)
-      .finally(() => {
-        // Allow a later retry if the bootstrap failed.
-        setTimeout(() => { csrfPromise = null; }, 0);
+    csrfPromise = (async () => {
+      const response = await fetch(buildUrl('/api/auth/csrf/'), {
+        method: 'GET',
+        credentials: 'include',
+        cache: 'no-store',
+        headers: { Accept: 'application/json' },
       });
+      const payload = await parseBody(response);
+      if (!response.ok) throw toApiError(response.status, payload, response.headers);
+
+      const data = unwrap(payload);
+      const responseToken = data?.csrf_token || payload?.csrf_token;
+      const token = typeof responseToken === 'string' && responseToken
+        ? responseToken
+        : readableCsrfCookie();
+      if (!token) {
+        throw new ApiError({
+          message: 'Unable to initialize request security. Reload and try again.',
+          code: 'CSRF_UNAVAILABLE',
+          status: 0,
+        });
+      }
+      csrfToken = token;
+      return csrfToken;
+    })().finally(() => {
+      // De-duplicate concurrent callers but allow a later retry after failure.
+      csrfPromise = null;
+    });
   }
   return csrfPromise;
 }
@@ -298,7 +330,7 @@ export async function ensureCsrfToken() {
 function authHeaders(method, extra = {}) {
   const headers = { Accept: 'application/json', ...extra };
   if (!SAFE_METHODS.has(method)) {
-    const csrf = getCookie(DEFAULTS.csrfCookie);
+    const csrf = csrfToken || readableCsrfCookie();
     if (csrf) headers[DEFAULTS.csrfHeader] = csrf;
   }
   if (AUTH_MODE === 'bearer' && accessToken) {
@@ -326,6 +358,9 @@ async function tryRefreshSession() {
   if (refreshPromise) return refreshPromise;
   refreshPromise = (async () => {
     try {
+      // Refresh is an unsafe request too. This is especially important when a
+      // GET /api/me/ 401 is the first request made after a page load.
+      await ensureCsrfToken();
       const response = await fetch(buildUrl('/api/auth/refresh/'), {
         method: 'POST',
         credentials: 'include',

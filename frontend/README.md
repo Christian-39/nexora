@@ -78,9 +78,11 @@ new deployment is never hidden behind a stale cached bundle.
 
 ### Authentication transport
 
-* **cookie mode (default).** The browser holds an HttpOnly session cookie.
-  Nothing is duplicated into `localStorage`. CSRF is read from the `csrftoken`
-  cookie and sent as `X-CSRFToken` on unsafe methods.
+* **cookie mode (default).** The browser holds HttpOnly authentication cookies.
+  Nothing is duplicated into `localStorage`. The client obtains the CSRF token
+  from `/api/auth/csrf/` JSON, retains it only in memory, and sends it as
+  `X-CSRFToken` on unsafe methods. Reading `csrftoken` remains a same-origin
+  fallback; a Vercel page cannot read a cookie scoped to the Render hostname.
 * **bearer mode.** The access token is kept **in memory only** (`api.js`
   `tokenStore`) and is never persisted. A page reload re-establishes the session
   via `POST /api/auth/refresh/` using the refresh cookie.

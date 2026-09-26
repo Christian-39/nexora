@@ -411,8 +411,9 @@ single-socket/single-timer invariants.
 * Tokens live in HttpOnly cookies; the refresh cookie is scoped to
   `/api/auth/` and rotates on every use, with the old token blacklisted.
 * CSRF is enforced on every unsafe request **including sign-in** (DRF exempts
-  views from the CSRF middleware, so the check is explicit). The frontend
-  bootstraps the cookie from `/api/auth/csrf/` before its first unsafe call.
+  views from the CSRF middleware, so the check is explicit). Before its first
+  unsafe call, the frontend obtains the token from `/api/auth/csrf/` JSON and
+  keeps it in memory; the backend continues to set Django's CSRF cookie.
 * Security headers: HSTS, CSP, `nosniff`, `Referrer-Policy`,
   `Permissions-Policy`, `X-Frame-Options: DENY`, Secure + SameSite cookies.
 * No `innerHTML`, no `eval`, no `new Function` in frontend code; all

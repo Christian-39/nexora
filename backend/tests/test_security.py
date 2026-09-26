@@ -72,6 +72,60 @@ def test_login_requires_csrf(member_a):
 
 
 @pytest.mark.django_db
+def test_json_csrf_token_supports_cross_origin_auth_lifecycle(member_a, settings):
+    """The Vercel client can use the JSON token without reading Render cookies."""
+    origin = "https://nexora-eight-lilac.vercel.app"
+    settings.CORS_ALLOWED_ORIGINS = [origin]
+    settings.CSRF_TRUSTED_ORIGINS = [origin]
+    settings.CORS_ALLOW_CREDENTIALS = True
+
+    client = APIClient(enforce_csrf_checks=True)
+    bootstrap = client.get("/api/auth/csrf/", HTTP_ORIGIN=origin)
+    assert bootstrap.status_code == 200
+    token = bootstrap.json()["data"]["csrf_token"]
+    assert isinstance(token, str) and token
+    assert "csrftoken" in bootstrap.cookies
+    assert bootstrap["Access-Control-Allow-Origin"] == origin
+    assert bootstrap["Access-Control-Allow-Credentials"] == "true"
+
+    login_response = client.post(
+        "/api/auth/login/",
+        {"phone": member_a.phone, "pin": "123456"},
+        format="json",
+        HTTP_ORIGIN=origin,
+        HTTP_X_CSRFTOKEN=token,
+    )
+    assert login_response.status_code == 200
+    assert login_response.cookies["nexora_access"]["httponly"]
+    assert login_response.cookies["nexora_refresh"]["httponly"]
+    assert client.get("/api/me/", HTTP_ORIGIN=origin).status_code == 200
+
+    # Refresh remains protected: the cookie by itself is not sufficient.
+    assert client.post(
+        "/api/auth/refresh/", {}, format="json", HTTP_ORIGIN=origin
+    ).status_code == 403
+    assert client.post(
+        "/api/auth/refresh/",
+        {},
+        format="json",
+        HTTP_ORIGIN=origin,
+        HTTP_X_CSRFTOKEN=token,
+    ).status_code == 200
+
+    logout_response = client.post(
+        "/api/auth/logout/",
+        {},
+        format="json",
+        HTTP_ORIGIN=origin,
+        HTTP_X_CSRFTOKEN=token,
+    )
+    assert logout_response.status_code == 200
+    assert logout_response.cookies["nexora_access"]["max-age"] == 0
+    assert logout_response.cookies["nexora_refresh"]["max-age"] == 0
+    assert client.get("/api/me/", HTTP_ORIGIN=origin).status_code == 401
+
+
+@pytest.mark.django_db
 def test_unsafe_api_request_without_csrf_is_refused(admin, private_thread):
     from rest_framework_simplejwt.tokens import RefreshToken
 
