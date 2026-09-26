@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex, nofollow">
+
+  <meta name="nexora-api-base" content="">
+  <meta name="nexora-api-prefix" content="/api">
+  <meta name="nexora-auth-mode" content="cookie">
+
+  <title>Dashboard</title>
+
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="assets/images/icon-192.png">
+  <link rel="apple-touch-icon" href="assets/images/icon-192.png">
+  <meta name="theme-color" content="#ffffff">
+  <meta name="application-name" content="NEXORA">
+  <meta name="apple-mobile-web-app-title" content="NEXORA">
+
+  <script>
+    (function () {
+      try {
+        var pref = JSON.parse(localStorage.getItem('nexora.theme') || '"system"');
+        var dark = pref === 'dark' || (pref === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+      } catch (e) {}
+    })();
+  </script>
+
+  <link rel="stylesheet" href="assets/css/variables.css">
+  <link rel="stylesheet" href="assets/css/themes.css">
+  <link rel="stylesheet" href="assets/css/typography.css">
+  <link rel="stylesheet" href="assets/css/main.css">
+  <link rel="stylesheet" href="assets/css/components.css">
+  <link rel="stylesheet" href="assets/css/admin.css">
+  <link rel="stylesheet" href="assets/css/responsive.css">
+</head>
+<body class="app-body" data-page="admin" data-page-title="Dashboard">
+  <a class="sr-only sr-only-focusable" href="#main-content">Skip to content</a>
+
+  <div class="app-shell" id="app-shell">
+    <nav class="app-nav" id="app-nav" aria-label="Primary"></nav>
+
+    <div class="app-main">
+      <div class="conn-banner" id="conn-banner"></div>
+
+      <div class="page">
+        <header class="page__header">
+          <h1 class="page__title">Dashboard</h1>
+          <div class="page__actions">
+            <button class="btn btn--sm" id="refresh-btn" type="button">Refresh</button>
+          </div>
+        </header>
+
+        <div class="page__body" id="main-content">
+          <div class="container-wide stack">
+            <section aria-labelledby="overview-heading" class="stack">
+              <h2 id="overview-heading" class="sr-only">Overview</h2>
+              <div class="metrics" id="metrics"></div>
+            </section>
+
+            <div class="dash-grid">
+              <section class="card" aria-labelledby="recent-activity-heading">
+                <div class="card__header">
+                  <h2 class="card__title" id="recent-activity-heading">Recent member activity</h2>
+                </div>
+                <div id="recent-activity"></div>
+              </section>
+
+              <section class="card" aria-labelledby="security-events-heading">
+                <div class="card__header">
+                  <h2 class="card__title" id="security-events-heading">Security events</h2>
+                  <span class="spacer"></span>
+                  <a class="btn btn--sm btn--ghost" href="settings.html?s=securityPolicy">Policy</a>
+                </div>
+                <div id="security-events"></div>
+              </section>
+            </div>
+
+            <section class="card" aria-labelledby="quick-actions-heading">
+              <div class="card__header">
+                <h2 class="card__title" id="quick-actions-heading">Quick actions</h2>
+              </div>
+              <div class="card__body row row-wrap">
+                <a class="btn" href="members.html">Manage members</a>
+                <a class="btn" href="groups.html">Manage groups</a>
+                <a class="btn" href="chat.html">Open conversations</a>
+                <a class="btn" href="settings.html">Settings</a>
+              </div>
+            </section>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    import { requireSession } from './assets/js/auth.js';
+    import { loadBranding } from './assets/js/theme.js';
+    import { mountNavigation, mountConnectionBanner, mountSessionGuards } from './assets/js/navigation.js';
+    import { realtime, socketEvents } from './assets/js/websocket.js';
+    import { ApiError, api, normalizePage } from './assets/js/api.js';
+    import { refreshUnread } from './assets/js/notifications.js';
+    import { registerServiceWorker } from './assets/js/push.js';
+    import { emptyState, errorState, icon, loadingRow, setBusy, skeletonList, toastApiError } from './assets/js/ui.js';
+    import { $, clear, el, formatRelative } from './assets/js/utils.js';
+
+    loadBranding();
+
+    const METRICS = [
+      { key: 'total_members', label: 'Total members' },
+      { key: 'active_members', label: 'Active members' },
+      { key: 'inactive_members', label: 'Inactive members' },
+      { key: 'active_conversations', label: 'Active conversations' },
+      { key: 'unread_conversations', label: 'Unread conversations' },
+      { key: 'total_groups', label: 'Groups' },
+      { key: 'messages_today', label: 'Messages today' },
+      { key: 'media_today', label: 'Media shared today' },
+      { key: 'voice_notes_today', label: 'Voice notes today' },
+    ];
+
+    (async () => {
+      const user = await requireSession({ adminOnly: true });
+      if (!user) return;
+
+      mountNavigation({ active: 'admin' });
+      mountConnectionBanner();
+      mountSessionGuards();
+      registerServiceWorker();
+      realtime.start('/ws/app/');
+      refreshUnread();
+
+      renderMetricSkeleton();
+      await Promise.all([loadDashboard(), loadActivity(), loadSecurity()]);
+
+      $('#refresh-btn').addEventListener('click', async (event) => {
+        setBusy(event.currentTarget, true);
+        await Promise.all([loadDashboard(), loadActivity(), loadSecurity()]);
+        setBusy(event.currentTarget, false);
+      });
+
+      // Live counters stay current without polling.
+      socketEvents.on('dashboard.update', (payload) => renderMetrics(payload));
+      socketEvents.on('state', (state) => {
+        if (state === 'open') loadDashboard();
+      });
+    })();
+
+    function renderMetricSkeleton() {
+      const container = $('#metrics');
+      clear(container);
+      for (const metric of METRICS) {
+        container.append(
+          el('div', { class: 'metric' }, [
+            el('div', { class: 'metric__label', text: metric.label }),
+            el('div', { class: 'metric__value', dataset: { key: metric.key, loading: 'true' }, text: '0' }),
+          ])
+        );
+      }
+    }
+
+    async function loadDashboard() {
+      try {
+        const data = await api.dashboard();
+        renderMetrics(data);
+      } catch (error) {
+        const container = $('#metrics');
+        clear(container);
+        container.append(
+          errorState({
+            title: 'Unable to load dashboard metrics',
+            text: error.message,
+            onRetry: () => { renderMetricSkeleton(); loadDashboard(); },
+          })
+        );
+      }
+    }
+
+    function renderMetrics(data) {
+      if (!data || typeof data !== 'object') return;
+      for (const node of document.querySelectorAll('.metric__value')) {
+        const key = node.dataset.key;
+        const value = data[key];
+        if (value === undefined || value === null) {
+          node.dataset.loading = 'false';
+          node.textContent = '—';
+          continue;
+        }
+        node.dataset.loading = 'false';
+        node.textContent = typeof value === 'number' ? value.toLocaleString() : String(value);
+      }
+    }
+
+    async function loadActivity() {
+      const container = $('#recent-activity');
+      clear(container);
+      container.append(skeletonList(4));
+      try {
+        const response = await api.audit({ limit: 8, category: 'member' });
+        const page = normalizePage(response.data ?? response);
+        clear(container);
+        if (!page.items.length) {
+          container.append(emptyState({ icon: 'activity', title: 'No recent activity', text: 'Member activity will appear here.' }));
+          return;
+        }
+        container.append(renderActivityList(page.items));
+      } catch (error) {
+        clear(container);
+        container.append(
+          error instanceof ApiError && error.isNotFound
+            ? emptyState({ icon: 'activity', title: 'Activity log unavailable', text: 'This deployment does not expose an activity log.' })
+            : errorState({ text: error.message, onRetry: loadActivity })
+        );
+      }
+    }
+
+    async function loadSecurity() {
+      const container = $('#security-events');
+      clear(container);
+      container.append(skeletonList(4, { avatar: false }));
+      try {
+        const response = await api.security.events({ limit: 8 });
+        const page = normalizePage(response.data ?? response);
+        clear(container);
+        if (!page.items.length) {
+          container.append(emptyState({ icon: 'shield-check', title: 'No security events', text: 'Sign-in failures and lockouts will appear here.' }));
+          return;
+        }
+        container.append(renderActivityList(page.items, true));
+      } catch (error) {
+        clear(container);
+        container.append(
+          error instanceof ApiError && (error.isNotFound || error.isForbidden)
+            ? emptyState({ icon: 'shield-check', title: 'Security log unavailable', text: 'You do not have access to the security log, or it is not enabled.' })
+            : errorState({ text: error.message, onRetry: loadSecurity })
+        );
+      }
+    }
+
+    function renderActivityList(items, security = false) {
+      const list = el('div', { class: 'activity-list' });
+      for (const entry of items) {
+        const severity = entry.severity || (security ? 'warning' : '');
+        list.append(
+          el('div', { class: 'activity-item' }, [
+            el('div', { class: 'activity-item__icon', dataset: { severity } }, [
+              icon(security ? 'shield-alert' : 'activity', { size: 15 }),
+            ]),
+            el('div', { class: 'activity-item__body' }, [
+              el('div', { class: 'activity-item__title', text: entry.description || entry.action || entry.event || 'Event' }),
+              el('div', { class: 'activity-item__meta', text: [entry.actor_name || entry.actor, entry.created_at ? formatRelative(entry.created_at) : null].filter(Boolean).join(' · ') }),
+            ]),
+          ])
+        );
+      }
+      return list;
+    }
+  </script>
+</body>
+</html>

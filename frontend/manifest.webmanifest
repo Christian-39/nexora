@@ -1,0 +1,51 @@
+{
+  "name": "NEXORA",
+  "short_name": "NEXORA",
+  "description": "Private administrator-controlled messaging and community platform.",
+  "id": "/",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "any",
+  "theme_color": "#33526E",
+  "background_color": "#F8F9FA",
+  "lang": "en",
+  "dir": "ltr",
+  "categories": ["communication", "productivity"],
+  "prefer_related_applications": false,
+  "icons": [
+    {
+      "src": "assets/images/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "assets/images/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "assets/images/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Chats",
+      "short_name": "Chats",
+      "url": "./chat.html",
+      "icons": [{ "src": "assets/images/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Groups",
+      "short_name": "Groups",
+      "url": "./groups.html",
+      "icons": [{ "src": "assets/images/icon-192.png", "sizes": "192x192" }]
+    }
+  ]
+}

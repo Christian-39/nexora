@@ -1,0 +1,250 @@
+/* NEXORA — Responsive rules (mobile-first corrections)
+ * Base stylesheets are authored desktop-capable; these breakpoints collapse
+ * panes and reflow tables. No `overflow-x: hidden` band-aids: every
+ * potentially-wide element (tables, media, code, long words) is constrained
+ * at the source with min-width:0 / overflow-wrap / max-width.
+ */
+
+/* ============================================================
+   <= 1279px — hide optional details pane by default
+   ============================================================ */
+@media (max-width: 1279px) {
+  .chat-layout[data-details="open"] {
+    grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
+  }
+  /* Details becomes an overlay drawer on the right */
+  .chat-layout[data-details="open"] .details-pane {
+    position: fixed;
+    top: 0; right: 0; bottom: 0;
+    width: min(340px, 92vw);
+    z-index: var(--z-drawer);
+    box-shadow: var(--shadow-lg);
+  }
+  .details-scrim {
+    position: fixed;
+    inset: 0;
+    background: var(--overlay);
+    z-index: calc(var(--z-drawer) - 1);
+  }
+}
+
+/* ============================================================
+   <= 1023px — collapse primary nav to icon rail
+   ============================================================ */
+@media (max-width: 1023px) and (min-width: 768px) {
+  .app-shell { grid-template-columns: var(--nav-w-collapsed) minmax(0, 1fr); }
+  .app-shell .app-nav__name,
+  .app-shell .nav-item__label,
+  .app-shell .app-nav__section { display: none; }
+  .app-shell .nav-item { justify-content: center; padding: var(--sp-3) 0; position: relative; }
+  .app-shell .nav-item__badge { position: absolute; margin: 0; transform: translate(12px, -12px); }
+  .app-shell .app-nav__brand { justify-content: center; }
+
+  .chat-layout { grid-template-columns: 250px minmax(0, 1fr); }
+  .settings-layout { grid-template-columns: 180px minmax(0, 1fr); gap: var(--sp-4); }
+}
+
+/* ============================================================
+   <= 767px — single-pane mobile experience
+   ============================================================ */
+@media (max-width: 767px) {
+  /* Primary nav becomes a bottom bar */
+  .app-shell,
+  .app-shell[data-nav="collapsed"],
+  .app-shell[data-nav="none"] {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto;
+  }
+  .app-nav {
+    grid-row: 2;
+    flex-direction: row;
+    border-right: none;
+    border-top: 1px solid var(--border);
+    padding: 0;
+    padding-bottom: var(--safe-bottom);
+  }
+  .app-nav__brand,
+  .app-nav__section,
+  .app-nav__footer { display: none; }
+  .app-nav__list {
+    flex-direction: row;
+    justify-content: space-around;
+    align-items: stretch;
+    padding: var(--sp-1);
+    gap: 0;
+    overflow: visible;
+    width: 100%;
+  }
+  .nav-item {
+    flex: 1;
+    min-width: 0;
+    flex-direction: column;
+    gap: 2px;
+    justify-content: center;
+    padding: var(--sp-2) var(--sp-1);
+    position: relative;
+  }
+  .nav-item__label {
+    display: block;
+    font-size: 0.6875rem; /* 11px */
+    font-weight: var(--fw-medium);
+    text-align: center;
+    width: 100%;
+  }
+  .nav-item__badge { position: absolute; top: 2px; right: 50%; margin: 0; transform: translateX(22px); }
+  /* Hide bottom bar when a thread is open full-screen */
+  .app-shell[data-mobile-view="thread"] .app-nav { display: none; }
+
+  /* Chat: one pane at a time */
+  .chat-layout { grid-template-columns: minmax(0, 1fr); position: relative; }
+  .chat-layout .conv-pane,
+  .chat-layout .thread { grid-column: 1; grid-row: 1; }
+  .chat-layout[data-mobile-pane="list"] .thread { display: none; }
+  .chat-layout[data-mobile-pane="thread"] .conv-pane { display: none; }
+  .chat-layout[data-details="open"] .details-pane { width: 100vw; }
+
+  .thread__back { display: inline-flex; }
+  .thread__scroll { padding: var(--sp-3) var(--sp-2); }
+  .bubble { max-width: 86%; }
+  .media-frame { width: min(240px, 68vw); }
+  .thread__jump { right: var(--sp-3); }
+
+  /* Page chrome */
+  .page__body { padding: var(--sp-4) var(--sp-3); }
+  .page__header { padding-left: var(--sp-3); padding-right: var(--sp-3); }
+  .page__title { font-size: var(--fs-md); }
+
+  /* Settings stacks */
+  .settings-layout { grid-template-columns: minmax(0, 1fr); gap: var(--sp-4); }
+  .settings-nav {
+    position: static;
+    flex-direction: row;
+    overflow-x: auto;
+    scrollbar-width: none;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: var(--sp-2);
+  }
+  .settings-nav::-webkit-scrollbar { display: none; }
+  .settings-nav button { white-space: nowrap; }
+
+  /* Modals become bottom sheets */
+  .modal-backdrop { align-items: flex-end; padding: 0; }
+  .modal {
+    max-width: 100%;
+    max-height: 92dvh;
+    border-radius: var(--r-xl) var(--r-xl) 0 0;
+    border-bottom: none;
+    animation: nx-sheet var(--dur-base) var(--ease-out);
+  }
+  @keyframes nx-sheet { from { transform: translateY(16px); opacity: 0; } }
+  .modal__footer { padding-bottom: calc(var(--sp-3) + var(--safe-bottom)); }
+  .modal__footer .btn { flex: 1; }
+
+  /* Tables reflow into stacked rows — no horizontal scrolling traps */
+  .table-wrap--stack { border: none; background: none; overflow: visible; }
+  .table-wrap--stack .table,
+  .table-wrap--stack .table tbody,
+  .table-wrap--stack .table tr,
+  .table-wrap--stack .table td { display: block; width: 100%; }
+  .table-wrap--stack .table thead { display: none; }
+  .table-wrap--stack .table tr {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    margin-bottom: var(--sp-2);
+    padding: var(--sp-2);
+  }
+  .table-wrap--stack .table td {
+    border: none;
+    padding: var(--sp-1) var(--sp-2);
+    display: flex;
+    gap: var(--sp-3);
+    align-items: baseline;
+    min-width: 0;
+  }
+  .table-wrap--stack .table td::before {
+    content: attr(data-label);
+    flex: 0 0 38%;
+    font-size: var(--fs-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+  }
+  .table-wrap--stack .table td:empty { display: none; }
+  .table-wrap--stack .table__actions { justify-content: flex-start; }
+
+  .toolbar { gap: var(--sp-2); }
+  .metrics { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: var(--sp-2); }
+  .metric { padding: var(--sp-3); }
+  .metric__value { font-size: var(--fs-xl); }
+
+  .toast-region { width: calc(100vw - var(--sp-4)); bottom: calc(var(--sp-3) + var(--safe-bottom)); }
+  .dl { grid-template-columns: minmax(0, 1fr); gap: var(--sp-1); }
+  .dl dd { margin-bottom: var(--sp-2); }
+}
+
+/* ============================================================
+   <= 430px — large phones
+   ============================================================ */
+@media (max-width: 430px) {
+  .bubble { max-width: 88%; }
+  .media-frame { width: min(230px, 72vw); }
+  .preview-tray__thumb { width: 60px; height: 60px; }
+}
+
+/* ============================================================
+   <= 360px — small phones (320/360)
+   ============================================================ */
+@media (max-width: 360px) {
+  :root { --sp-4: 0.875rem; --sp-5: 1rem; }
+  .auth-card { padding: var(--sp-4); }
+  .pin-input { gap: 6px; }
+  .pin-input input { font-size: var(--fs-lg); }
+  .bubble { max-width: 90%; }
+  .media-frame { width: min(210px, 74vw); }
+  .conv-item { padding: var(--sp-2) var(--sp-3); }
+  .avatar { width: 36px; height: 36px; }
+  .nav-item__label { font-size: 0.625rem; }
+  .metrics { grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); }
+  .btn { padding: 0 var(--sp-3); }
+  .page__body { padding: var(--sp-3) var(--sp-2); }
+}
+
+/* ============================================================
+   Large desktop refinements
+   ============================================================ */
+@media (min-width: 1280px) {
+  .chat-layout { grid-template-columns: 320px minmax(0, 1fr); }
+  .chat-layout[data-details="open"] { grid-template-columns: 320px minmax(0, 1fr) 320px; }
+}
+@media (min-width: 1440px) {
+  .chat-layout { grid-template-columns: 340px minmax(0, 1fr); }
+  .chat-layout[data-details="open"] { grid-template-columns: 340px minmax(0, 1fr) 340px; }
+  .page__body { padding: var(--sp-6); }
+}
+
+/* ============================================================
+   Landscape phones — keep the composer reachable
+   ============================================================ */
+@media (max-height: 460px) and (orientation: landscape) {
+  .thread__scroll { padding-top: var(--sp-2); padding-bottom: var(--sp-2); }
+  .composer { padding-top: var(--sp-1); padding-bottom: calc(var(--sp-1) + var(--safe-bottom)); }
+  .app-nav { display: none; }
+}
+
+/* ============================================================
+   Pointer-coarse: larger hit targets (WCAG 2.5.8)
+   ============================================================ */
+@media (pointer: coarse) {
+  .icon-btn { width: 42px; height: 42px; }
+  .icon-btn--sm { width: 34px; height: 34px; }
+  .btn { min-height: 42px; }
+  .menu__item { padding: var(--sp-3); }
+}
+
+/* ============================================================
+   Print — chat is private; discourage printing content
+   ============================================================ */
+@media print {
+  .app-nav, .composer, .thread__actions, .conv-pane { display: none !important; }
+}

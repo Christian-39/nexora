@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="description" content="Sign in to continue.">
+
+  <meta name="nexora-api-base" content="">
+  <meta name="nexora-api-prefix" content="/api">
+  <meta name="nexora-auth-mode" content="cookie">
+
+  <title>Sign in</title>
+
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="assets/images/icon-192.png">
+  <link rel="apple-touch-icon" href="assets/images/icon-192.png">
+  <meta name="theme-color" content="#ffffff">
+  <meta name="application-name" content="NEXORA">
+  <meta name="apple-mobile-web-app-title" content="NEXORA">
+
+  <script>
+    (function () {
+      try {
+        var pref = JSON.parse(localStorage.getItem('nexora.theme') || '"system"');
+        var dark = pref === 'dark' || (pref === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+      } catch (e) {}
+    })();
+  </script>
+
+  <link rel="stylesheet" href="assets/css/variables.css">
+  <link rel="stylesheet" href="assets/css/themes.css">
+  <link rel="stylesheet" href="assets/css/typography.css">
+  <link rel="stylesheet" href="assets/css/main.css">
+  <link rel="stylesheet" href="assets/css/components.css">
+  <link rel="stylesheet" href="assets/css/responsive.css">
+</head>
+<body data-page-title="Sign in">
+  <a class="sr-only sr-only-focusable" href="#login-main">Skip to sign-in form</a>
+
+  <main class="auth-layout" id="login-main">
+    <div class="auth-card">
+      <div class="auth-card__brand">
+        <span data-brand="logo"></span>
+        <h1 class="auth-card__org" data-brand="org-name">NEXORA</h1>
+        <p class="auth-card__hint" id="auth-subtitle">Sign in to continue</p>
+      </div>
+
+      <div class="alert" id="login-alert" hidden role="alert"></div>
+
+      <!-- ============ Step 1: credentials ============ -->
+      <form id="login-form" novalidate autocomplete="on">
+        <div class="stack">
+          <div class="field">
+            <label class="field__label" for="identifier">Phone number or login ID</label>
+            <input
+              class="input"
+              id="identifier"
+              name="username"
+              type="text"
+              inputmode="tel"
+              autocomplete="username"
+              autocapitalize="off"
+              autocorrect="off"
+              spellcheck="false"
+              maxlength="64"
+              required
+            >
+            <div class="field__error" id="identifier-error"></div>
+          </div>
+
+          <div class="field">
+            <span class="field__label" id="pin-label">Six-digit PIN</span>
+            <div id="pin-slot"></div>
+          </div>
+
+          <button class="btn btn--primary btn--block btn--lg" id="login-submit" type="submit">Sign in</button>
+        </div>
+      </form>
+
+      <!-- ============ Step 2: first-login credential change ============ -->
+      <section id="change-section" hidden aria-labelledby="change-title">
+        <div class="stack">
+          <div class="alert alert--warning">
+            <span>For your security you must choose a new six-digit PIN before continuing.</span>
+          </div>
+          <h2 id="change-title" class="text-sm fw-semibold">Create your new PIN</h2>
+          <div id="change-fields"></div>
+          <button class="btn btn--primary btn--block btn--lg" id="change-submit" type="button">Set new PIN</button>
+          <button class="btn btn--ghost btn--block" id="change-cancel" type="button">Cancel and sign out</button>
+        </div>
+      </section>
+
+      <div class="auth-footer">
+        <p>Accounts are created by administrators. There is no public registration.</p>
+        <p id="org-contact"></p>
+      </div>
+    </div>
+  </main>
+
+  <script type="module">
+    import { loadBranding, getConfig } from './assets/js/theme.js';
+    import {
+      changePin,
+      landingPage,
+      login,
+      logout,
+      mustChangeCredential,
+      redirectIfAuthenticated,
+      validateIdentifier,
+      validateNewPin,
+      validatePin,
+    } from './assets/js/auth.js';
+    import { ApiError } from './assets/js/api.js';
+    import { buildPinInput, buildPinFields } from './assets/js/pin.js';
+    import { announce, setBusy, setFieldError, showAlert, hideAlert } from './assets/js/ui.js';
+    import { $, el } from './assets/js/utils.js';
+
+    loadBranding().then(() => {
+      const config = getConfig();
+      const contact = $('#org-contact');
+      const bits = [config.contact_phone, config.contact_email].filter(Boolean);
+      if (bits.length) contact.textContent = `Need help? ${bits.join(' · ')}`;
+    });
+
+    const form = $('#login-form');
+    const identifier = $('#identifier');
+    const identifierError = $('#identifier-error');
+    const submitBtn = $('#login-submit');
+    const alertEl = $('#login-alert');
+    const changeSection = $('#change-section');
+    const subtitle = $('#auth-subtitle');
+
+    const pin = buildPinInput({ label: 'PIN', autocomplete: 'current-password' });
+    $('#pin-slot').append(pin.group, pin.errorEl);
+
+    const changeFields = buildPinFields({ includeCurrent: false });
+    $('#change-fields').append(changeFields.root);
+
+    /* ---- surface the reason we were redirected here ---- */
+    const params = new URLSearchParams(window.location.search);
+    const reason = params.get('reason');
+    if (reason === 'expired') showAlert(alertEl, 'Your session has ended. Please sign in again.', 'warning');
+    else if (reason === 'signed-out') showAlert(alertEl, 'You have been signed out.', 'info');
+    else if (reason === 'unauthorized') showAlert(alertEl, 'Please sign in to continue.', 'info');
+
+    /* ---- already signed in? ---- */
+    redirectIfAuthenticated().then((redirected) => {
+      if (!redirected && mustChangeCredential()) showChangeStep();
+      if (!redirected) identifier.focus();
+    });
+
+    if (params.get('change') === '1') showChangeStep();
+
+    function showChangeStep() {
+      form.hidden = true;
+      changeSection.hidden = false;
+      subtitle.textContent = 'Set a new PIN to continue';
+      changeFields.focus();
+    }
+
+    /* ============ Sign in ============ */
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      hideAlert(alertEl);
+      setFieldError(identifier, identifierError, '');
+      pin.setError('');
+
+      const identifierValue = identifier.value;
+      const pinValue = pin.value();
+
+      const identifierProblem = validateIdentifier(identifierValue);
+      if (identifierProblem) {
+        setFieldError(identifier, identifierError, identifierProblem);
+        identifier.focus();
+        return;
+      }
+      const pinProblem = validatePin(pinValue);
+      if (pinProblem) {
+        pin.setError(pinProblem);
+        return;
+      }
+
+      setBusy(submitBtn, true, 'Signing in');
+      pin.setDisabled(true);
+      identifier.disabled = true;
+
+      try {
+        const { mustChangePin } = await login(identifierValue, pinValue);
+        pin.reset(); // the PIN never lingers in the DOM
+        announce('Signed in.');
+        if (mustChangePin) {
+          showChangeStep();
+          return;
+        }
+        window.location.replace(landingPage());
+      } catch (error) {
+        pin.reset();
+        handleAuthError(error);
+      } finally {
+        setBusy(submitBtn, false);
+        pin.setDisabled(false);
+        identifier.disabled = false;
+      }
+    });
+
+    function handleAuthError(error) {
+      if (!(error instanceof ApiError)) {
+        showAlert(alertEl, 'Sign-in failed. Please try again.', 'error');
+        return;
+      }
+      if (error.isRateLimited) {
+        const wait = error.retryAfter ? ` Try again in about ${Math.ceil(error.retryAfter / 60)} minute(s).` : '';
+        showAlert(alertEl, `Too many sign-in attempts.${wait}`, 'error');
+        announce('Too many sign-in attempts.', 'assertive');
+        return;
+      }
+      if (error.status === 423 || error.code === 'ACCOUNT_LOCKED') {
+        showAlert(alertEl, 'This account is temporarily locked. Contact your administrator.', 'error');
+        return;
+      }
+      if (error.isForbidden || error.code === 'ACCOUNT_INACTIVE') {
+        showAlert(alertEl, 'This account cannot sign in. Contact your administrator.', 'error');
+        return;
+      }
+      if (error.isAuth || error.isValidation) {
+        // Deliberately generic: never reveal whether the account exists.
+        showAlert(alertEl, 'The sign-in details you entered are not correct.', 'error');
+        announce('Sign-in failed.', 'assertive');
+        return;
+      }
+      if (error.isOffline || error.isNetwork || error.isTimeout) {
+        showAlert(alertEl, 'Unable to reach the server. Check your connection and try again.', 'warning');
+        return;
+      }
+      showAlert(alertEl, error.message, 'error');
+    }
+
+    /* ============ First-login PIN change ============ */
+    const changeBtn = $('#change-submit');
+    changeBtn.addEventListener('click', async () => {
+      hideAlert(alertEl);
+      changeFields.clearErrors();
+
+      const values = changeFields.values();
+      const problem = validateNewPin(values.newPin, values.confirmPin);
+      if (problem) {
+        changeFields.setError(problem.field, problem.message);
+        return;
+      }
+
+      setBusy(changeBtn, true, 'Saving new PIN');
+      changeFields.setDisabled(true);
+      try {
+        await changePin({ newPin: values.newPin, confirmPin: values.confirmPin });
+        changeFields.reset();
+        announce('Your PIN has been updated.');
+        window.location.replace(landingPage());
+      } catch (error) {
+        changeFields.reset();
+        if (error instanceof ApiError && error.isValidation) {
+          const fieldError = error.firstFieldError();
+          if (fieldError?.field === 'new_pin') changeFields.setError('new', fieldError.message);
+          else showAlert(alertEl, error.message, 'error');
+        } else if (error instanceof ApiError && error.isRateLimited) {
+          showAlert(alertEl, 'Too many attempts. Please wait before trying again.', 'error');
+        } else {
+          showAlert(alertEl, error?.message || 'The PIN could not be updated.', 'error');
+        }
+      } finally {
+        setBusy(changeBtn, false);
+        changeFields.setDisabled(false);
+      }
+    });
+
+    $('#change-cancel').addEventListener('click', () => logout());
+  </script>
+</body>
+</html>

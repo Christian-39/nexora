@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="description" content="Private communication platform. Sign in to continue.">
+
+  <!-- Deployment configuration. Leave api-base empty for same-origin Django. -->
+  <meta name="nexora-api-base" content="">
+  <meta name="nexora-api-prefix" content="/api">
+  <meta name="nexora-auth-mode" content="cookie">
+
+  <title>NEXORA</title>
+
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="assets/images/icon-192.png">
+  <link rel="apple-touch-icon" href="assets/images/icon-192.png">
+  <meta name="theme-color" content="#ffffff">
+  <meta name="application-name" content="NEXORA">
+  <meta name="apple-mobile-web-app-title" content="NEXORA">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+
+  <script>
+    // Resolve the theme before first paint to avoid a flash.
+    (function () {
+      try {
+        var pref = JSON.parse(localStorage.getItem('nexora.theme') || '"system"');
+        var dark = pref === 'dark' || (pref === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+      } catch (e) { /* defaults apply */ }
+    })();
+  </script>
+
+  <link rel="stylesheet" href="assets/css/variables.css">
+  <link rel="stylesheet" href="assets/css/themes.css">
+  <link rel="stylesheet" href="assets/css/typography.css">
+  <link rel="stylesheet" href="assets/css/main.css">
+  <link rel="stylesheet" href="assets/css/components.css">
+  <link rel="stylesheet" href="assets/css/responsive.css">
+</head>
+<body data-page-title="">
+  <main class="auth-layout">
+    <div class="auth-card" role="status" aria-live="polite">
+      <div class="auth-card__brand">
+        <span data-brand="logo"></span>
+        <div class="auth-card__org" data-brand="org-name">NEXORA</div>
+      </div>
+      <div class="loading-row">
+        <span class="spinner"></span>
+        <span>Starting…</span>
+      </div>
+      <noscript>
+        <p class="text-sm text-muted text-center">This application requires JavaScript. Please enable it and reload the page.</p>
+      </noscript>
+      <div class="auth-footer">
+        <a href="login.html">Continue to sign in</a>
+      </div>
+    </div>
+  </main>
+
+  <script type="module">
+    import { loadBranding } from './assets/js/theme.js';
+    import { bootstrap, isAdmin } from './assets/js/auth.js';
+
+    loadBranding();
+
+    (async () => {
+      const user = await bootstrap();
+      if (!user) {
+        window.location.replace('login.html');
+        return;
+      }
+      window.location.replace(isAdmin() ? 'admin.html' : 'chat.html');
+    })();
+  </script>
+</body>
+</html>

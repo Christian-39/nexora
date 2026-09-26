@@ -1,0 +1,160 @@
+/* NEXORA — Themes
+ * Light / Dark / System. One set of semantic tokens, redefined per theme.
+ * No duplicated stylesheets: every component consumes semantic tokens only.
+ */
+
+:root,
+[data-theme="light"] {
+  color-scheme: light;
+
+  --bg: #F8F9FA;
+  --surface: #FFFFFF;
+  --surface-alt: #F1F4F7;
+  --surface-elevated: #FFFFFF;
+  --surface-sunken: #ECEFF3;
+  --surface-hover: #F1F4F7;
+  --surface-active: #E6EBF0;
+
+  --text-heading: #181C21;
+  --text-body: #23272E;
+  --text-muted: #5B6570;
+  --text-faint: #8A929C;
+  --text-on-accent: #FFFFFF;
+
+  --border: #E3E8ED;
+  --border-strong: #CFD6DE;
+  --border-focus: var(--brand-primary);
+
+  --accent: var(--brand-primary);
+  --accent-hover: #2B4560;
+  --accent-soft: #EBF1F7;
+  --accent-text: var(--brand-primary);
+
+  --success: #1E7A4E;
+  --success-soft: #E7F4ED;
+  --warning: #9A6400;
+  --warning-soft: #FCF3E2;
+  --danger: #BA3A2E;
+  --danger-soft: #FBECEA;
+  --info: #2A5F8F;
+  --info-soft: #EAF1F8;
+
+  /* Chat surfaces */
+  --bubble-in-bg: #FFFFFF;
+  --bubble-in-border: #E3E8ED;
+  --bubble-in-text: #23272E;
+  --bubble-out-bg: #E8EFF6;
+  --bubble-out-border: #D3E0EC;
+  --bubble-out-text: #1B2630;
+  --bubble-system-bg: #ECEFF3;
+  --bubble-system-text: #5B6570;
+  --chat-canvas: #F4F6F8;
+
+  --shadow-xs: 0 1px 2px rgba(16, 24, 40, 0.05);
+  --shadow-sm: 0 1px 3px rgba(16, 24, 40, 0.08);
+  --shadow-md: 0 4px 12px rgba(16, 24, 40, 0.09);
+  --shadow-lg: 0 12px 32px rgba(16, 24, 40, 0.14);
+
+  --overlay: rgba(16, 20, 26, 0.45);
+  --skeleton: linear-gradient(90deg, #ECEFF3 25%, #F5F7F9 37%, #ECEFF3 63%);
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #0D0F13;
+  --surface: #14171C;
+  --surface-alt: #1A1E24;
+  --surface-elevated: #20252D;
+  --surface-sunken: #0A0C0F;
+  --surface-hover: #1E232A;
+  --surface-active: #262C34;
+
+  --text-heading: #F1F3F6;
+  --text-body: #E6E9ED;
+  --text-muted: #9AA3AF;
+  --text-faint: #6E7782;
+  --text-on-accent: #0D0F13;
+
+  --border: #262B33;
+  --border-strong: #363D47;
+  --border-focus: var(--brand-accent-dark, #8FB0CB);
+
+  --accent: var(--brand-accent-dark, #8FB0CB);
+  --accent-hover: #A6C2D9;
+  --accent-soft: #1B242D;
+  --accent-text: var(--brand-accent-dark, #8FB0CB);
+
+  --success: #4CB484;
+  --success-soft: #142520;
+  --warning: #D9A441;
+  --warning-soft: #2A2113;
+  --danger: #E4705F;
+  --danger-soft: #2B1815;
+  --info: #79A6D2;
+  --info-soft: #14202B;
+
+  --bubble-in-bg: #1A1E24;
+  --bubble-in-border: #262B33;
+  --bubble-in-text: #E6E9ED;
+  --bubble-out-bg: #223345;
+  --bubble-out-border: #2C4359;
+  --bubble-out-text: #E9EFF5;
+  --bubble-system-bg: #1A1E24;
+  --bubble-system-text: #9AA3AF;
+  --chat-canvas: #0D0F13;
+
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.5);
+  --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.55);
+  --shadow-lg: 0 14px 38px rgba(0, 0, 0, 0.65);
+
+  --overlay: rgba(0, 0, 0, 0.62);
+  --skeleton: linear-gradient(90deg, #1A1E24 25%, #232830 37%, #1A1E24 63%);
+}
+
+/* "System" theme = no data-theme attribute set to explicit value.
+   theme.js writes data-theme="light"|"dark" resolved from matchMedia,
+   but we keep this fallback so first paint is never wrong. */
+@media (prefers-color-scheme: dark) {
+  [data-theme="system"] {
+    color-scheme: dark;
+    --bg: #0D0F13;
+    --surface: #14171C;
+    --surface-alt: #1A1E24;
+    --surface-elevated: #20252D;
+    --surface-sunken: #0A0C0F;
+    --surface-hover: #1E232A;
+    --surface-active: #262C34;
+    --text-heading: #F1F3F6;
+    --text-body: #E6E9ED;
+    --text-muted: #9AA3AF;
+    --text-faint: #6E7782;
+    --text-on-accent: #0D0F13;
+    --border: #262B33;
+    --border-strong: #363D47;
+    --accent: #8FB0CB;
+    --accent-hover: #A6C2D9;
+    --accent-soft: #1B242D;
+    --success: #4CB484;
+    --danger: #E4705F;
+    --bubble-in-bg: #1A1E24;
+    --bubble-in-border: #262B33;
+    --bubble-in-text: #E6E9ED;
+    --bubble-out-bg: #223345;
+    --bubble-out-border: #2C4359;
+    --bubble-out-text: #E9EFF5;
+    --bubble-system-bg: #1A1E24;
+    --bubble-system-text: #9AA3AF;
+    --chat-canvas: #0D0F13;
+    --overlay: rgba(0, 0, 0, 0.62);
+  }
+}
+
+/* High-contrast preference hardening */
+@media (prefers-contrast: more) {
+  :root {
+    --border: var(--border-strong);
+    --text-muted: var(--text-body);
+  }
+}

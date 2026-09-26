@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Access denied</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="assets/images/icon-192.png">
+  <meta name="theme-color" content="#ffffff">
+  <script>
+    (function () {
+      try {
+        var pref = JSON.parse(localStorage.getItem('nexora.theme') || '"system"');
+        var dark = pref === 'dark' || (pref === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+      } catch (e) {}
+    })();
+  </script>
+  <link rel="stylesheet" href="assets/css/variables.css">
+  <link rel="stylesheet" href="assets/css/themes.css">
+  <link rel="stylesheet" href="assets/css/typography.css">
+  <link rel="stylesheet" href="assets/css/main.css">
+  <link rel="stylesheet" href="assets/css/components.css">
+  <link rel="stylesheet" href="assets/css/responsive.css">
+</head>
+<body data-page-title="Access denied">
+  <main class="status-page">
+    <div class="status-page__inner">
+      <div class="status-page__code">403</div>
+      <h1 class="status-page__title">Access denied</h1>
+      <p class="status-page__text">You are not authorized to view this page. If you believe this is a mistake, contact your administrator.</p>
+      <div class="status-page__actions">
+        <a class="btn btn--primary" href="chat.html">Go to chats</a><a class="btn" href="login.html">Sign in as another user</a>
+      </div>
+      <p class="text-xs text-faint" style="margin-top: var(--sp-8);">
+        <span data-brand="org-name"></span>
+      </p>
+    </div>
+  </main>
+  <script type="module">
+    import { loadBranding } from './assets/js/theme.js';
+    loadBranding();
+  </script>
+</body>
+</html>

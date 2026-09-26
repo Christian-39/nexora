@@ -1,0 +1,9 @@
+from django.core.validators import RegexValidator
+from django.db import models
+from apps.core.models import TimeStampedModel
+color=RegexValidator(r'^#[0-9A-Fa-f]{6}$','Use #RRGGBB.')
+class PlatformConfiguration(TimeStampedModel):
+ singleton=models.PositiveSmallIntegerField(default=1,unique=True,editable=False);organization_name=models.CharField(max_length=160);app_name=models.CharField(max_length=80,default='NEXORA');short_app_name=models.CharField(max_length=20,default='NEXORA');phone=models.CharField(max_length=18,blank=True);address=models.TextField(blank=True);contact_email=models.EmailField(blank=True);website=models.URLField(blank=True);primary_color=models.CharField(max_length=7,validators=[color],default='#315EFB');secondary_color=models.CharField(max_length=7,validators=[color],default='#101828');privacy_policy=models.TextField(blank=True);terms=models.TextField(blank=True);community_rules=models.TextField(blank=True);data_policy=models.TextField(blank=True);about=models.TextField(blank=True);max_message_length=models.PositiveIntegerField(default=5000);max_image_size_mb=models.PositiveSmallIntegerField(default=15);max_video_size_mb=models.PositiveSmallIntegerField(default=250);max_voice_duration_seconds=models.PositiveIntegerField(default=600);message_edit_window_minutes=models.PositiveSmallIntegerField(default=15);message_delete_window_minutes=models.PositiveSmallIntegerField(default=15);allow_delete_everyone=models.BooleanField(default=True);allow_member_name_edit=models.BooleanField(default=True)
+class BrandingAsset(TimeStampedModel):
+ class Kind(models.TextChoices):LOGO='LOGO';FAVICON='FAVICON'
+ kind=models.CharField(max_length=10,choices=Kind.choices,unique=True);storage_key=models.CharField(max_length=512,unique=True);mime_type=models.CharField(max_length=100);size=models.PositiveIntegerField();width=models.PositiveIntegerField();height=models.PositiveIntegerField()

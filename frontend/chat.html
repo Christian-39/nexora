@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="robots" content="noindex, nofollow">
+
+  <meta name="nexora-api-base" content="">
+  <meta name="nexora-api-prefix" content="/api">
+  <meta name="nexora-auth-mode" content="cookie">
+
+  <title>Chats</title>
+
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="assets/images/icon-192.png">
+  <link rel="apple-touch-icon" href="assets/images/icon-192.png">
+  <meta name="theme-color" content="#ffffff">
+  <meta name="application-name" content="NEXORA">
+  <meta name="apple-mobile-web-app-title" content="NEXORA">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+
+  <script>
+    (function () {
+      try {
+        var pref = JSON.parse(localStorage.getItem('nexora.theme') || '"system"');
+        var dark = pref === 'dark' || (pref === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+      } catch (e) {}
+    })();
+  </script>
+
+  <link rel="stylesheet" href="assets/css/variables.css">
+  <link rel="stylesheet" href="assets/css/themes.css">
+  <link rel="stylesheet" href="assets/css/typography.css">
+  <link rel="stylesheet" href="assets/css/main.css">
+  <link rel="stylesheet" href="assets/css/components.css">
+  <link rel="stylesheet" href="assets/css/chat.css">
+  <link rel="stylesheet" href="assets/css/responsive.css">
+</head>
+<body class="app-body" data-page="chat" data-page-title="Chats">
+  <a class="sr-only sr-only-focusable" href="#thread-region">Skip to conversation</a>
+
+  <div class="app-shell" id="app-shell" data-mobile-view="list">
+    <nav class="app-nav" id="app-nav" aria-label="Primary"></nav>
+
+    <div class="app-main">
+      <div class="conn-banner" id="conn-banner"></div>
+
+      <div class="chat-layout" id="chat-layout" data-mobile-pane="list">
+
+        <!-- ============ Conversation list ============ -->
+        <section class="conv-pane" aria-label="Conversations">
+          <header class="conv-pane__header">
+            <h1 class="conv-pane__title">Chats</h1>
+            <span class="spacer"></span>
+            <button class="icon-btn" id="notifications-btn" type="button" aria-label="Open notifications">
+              <span id="notifications-badge"></span>
+            </button>
+          </header>
+
+          <div class="conv-pane__search">
+            <div class="search">
+              <label class="sr-only" for="conv-search">Search conversations</label>
+              <input class="input" id="conv-search" type="search" placeholder="Search conversations" autocomplete="off">
+            </div>
+          </div>
+
+          <div class="conv-pane__filters" id="conv-filters" role="group" aria-label="Filter conversations">
+            <button class="btn btn--sm btn--subtle" type="button" data-filter="all" aria-pressed="true">All</button>
+            <button class="btn btn--sm btn--subtle" type="button" data-filter="unread" aria-pressed="false">Unread</button>
+            <button class="btn btn--sm btn--subtle" type="button" data-filter="groups" aria-pressed="false">Groups</button>
+          </div>
+
+          <div class="conv-pane__list" id="conv-list" role="list" aria-busy="true"></div>
+        </section>
+
+        <!-- ============ Thread ============ -->
+        <section class="thread" id="thread-region" aria-label="Conversation">
+          <header class="thread__header" id="thread-header"></header>
+
+          <div class="thread__scroll" id="thread-scroll" tabindex="0" aria-label="Messages" role="log" aria-live="polite" aria-relevant="additions">
+            <div class="thread__messages" id="thread-messages"></div>
+          </div>
+
+          <button class="icon-btn thread__jump" id="thread-jump" type="button" aria-label="Scroll to latest messages" hidden>
+            <span class="badge" hidden></span>
+          </button>
+
+          <div class="composer" id="composer" hidden>
+            <p class="composer__notice" id="composer-notice" hidden></p>
+            <div class="composer__context" id="composer-context" hidden></div>
+            <div id="composer-tray" hidden></div>
+            <div id="composer-recorder" hidden></div>
+            <div class="composer__row" id="composer-row">
+              <div class="composer__attach-wrap">
+                <button class="icon-btn" id="composer-attach" type="button" aria-label="Add attachment"></button>
+              </div>
+              <label class="sr-only" for="composer-input">Write a message</label>
+              <textarea class="composer__input" id="composer-input" rows="1" placeholder="Write a message" enterkeyhint="send"></textarea>
+              <button class="icon-btn" id="composer-voice" type="button" aria-label="Record a voice note"></button>
+              <button class="icon-btn icon-btn--primary" id="composer-send" type="button" aria-label="Send message"></button>
+            </div>
+            <div class="composer__counter" id="composer-counter" hidden aria-live="polite"></div>
+          </div>
+        </section>
+
+        <!-- ============ Details ============ -->
+        <aside class="details-pane" id="details-pane" aria-label="Conversation details"></aside>
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    import { requireSession, getUser } from './assets/js/auth.js';
+    import { loadBranding } from './assets/js/theme.js';
+    import { mountNavigation, mountConnectionBanner, mountSessionGuards, mobile } from './assets/js/navigation.js';
+    import { realtime } from './assets/js/websocket.js';
+    import { ChatController } from './assets/js/chat.js';
+    import {
+      mountForegroundMessageAlerts,
+      mountNotificationCentre,
+      refreshUnread,
+      unreadEvents,
+      getUnread,
+      markAllNotificationsRead,
+    } from './assets/js/notifications.js';
+    import { registerServiceWorker, maybeOfferPush, onNotificationNavigate } from './assets/js/push.js';
+    import { icon, openModal, iconButton } from './assets/js/ui.js';
+    import { $, el, formatCount } from './assets/js/utils.js';
+
+    loadBranding();
+
+    (async () => {
+      const user = await requireSession();
+      if (!user) return;
+
+      mountNavigation({ active: 'chat' });
+      mountConnectionBanner();
+      mountSessionGuards();
+
+      // Decorate icon-only buttons that are declared in markup.
+      $('#composer-attach').append(icon('paperclip'));
+      $('#composer-voice').append(icon('mic'));
+      $('#composer-send').append(icon('send'));
+      $('#thread-jump').prepend(icon('arrow-down'));
+      $('#notifications-btn').prepend(icon('bell'));
+
+      const controller = new ChatController({
+        layoutEl: $('#chat-layout'),
+        listEl: $('#conv-list'),
+        searchInput: $('#conv-search'),
+        filterBar: $('#conv-filters'),
+        threadEl: $('#thread-region'),
+        headerEl: $('#thread-header'),
+        scrollEl: $('#thread-scroll'),
+        messagesEl: $('#thread-messages'),
+        jumpBtn: $('#thread-jump'),
+        composerEl: $('#composer'),
+        composerRow: $('#composer-row'),
+        composerNotice: $('#composer-notice'),
+        contextEl: $('#composer-context'),
+        trayEl: $('#composer-tray'),
+        recorderEl: $('#composer-recorder'),
+        inputEl: $('#composer-input'),
+        sendBtn: $('#composer-send'),
+        attachBtn: $('#composer-attach'),
+        voiceBtn: $('#composer-voice'),
+        counterEl: $('#composer-counter'),
+        detailsEl: $('#details-pane'),
+      });
+
+      realtime.start('/ws/app/');
+      await refreshUnread();
+      await controller.init();
+      $('#conv-list').setAttribute('aria-busy', 'false');
+
+      mountForegroundMessageAlerts({
+        getActiveConversationId: () => controller.activeId,
+        onOpen: (id) => controller.open(id),
+      });
+
+      /* ---- notification centre ---- */
+      const badge = $('#notifications-badge');
+      const paintBadge = () => {
+        const count = getUnread().notifications;
+        badge.className = count ? 'badge' : '';
+        badge.textContent = count ? formatCount(count) : '';
+        badge.style.position = count ? 'absolute' : '';
+        badge.style.transform = count ? 'translate(12px, -12px)' : '';
+      };
+      unreadEvents.on('change', paintBadge);
+      paintBadge();
+
+      $('#notifications-btn').addEventListener('click', () => {
+        const body = el('div', {});
+        const { close } = openModal({
+          title: 'Notifications',
+          body,
+          size: 'lg',
+          actions: [
+            {
+              label: 'Mark all as read',
+              closeOnClick: false,
+              onClick: async () => {
+                await markAllNotificationsRead();
+                return false;
+              },
+            },
+            { label: 'Close', variant: 'primary' },
+          ],
+        });
+        mountNotificationCentre(body, {
+          onOpen: (notification) => {
+            const convId = notification.conversation_id ?? notification.data?.conversation_id;
+            if (convId) {
+              close();
+              controller.open(String(convId));
+            }
+          },
+        });
+      });
+
+      /* ---- PWA ---- */
+      registerServiceWorker();
+      maybeOfferPush();
+      onNotificationNavigate(({ conversationId }) => {
+        if (conversationId) controller.open(String(conversationId));
+      });
+
+      // Back button returns to the list on mobile instead of leaving the app.
+      window.addEventListener('popstate', () => {
+        if (mobile.isSmall && $('#chat-layout').dataset.mobilePane === 'thread') {
+          mobile.showList();
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
