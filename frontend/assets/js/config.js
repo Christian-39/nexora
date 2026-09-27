@@ -44,7 +44,7 @@ export const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1', '0
 /** Default port Django/uvicorn listens on in development. */
 export const LOCAL_API_PORT = String(RUNTIME.localApiPort || readMeta('nexora-local-api-port') || '8000');
 
-export const PRODUCTION_API_ORIGIN = 'https://nexora-backend-ptsc.onrender.com';
+export const PRODUCTION_API_ORIGIN = 'https://nexora-f397.onrender.com';
 const SANDBOX_PREVIEW_RE = /\.e2b\.app$/;
 
 export function isLocalHostname(hostname) {
