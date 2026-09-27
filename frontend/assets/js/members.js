@@ -20,6 +20,7 @@ import {
   openModal,
   setBusy,
   setFieldError,
+  showAlert,
   skeletonList,
   toast,
   toastApiError,
@@ -332,19 +333,22 @@ export class MembersController {
           label: 'Create member',
           variant: 'primary',
           closeOnClick: false,
-          busyLabel: 'Creating member',
+          busyLabel: 'Creating member…',
           onClick: async ({ button }) => {
             const payload = form.collect();
             if (!payload) return false;
             setBusy(button, true);
             try {
-              await api.members.create(payload);
+              const member = await api.members.create(payload);
               toast('Member created.', { type: 'success' });
               close(true);
-              this.load({ reset: true });
+              // Reconcile locally: the backend just returned the created
+              // member, so a full list reload is unnecessary when the current
+              // view would show it. Backend stays authoritative for anything
+              // the local view cannot represent (filters, ordering position).
+              this.applyCreatedMember(member);
             } catch (error) {
               form.applyErrors(error);
-              if (!(error instanceof ApiError) || !error.isValidation) toastApiError(error);
               return false;
             } finally {
               setBusy(button, false);
@@ -354,6 +358,29 @@ export class MembersController {
         },
       ],
     });
+  }
+
+  /** Insert a freshly created member without a network round-trip. */
+  applyCreatedMember(member) {
+    if (!member || !member.id) {
+      this.load({ reset: true });
+      return;
+    }
+    const matchesView =
+      !this.query &&
+      (this.status === 'all' || this.status === (member.is_active !== false ? 'active' : 'inactive'));
+    this.count += 1;
+    if (matchesView) {
+      // Keep the backend's ordering (full_name) locally: insert, sort, render.
+      this.items = [...this.items, member].sort((a, b) =>
+        String(a.display_name || a.full_name || '').localeCompare(String(b.display_name || b.full_name || ''))
+      );
+      this.render();
+    } else {
+      // The current filter would hide the new row; re-fetch quietly so the
+      // counts and pagination stay truthful.
+      this.load({ reset: true });
+    }
   }
 
   openEditDialog(member) {
@@ -367,18 +394,26 @@ export class MembersController {
           label: 'Save changes',
           variant: 'primary',
           closeOnClick: false,
+          busyLabel: 'Saving…',
           onClick: async ({ button }) => {
             const payload = form.collect();
             if (!payload) return false;
             setBusy(button, true);
             try {
-              await api.members.update(member.id, payload);
+              const updated = await api.members.update(member.id, payload);
               toast('Member updated.', { type: 'success' });
               close(true);
-              this.load({ reset: true });
+              // Patch the row in place — no unrelated reloads, no full refetch.
+              const merged = { ...member, ...payload, ...(updated || {}) };
+              const index = this.items.findIndex((m) => String(m.id) === String(member.id));
+              if (index >= 0) {
+                this.items[index] = merged;
+                this.render();
+              } else {
+                this.load({ reset: true });
+              }
             } catch (error) {
               form.applyErrors(error);
-              if (!(error instanceof ApiError) || !error.isValidation) toastApiError(error);
               return false;
             } finally {
               setBusy(button, false);
@@ -482,14 +517,72 @@ export class MembersController {
 
 /* ============================================================
    Member form
+
+   API contract (backend MemberCreateSerializer / MemberUpdateSerializer):
+     display_name  -> model full_name   (required on create)
+     phone         -> normalized E.164  (required on create)
+     email         -> optional
+     is_active     -> create only; updates use activate/deactivate endpoints
+   `login_identifier` is NOT part of the contract: sign-in is by phone and the
+   backend has no such field, so the form never sends it.
    ============================================================ */
 
+/**
+ * Pure payload builder — the DOM form delegates to this so the contract is
+ * unit-testable without a browser.
+ * @param {{displayName?:string, phone?:string, email?:string, isActive?:boolean}} input
+ * @param {{isEdit?:boolean}} [options]
+ * @returns {{payload:object|null, problems:{displayName?:string, phone?:string, email?:string}}}
+ */
+export function collectMemberPayload(input = {}, { isEdit = false } = {}) {
+  const displayName = String(input.displayName || '').trim();
+  const phone = String(input.phone || '').trim();
+  const email = String(input.email || '').trim();
+
+  const problems = {};
+  if (!displayName) problems.displayName = 'Enter a display name.';
+  if (!phone) problems.phone = 'Enter a phone number.';
+  else if (!/^[+0-9 ()-]{6,32}$/.test(phone)) problems.phone = 'Enter a valid phone number.';
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) problems.email = 'Enter a valid email address.';
+
+  if (Object.keys(problems).length) return { payload: null, problems };
+
+  const payload = { display_name: displayName, phone };
+  if (email) payload.email = email;
+  if (!isEdit) payload.is_active = input.isActive !== false;
+  return { payload, problems };
+}
+
+/**
+ * Pure backend-error mapper. Accepts anything ApiError-shaped and returns the
+ * message for each form slot: `displayName` (display_name/full_name), `phone`,
+ * `email`, plus `form` for everything that must be shown at form level
+ * (non-field errors, is_active, 403/409/500/network/timeout messages).
+ * @param {{errors?:object, message?:string}} error
+ */
+export function mapMemberErrors(error) {
+  const fields = (error && error.errors) || {};
+  const first = (keys) => {
+    for (const key of keys) {
+      const value = fields[key];
+      if (value) return [].concat(value)[0];
+    }
+    return null;
+  };
+  const displayName = first(['display_name', 'full_name']);
+  const phone = first(['phone']);
+  const email = first(['email']);
+  const form = first(['__all__', 'non_field_errors', 'is_active', 'detail']) || (error && error.message) || null;
+  return { displayName, phone, email, form };
+}
+
 function buildMemberForm(member = null) {
+  const isEdit = !!member;
   const nameId = uid('f');
   const phoneId = uid('f');
-  const identifierId = uid('f');
+  const emailId = uid('f');
 
-  const nameInput = el('input', { class: 'input', id: nameId, value: member?.display_name || '', maxLength: 120, autocomplete: 'off' });
+  const nameInput = el('input', { class: 'input', id: nameId, value: member?.display_name || member?.full_name || '', maxLength: 120, autocomplete: 'off' });
   const nameError = el('div', { class: 'field__error' });
 
   const phoneInput = el('input', {
@@ -500,21 +593,28 @@ function buildMemberForm(member = null) {
     value: member?.phone || '',
     maxLength: 32,
     autocomplete: 'off',
-    placeholder: '+000 000 0000',
+    placeholder: '+234 801 234 5678',
   });
   const phoneError = el('div', { class: 'field__error' });
 
-  const identifierInput = el('input', {
+  const emailInput = el('input', {
     class: 'input',
-    id: identifierId,
-    value: member?.login_identifier || '',
-    maxLength: 64,
+    id: emailId,
+    type: 'email',
+    inputMode: 'email',
+    value: member?.email || '',
+    maxLength: 254,
     autocomplete: 'off',
   });
+  const emailError = el('div', { class: 'field__error' });
 
   const activeToggle = el('input', { type: 'checkbox', checked: member ? member.is_active !== false : true });
 
+  /** Form-level error strip for non-field failures (403/409/500/network…). */
+  const formAlert = el('div', { class: 'alert alert--error', role: 'alert', hidden: true });
+
   const root = el('div', { class: 'stack' }, [
+    formAlert,
     el('div', { class: 'field' }, [
       el('label', { class: 'field__label', for: nameId, text: 'Display name' }),
       nameInput,
@@ -523,14 +623,22 @@ function buildMemberForm(member = null) {
     el('div', { class: 'field' }, [
       el('label', { class: 'field__label', for: phoneId, text: 'Phone number' }),
       phoneInput,
-      el('div', { class: 'field__hint', text: 'Used as the sign-in identifier unless a separate identifier is set.' }),
+      el('div', { class: 'field__hint', text: 'International format, e.g. +2348012345678. This is the member’s sign-in identifier.' }),
       phoneError,
     ]),
     el('div', { class: 'field' }, [
-      el('label', { class: 'field__label', for: identifierId, text: 'Login identifier (optional)' }),
-      identifierInput,
+      el('label', { class: 'field__label', for: emailId, text: 'Email (optional)' }),
+      emailInput,
+      emailError,
     ]),
-    el('label', { class: 'check' }, [activeToggle, el('span', { class: 'check__text', text: 'Account is active' })]),
+    isEdit
+      ? el('div', { class: 'alert alert--info' }, [
+          icon('info', { size: 16 }),
+          el('span', {
+            text: 'Activation is managed with the Activate/Deactivate action in the member menu.',
+          }),
+        ])
+      : el('label', { class: 'check' }, [activeToggle, el('span', { class: 'check__text', text: 'Account is active' })]),
     el('div', { class: 'alert alert--info' }, [
       icon('info', { size: 16 }),
       el('span', {
@@ -542,40 +650,53 @@ function buildMemberForm(member = null) {
   return {
     root,
     collect() {
+      formAlert.hidden = true;
       setFieldError(nameInput, nameError, '');
       setFieldError(phoneInput, phoneError, '');
+      setFieldError(emailInput, emailError, '');
 
-      const displayName = nameInput.value.trim();
-      const phone = phoneInput.value.trim();
-      let valid = true;
+      const { payload, problems } = collectMemberPayload(
+        {
+          displayName: nameInput.value,
+          phone: phoneInput.value,
+          email: emailInput.value,
+          isActive: activeToggle.checked,
+        },
+        { isEdit }
+      );
 
-      if (!displayName) {
-        setFieldError(nameInput, nameError, 'Enter a display name.');
-        valid = false;
+      if (!payload) {
+        if (problems.displayName) setFieldError(nameInput, nameError, problems.displayName);
+        if (problems.phone) setFieldError(phoneInput, phoneError, problems.phone);
+        if (problems.email) setFieldError(emailInput, emailError, problems.email);
+        (problems.displayName ? nameInput : problems.phone ? phoneInput : emailInput).focus();
+        return null;
       }
-      if (!phone) {
-        setFieldError(phoneInput, phoneError, 'Enter a phone number.');
-        valid = false;
-      } else if (!/^[+0-9 ()-]{6,32}$/.test(phone)) {
-        setFieldError(phoneInput, phoneError, 'Enter a valid phone number.');
-        valid = false;
-      }
-      if (!valid) return null;
-
-      const payload = {
-        display_name: displayName,
-        phone,
-        is_active: activeToggle.checked,
-      };
-      const identifier = identifierInput.value.trim();
-      if (identifier) payload.login_identifier = identifier;
       return payload;
     },
+    /**
+     * Map an ApiError onto the form. Field errors land next to their input;
+     * everything else (non-field, authorization, conflict, server, network,
+     * timeout) lands in the always-visible form alert so a failure is never
+     * silent. Returns true when a field error was pinned.
+     */
     applyErrors(error) {
-      if (!(error instanceof ApiError)) return;
-      const fields = error.errors || {};
-      if (fields.display_name) setFieldError(nameInput, nameError, [].concat(fields.display_name)[0]);
-      if (fields.phone) setFieldError(phoneInput, phoneError, [].concat(fields.phone)[0]);
+      if (!(error instanceof ApiError)) {
+        showAlert(formAlert, error?.message || 'The member could not be saved. Please try again.');
+        return;
+      }
+      const mapped = mapMemberErrors(error);
+
+      if (mapped.displayName) setFieldError(nameInput, nameError, mapped.displayName);
+      if (mapped.phone) setFieldError(phoneInput, phoneError, mapped.phone);
+      if (mapped.email) setFieldError(emailInput, emailError, mapped.email);
+      showAlert(formAlert, mapped.form || 'The member could not be saved. Please try again.');
+
+      // Focus the first invalid field so retrying is one keystroke away.
+      if (mapped.displayName) nameInput.focus();
+      else if (mapped.phone) phoneInput.focus();
+      else if (mapped.email) emailInput.focus();
+      return Boolean(mapped.displayName || mapped.phone || mapped.email);
     },
   };
 }

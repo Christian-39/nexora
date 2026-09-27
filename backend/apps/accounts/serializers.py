@@ -21,6 +21,22 @@ def avatar_url_for(user, request=None):
     return request.build_absolute_uri(path) if request else path
 
 
+def presence_online_map(user_ids) -> dict:
+    """One ``cache.get_many`` for many users instead of N ``cache.get`` calls.
+
+    With a remote Redis, a per-member lookup inside a serializer turns a
+    25-member page into 25 sequential network round trips. Returns
+    ``{user_id: bool}``.
+    """
+    from django.core.cache import cache
+
+    ids = [str(x) for x in {str(i) for i in user_ids if i}]
+    if not ids:
+        return {}
+    raw = cache.get_many([f"presence:{i}" for i in ids])
+    return {i: bool(raw.get(f"presence:{i}", 0)) for i in ids}
+
+
 class UserSerializer(serializers.ModelSerializer):
     """Administrative projection of a member (admin-only listings)."""
 
@@ -61,30 +77,98 @@ class UserSerializer(serializers.ModelSerializer):
         return obj.credential_state != User.Credential.CHANGED
 
     def get_online(self, obj):
-        from django.core.cache import cache
-
-        return bool(cache.get(f"presence:{obj.id}", 0))
+        # List views pre-compute the whole page with one get_many and pass it
+        # through the context; the single-get path remains for detail views.
+        batched = self.context.get("presence_online_map")
+        if batched is not None:
+            return bool(batched.get(str(obj.id), False))
+        return presence_online_map([obj.id]).get(str(obj.id), False)
 
 
 class MemberCreateSerializer(serializers.Serializer):
-    full_name = serializers.CharField(max_length=150)
-    display_name = serializers.CharField(max_length=150, required=False)
-    phone = serializers.CharField(max_length=18)
+    """The canonical member-creation contract.
+
+    The public API field is ``display_name`` (what the UI and the rest of the
+    API surface use); it maps explicitly onto the model's ``full_name``.
+    ``full_name`` is accepted as a direct alias so API callers written against
+    the model field keep working — exactly one of the two is required.
+
+    Every accepted field is consumed: ``is_active`` and ``email`` are applied
+    by the service, ``phone`` is normalized and validated here so a bad value
+    is reported against the ``phone`` field (and a duplicate too, which the
+    service re-checks authoritatively). Nothing is silently discarded.
+    """
+
+    display_name = serializers.CharField(max_length=150, required=False, allow_blank=True)
+    full_name = serializers.CharField(max_length=150, required=False, allow_blank=True)
+    phone = serializers.CharField(max_length=32)
     email = serializers.EmailField(required=False, allow_blank=True)
+    is_active = serializers.BooleanField(required=False)
 
     def validate(self, attrs):
-        if not attrs.get("full_name") and attrs.get("display_name"):
-            attrs["full_name"] = attrs["display_name"]
+        name = (attrs.get("display_name") or "").strip() or (attrs.get("full_name") or "").strip()
+        if not name:
+            raise serializers.ValidationError(
+                {"display_name": ["A display name is required."]}
+            )
+        attrs["full_name"] = name
         attrs.pop("display_name", None)
+        attrs["email"] = (attrs.get("email") or "").strip() or ""
+
+        # Normalize here (not only in the service) so invalid numbers surface
+        # as field errors the form can pin to the phone input.
+        from .services import normalize_phone
+
+        try:
+            attrs["phone"] = normalize_phone(attrs["phone"])
+        except Exception:
+            raise serializers.ValidationError(
+                {"phone": ["Enter a valid international phone number, e.g. +2348012345678."]}
+            )
         return attrs
 
 
 class MemberUpdateSerializer(serializers.ModelSerializer):
+    """Administrative member updates.
+
+    ``display_name`` is the public API field (model: ``full_name``). ``phone``
+    is accepted and re-normalized here so the edit form's phone input is real,
+    not decorative; duplicates are refused against every *other* user.
+    Activation state deliberately has its own endpoints (activate/deactivate,
+    which also revoke sessions) and is not patchable here.
+    """
+
     display_name = serializers.CharField(source="full_name", required=False, max_length=150)
+    phone = serializers.CharField(max_length=32, required=False, allow_blank=True)
 
     class Meta:
         model = User
-        fields = ["full_name", "display_name", "email"]
+        fields = ["full_name", "display_name", "email", "phone"]
+
+    def validate_phone(self, value):
+        from .services import normalize_phone
+
+        value = str(value or "").strip()
+        if not value:
+            return value
+        try:
+            return normalize_phone(value)
+        except Exception:
+            raise serializers.ValidationError(
+                "Enter a valid international phone number, e.g. +2348012345678."
+            )
+
+    def validate(self, attrs):
+        phone = attrs.get("phone")
+        if phone:
+            sister = User.objects.filter(phone=phone).exclude(pk=self.instance.pk).exists()
+            if sister:
+                raise serializers.ValidationError({"phone": ["A user with that phone number already exists."]})
+        # A blanked display name is never acceptable when the field is present.
+        name = attrs.get("full_name")
+        if name is not None and not str(name).strip():
+            raise serializers.ValidationError({"display_name": ["A display name is required."]})
+        return attrs
 
 
 class PinSerializer(serializers.Serializer):

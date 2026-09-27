@@ -111,19 +111,23 @@ export class SettingsController {
 
   async renderProfile(container) {
     clear(container);
-    container.append(loadingRow('Loading profile…'));
 
-    let me;
-    try {
-      me = await api.me.get();
-      patchUser(me);
-    } catch (error) {
-      clear(container);
-      container.append(errorState({ text: error.message }));
-      return;
+    // The session bootstrap (auth.js) already fetched /api/me/ before this
+    // page rendered — the ProfileSerializer document includes everything the
+    // profile form needs (editable_fields, privacy flags, avatar). Re-fetch
+    // only when the cached user genuinely lacks the data (older backend).
+    let me = getUser();
+    if (!me || !Array.isArray(me.editable_fields)) {
+      try {
+        me = await api.me.get();
+        patchUser(me);
+      } catch (error) {
+        clear(container);
+        container.append(errorState({ text: error.message }));
+        return;
+      }
     }
 
-    clear(container);
     const editable = new Set(me.editable_fields || ['display_name', 'avatar', 'phone_visible']);
 
     const nameId = uid('p');

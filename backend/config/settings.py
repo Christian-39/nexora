@@ -119,7 +119,11 @@ DATABASE_USER = config("DATABASE_USER", default=config("DB_USER", default=""))
 DATABASE_PASSWORD = config("DATABASE_PASSWORD", default=config("DB_PASSWORD", default=""))
 DATABASE_HOST = config("DATABASE_HOST", default=config("DB_HOST", default="127.0.0.1"))
 DATABASE_PORT = config("DATABASE_PORT", default=config("DB_PORT", default=3306), cast=int)
-DATABASE_CONN_MAX_AGE = config("DATABASE_CONN_MAX_AGE", default=60, cast=int)
+#: External managed MySQL is reached over the network; a short max age makes a
+#: low-traffic deployment pay a full TCP+auth handshake on almost every request.
+#: Five minutes keeps connections warm without outliving typical server limits
+#: (MySQL's default wait_timeout is 28800s).
+DATABASE_CONN_MAX_AGE = config("DATABASE_CONN_MAX_AGE", default=300, cast=int)
 
 if TESTING:
     DATABASES = {
@@ -182,12 +186,64 @@ LOCAL_FRONTEND_ORIGINS = [
     for port in (3000, 4173, 5173, 5500, 5501, 8080, 8081)
 ]
 
-CORS_ALLOWED_ORIGINS = config("CORS_ALLOWED_ORIGINS", default="", cast=csv_list)
-CSRF_TRUSTED_ORIGINS = config("CSRF_TRUSTED_ORIGINS", default="", cast=csv_list)
+
+def normalize_origin(value: str) -> str | None:
+    """Canonicalise one configured origin.
+
+    Accepts sloppy deployment input — ``https://host/`` , ``host`` — and always
+    produces ``https://host`` (or ``http://…`` only on an explicit http scheme).
+    Empty values are dropped so a stray comma can never widen the allowlist.
+    """
+    text = str(value or "").strip().rstrip("/")
+    if not text:
+        return None
+    if "://" not in text:
+        # A bare hostname is trusted to be the production HTTPS frontend.
+        text = f"https://{text}"
+    scheme, _, rest = text.partition("://")
+    if scheme.lower() not in ("http", "https") or not rest:
+        return None
+    return f"{scheme.lower()}://{rest}"
+
+
+def _origin_list(*values) -> list[str]:
+    out: list[str] = []
+    for value in values:
+        for item in (value if isinstance(value, (list, tuple)) else str(value).replace("\n", ",").split(",")):
+            normalized = normalize_origin(item)
+            if normalized and normalized not in out:
+                out.append(normalized)
+    return out
+
+
+CORS_ALLOWED_ORIGINS = _origin_list(config("CORS_ALLOWED_ORIGINS", default=""))
+CSRF_TRUSTED_ORIGINS = _origin_list(config("CSRF_TRUSTED_ORIGINS", default=""))
+
+# Configure one list and the other follows: the frontend origin must be able
+# to both send credentialed CORS requests and pass Django's CSRF origin check.
+if CORS_ALLOWED_ORIGINS and not CSRF_TRUSTED_ORIGINS:
+    CSRF_TRUSTED_ORIGINS = list(CORS_ALLOWED_ORIGINS)
+elif CSRF_TRUSTED_ORIGINS and not CORS_ALLOWED_ORIGINS:
+    CORS_ALLOWED_ORIGINS = list(CSRF_TRUSTED_ORIGINS)
 
 if DEBUG:
     CORS_ALLOWED_ORIGINS = sorted(set(CORS_ALLOWED_ORIGINS) | set(LOCAL_FRONTEND_ORIGINS))
     CSRF_TRUSTED_ORIGINS = sorted(set(CSRF_TRUSTED_ORIGINS) | set(LOCAL_FRONTEND_ORIGINS))
+
+#: WebSocket handshakes are NOT covered by the same-origin policy. With
+#: SameSite=None cookies any site could otherwise open an authenticated socket
+#: for a signed-in visitor, so the ASGI origin allowlist mirrors the frontend
+#: origins (see config/asgi.py::OriginAllowlist).
+WEBSOCKET_ALLOWED_ORIGINS = _origin_list(
+    config("WEBSOCKET_ALLOWED_ORIGINS", default=""),
+    CORS_ALLOWED_ORIGINS,
+)
+
+#: Render injects the service's public hostname; it must always be servable
+#: (health checks hit it directly) even when ALLOWED_HOSTS lists a custom one.
+_render_hostname = config("RENDER_EXTERNAL_HOSTNAME", default="").strip()
+if _render_hostname and _render_hostname not in ALLOWED_HOSTS:
+    ALLOWED_HOSTS = [*ALLOWED_HOSTS, _render_hostname]
 
 CORS_ALLOW_ALL_ORIGINS = False
 CORS_ALLOW_CREDENTIALS = True
@@ -287,17 +343,58 @@ SESSION_COOKIE_HTTPONLY = True
 SESSION_COOKIE_SAMESITE = COOKIE_SAMESITE
 SESSION_COOKIE_SECURE = COOKIE_SECURE
 
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- 
 # Redis: channel layer, cache, presence, durable workers
 # ---------------------------------------------------------------------------
 
 REDIS_URL = config("REDIS_URL", default="")
+#: Managed Redis providers that terminate TLS themselves (e.g. Redis Cloud on
+#: Render) present a certificate uvicorn's default verification rejects; the
+#: deployment must explicitly opt out, never silently.
+REDIS_SSL_CERT_REQS = config("REDIS_SSL_CERT_REQS", default="")
+
+
+def _redis_host(value: str):
+    """Validate and normalise REDIS_URL before boot.
+
+    A malformed URL ("localhost:6379", missing scheme) must fail loudly here
+    rather than surface as an inscrutable channel-layer error on first use.
+    """
+    from urllib.parse import urlparse
+
+    raw = str(value or "").strip()
+    if not raw:
+        return raw
+    parsed = urlparse(raw)
+    if parsed.scheme not in ("redis", "rediss", "unix") or not (parsed.hostname or "").strip():
+        raise ImproperlyConfigured(
+            "REDIS_URL must be a valid redis:// , rediss:// or unix:// URL "
+            "(for example redis://host:6379/0)."
+        )
+    return raw
+
+
+REDIS_URL = _redis_host(REDIS_URL)
+
+
+def _redis_channel_hosts(url: str):
+    """Channel-layer host entries, with an opt-in TLS-verification override."""
+    if not url:
+        return [url]
+    if url.startswith("rediss://") and REDIS_SSL_CERT_REQS.strip().lower() == "none":
+        return [{"address": url, "ssl_cert_reqs": None}]
+    return [url]
+
 
 if REDIS_URL and not TESTING:
     CHANNEL_LAYERS = {
         "default": {
             "BACKEND": "channels_redis.core.RedisChannelLayer",
-            "CONFIG": {"hosts": [REDIS_URL], "capacity": 1500, "expiry": 20},
+            "CONFIG": {
+                "hosts": _redis_channel_hosts(REDIS_URL),
+                "capacity": 1500,
+                "expiry": 20,
+            },
         }
     }
     CACHES = {

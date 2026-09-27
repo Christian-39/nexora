@@ -102,27 +102,46 @@ export function setNotificationUnread(count) {
   recompute();
 }
 
-/** Refresh authoritative counts. Called on load, on reconnect, on focus. */
-export async function refreshUnread({ signal } = {}) {
-  try {
-    const summary = await api.conversations.unreadSummary({ signal, retries: 1 });
-    applyUnreadSummary(summary);
-    return summary;
-  } catch (error) {
-    if (error instanceof ApiError && (error.isNotFound)) {
-      // Deployment without the summary endpoint: fall back to the list payload.
-      try {
-        const response = await api.conversations.list({ limit: 50 }, { signal });
-        const page = normalizePage(response.data ?? response);
-        unread.byConversation.clear();
-        for (const conv of page.items) {
-          unread.byConversation.set(String(conv.id), Number(conv.unread_count) || 0);
-        }
-        recompute();
-      } catch { /* leave counts untouched */ }
+/** Refresh authoritative counts. Called on load, on reconnect, on focus.
+ *
+ *  Those three triggers routinely fire within the same second (page load
+ *  opens the socket, the socket opening refreshes again, focus lands too),
+ *  so the in-flight call is shared and a just-completed result is reused for
+ *  a short window instead of hammering the summary endpoint.
+ */
+let unreadRefreshInFlight = null;
+let unreadRefreshAt = 0;
+const UNREAD_REFRESH_DEDUP_MS = 2500;
+
+export async function refreshUnread({ force = false, signal } = {}) {
+  if (unreadRefreshInFlight) return unreadRefreshInFlight;
+  if (!force && Date.now() - unreadRefreshAt < UNREAD_REFRESH_DEDUP_MS) return null;
+
+  unreadRefreshInFlight = (async () => {
+    try {
+      const summary = await api.conversations.unreadSummary({ signal, retries: 1 });
+      applyUnreadSummary(summary);
+      return summary;
+    } catch (error) {
+      if (error instanceof ApiError && (error.isNotFound)) {
+        // Deployment without the summary endpoint: fall back to the list payload.
+        try {
+          const response = await api.conversations.list({ limit: 50 }, { signal });
+          const page = normalizePage(response.data ?? response);
+          unread.byConversation.clear();
+          for (const conv of page.items) {
+            unread.byConversation.set(String(conv.id), Number(conv.unread_count) || 0);
+          }
+          recompute();
+        } catch { /* leave counts untouched */ }
+      }
+      return null;
+    } finally {
+      unreadRefreshAt = Date.now();
+      unreadRefreshInFlight = null;
     }
-    return null;
-  }
+  })();
+  return unreadRefreshInFlight;
 }
 
 /* ============================================================

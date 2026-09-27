@@ -1,9 +1,20 @@
 """Cached accessors for the organization's database configuration.
 
 ``messaging_policy()`` is consulted by the messaging, media, group and
-notification layers on every relevant operation, so it is cached briefly and
-invalidated whenever the administrator saves settings.
+notification layers on every relevant operation — including several times per
+serialized message (can_edit / can_delete / can_react) — so it is cached at
+two levels:
+
+* a per-process micro-cache (a few seconds) so a page of messages does not
+  cost one Redis round trip per policy field;
+* a shared Redis cache (60s) so the database is not queried per request.
+
+``invalidate()`` (called on every administrator save) drops both levels, so a
+policy change becomes effective immediately on the saving process and within
+seconds everywhere else. Nothing here ever caches private/user data.
 """
+
+import time
 
 from django.core.cache import cache
 
@@ -11,6 +22,10 @@ from .models import PlatformConfiguration
 
 CACHE_KEY = "platform:messaging_policy"
 CACHE_TTL = 60
+#: Upper bound on how long another worker may serve a superseded policy.
+LOCAL_CACHE_TTL = 5.0
+
+_local = {"at": 0.0, "value": None}
 
 DEFAULTS = {
     "max_message_length": 5000,
@@ -54,15 +69,21 @@ def configuration() -> PlatformConfiguration | None:
 
 
 def messaging_policy() -> dict:
+    now = time.monotonic()
+    if _local["value"] is not None and now - _local["at"] < LOCAL_CACHE_TTL:
+        return _local["value"]
     cached = cache.get(CACHE_KEY)
     if cached is not None:
+        _local["at"], _local["value"] = now, cached
         return cached
     row = configuration()
     value = {key: getattr(row, key, default) if row else default for key, default in DEFAULTS.items()}
     cache.set(CACHE_KEY, value, CACHE_TTL)
+    _local["at"], _local["value"] = now, value
     return value
 
 
 def invalidate() -> None:
+    _local["at"], _local["value"] = 0.0, None
     cache.delete(CACHE_KEY)
     cache.delete("platform:public_config")

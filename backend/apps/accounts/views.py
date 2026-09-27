@@ -45,6 +45,7 @@ from .serializers import (
     PreferencesSerializer,
     ProfileSerializer,
     UserSerializer,
+    presence_online_map,
 )
 from .services import create_member, initial_pin, normalize_phone, register_failure
 from .session_serializers import SessionSerializer
@@ -378,6 +379,24 @@ class MemberViewSet(viewsets.ModelViewSet):
 
     def get_serializer_context(self):
         return {**super().get_serializer_context(), "request": self.request}
+
+    def list(self, request, *args, **kwargs):
+        """One presence read for the whole page instead of one per row."""
+        queryset = self.filter_queryset(self.get_queryset())
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            rows = page
+            wrap = self.get_paginated_response
+        else:
+            # Pagination disabled for this caller: return the plain envelope.
+            rows = list(queryset[:200])
+            wrap = lambda data: envelope("Members retrieved", data)  # noqa: E731
+        context = {
+            **self.get_serializer_context(),
+            "presence_online_map": presence_online_map(row.id for row in rows),
+        }
+        serializer = self.get_serializer(rows, many=True, context=context)
+        return wrap(serializer.data)
 
     def initial(self, request, *args, **kwargs):
         super().initial(request, *args, **kwargs)

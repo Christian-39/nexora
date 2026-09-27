@@ -61,13 +61,71 @@ class ConversationViewSet(viewsets.ReadOnlyModelViewSet):
             )
             .select_related("admin", "member", "group")
             .prefetch_related(Prefetch("participants__user"))
-            .annotate(last_message_at=Subquery(latest.values("created_at")[:1]), unread_count=Subquery(unread))
+            .annotate(
+                last_message_at=Subquery(latest.values("created_at")[:1]),
+                # The page's last messages are then fetched with ONE query in
+                # list() instead of one query per conversation.
+                latest_message_id=Subquery(latest.values("id")[:1]),
+                # Coalesce: an empty conversation annotates to 0, never NULL,
+                # so the serializer's annotation check cannot fall through to
+                # a per-conversation COUNT query.
+                unread_count=models.functions.Coalesce(Subquery(unread), 0),
+            )
             .distinct()
             .order_by(models.F("last_message_at").desc(nulls_last=True), "-updated_at")
         )
 
     def get_serializer_context(self):
         return {**super().get_serializer_context(), "request": self.request}
+
+    def list(self, request, *args, **kwargs):
+        """The conversation list with zero per-row queries.
+
+        The queryset already annotates ``last_message_at`` and ``unread_count``
+        (subqueries, one pass). Here the page additionally receives:
+
+        * ``latest_messages``  — one query for the whole page's last messages
+          (the serializer used to issue one query per conversation);
+        * ``presence_online_map`` — one ``cache.get_many`` for every
+          participant/counterpart on the page (used to be one Redis round
+          trip per participant).
+        """
+        queryset = self.filter_queryset(self.get_queryset())
+        page = self.paginate_queryset(queryset)
+        rows = page if page is not None else list(queryset)
+
+        latest_messages = {}
+        latest_ids = [row.latest_message_id for row in rows if row.latest_message_id]
+        if latest_ids:
+            messages = (
+                Message.objects.filter(id__in=latest_ids)
+                .select_related(*MESSAGE_SELECT)
+                .prefetch_related(*MESSAGE_PREFETCH)
+            )
+            latest_messages = {m.conversation_id: m for m in messages}
+
+        presence_map = None
+        user_ids = set()
+        for row in rows:
+            for participant in row.participants.all():
+                user_ids.add(participant.user_id)
+            if row.kind == Conversation.Kind.PRIVATE:
+                if row.admin_id:
+                    user_ids.add(row.admin_id)
+                if row.member_id:
+                    user_ids.add(row.member_id)
+        if user_ids:
+            from apps.accounts.serializers import presence_online_map
+
+            presence_map = presence_online_map(user_ids)
+
+        context = {
+            **self.get_serializer_context(),
+            "latest_messages": latest_messages,
+            "presence_online_map": presence_map or {},
+        }
+        serializer = self.get_serializer(rows, many=True, context=context)
+        return self.get_paginated_response(serializer.data)
 
     def create(self, request, *args, **kwargs):
         """Open (or reuse) the private conversation with one counterpart."""
@@ -99,8 +157,17 @@ class ConversationViewSet(viewsets.ReadOnlyModelViewSet):
                 .order_by("-created_at")
             )
             page = self.paginate_queryset(queryset)
+            from apps.accounts.serializers import presence_online_map
+
+            context = {
+                "request": request,
+                # One presence read for the page's senders instead of per row.
+                "presence_online_map": presence_online_map(
+                    {message.sender_id for message in page or []}
+                ),
+            }
             return self.get_paginated_response(
-                MessageSerializer(page, many=True, context={"request": request}).data
+                MessageSerializer(page, many=True, context=context).data
             )
 
         if request.FILES.get("file"):

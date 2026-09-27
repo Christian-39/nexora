@@ -122,4 +122,11 @@ def public_config(request):
     if cached is None:
         cached = build_public_config(request)
         cache.set(CACHE_KEY, cached, 60)
-    return Response({"success": True, "message": "Configuration retrieved", "data": cached})
+    response = Response({"success": True, "message": "Configuration retrieved", "data": cached})
+    # Public, non-sensitive configuration (branding, limits, feature flags).
+    # A one-minute shared cache means a multi-page app does not re-download it
+    # on every navigation; authenticated/private responses are never cached
+    # like this anywhere else in the API.
+    response["Cache-Control"] = "public, max-age=60, stale-while-revalidate=300"
+    response["Vary"] = "Accept-Encoding"
+    return response

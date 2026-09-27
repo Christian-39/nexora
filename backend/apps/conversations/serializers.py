@@ -29,17 +29,25 @@ def avatar_url(user, request=None) -> str | None:
     return request.build_absolute_uri(path) if request else path
 
 
-def participant_payload(user, *, viewer=None, request=None) -> dict:
+def participant_payload(user, *, viewer=None, request=None, presence=None) -> dict:
     """Public projection of a user, honouring their privacy settings.
 
     The administrator always sees phone numbers (they manage membership);
     members see another user's phone only when that user allows it.
+
+    ``presence`` is an optional precomputed ``{user_id: bool}`` map: list views
+    pass one built with a single ``get_many`` so a page of participants does
+    not cost one Redis round trip each.
     """
     if user is None:
         return None
     is_admin_viewer = getattr(viewer, "role", None) == "ADMIN"
     show_phone = is_admin_viewer or user.show_phone or (viewer is not None and viewer.id == user.id)
     presence_visible = user.show_last_seen or is_admin_viewer
+    if presence is not None:
+        online = bool(presence.get(str(user.id), False)) if presence_visible else None
+    else:
+        online = bool(cache.get(f"presence:{user.id}", 0)) if presence_visible else None
     return {
         "id": str(user.id),
         "display_name": user.full_name,
@@ -48,7 +56,7 @@ def participant_payload(user, *, viewer=None, request=None) -> dict:
         "is_admin": user.role == "ADMIN",
         "is_active": user.is_active,
         "presence_visible": presence_visible,
-        "online": bool(cache.get(f"presence:{user.id}", 0)) if presence_visible else None,
+        "online": online,
         "last_seen": user.last_seen.isoformat() if (presence_visible and user.last_seen) else None,
     }
 
@@ -215,7 +223,12 @@ class MessageSerializer(serializers.ModelSerializer):
         return getattr(request, "user", None) if request else self.context.get("viewer")
 
     def get_sender(self, obj):
-        return participant_payload(obj.sender, viewer=self._viewer, request=self.context.get("request"))
+        return participant_payload(
+            obj.sender,
+            viewer=self._viewer,
+            request=self.context.get("request"),
+            presence=self.context.get("presence_online_map"),
+        )
 
     def get_reactions(self, obj):
         return [
@@ -329,6 +342,11 @@ class ConversationSerializer(serializers.ModelSerializer):
             viewer = User.objects.filter(id=self.context["for_user_id"]).first()
         return viewer
 
+    @property
+    def _presence(self):
+        """Precomputed online map for the whole page (list views), if any."""
+        return self.context.get("presence_online_map")
+
     def _group(self, obj):
         return getattr(obj, "group", None)
 
@@ -356,7 +374,9 @@ class ConversationSerializer(serializers.ModelSerializer):
             return None
         viewer = self._viewer
         other = obj.member if viewer and viewer.id == obj.admin_id else obj.admin
-        return participant_payload(other, viewer=viewer, request=self.context.get("request"))
+        return participant_payload(
+            other, viewer=viewer, request=self.context.get("request"), presence=self._presence
+        )
 
     def get_participants(self, obj):
         viewer = self._viewer
@@ -366,7 +386,7 @@ class ConversationSerializer(serializers.ModelSerializer):
             if group and viewer and viewer.role != "ADMIN" and not group.members_can_view_members:
                 return []
         return [
-            participant_payload(p.user, viewer=viewer, request=request)
+            participant_payload(p.user, viewer=viewer, request=request, presence=self._presence)
             for p in obj.participants.all()
             if p.is_active
         ]
@@ -375,6 +395,13 @@ class ConversationSerializer(serializers.ModelSerializer):
         return sum(1 for p in obj.participants.all() if p.is_active)
 
     def get_last_message(self, obj):
+        # List views pre-fetch the page's latest messages in one query and
+        # pass them through the context. When that map is present, a missing
+        # entry legitimately means "no messages yet" — no per-conversation
+        # query is needed for empty conversations either.
+        if "latest_messages" in self.context:
+            message = self.context["latest_messages"].get(obj.id)
+            return MessageSerializer(message, context=self.context).data if message else None
         message = getattr(obj, "latest_message", None)
         if message is None:
             message = obj.messages.order_by("-created_at").first()

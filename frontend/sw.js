@@ -12,7 +12,7 @@
  * client can classify, never a stale message list.
  */
 
-const VERSION = 'v1.2.0';
+const VERSION = 'v1.3.0';
 const PRECACHE = `nexora-shell-${VERSION}`;
 const RUNTIME = `nexora-static-${VERSION}`;
 const OFFLINE_URL = 'offline.html';
@@ -43,6 +43,7 @@ const PRECACHE_URLS = [
   'assets/js/api.js',
   'assets/js/config.js',
   'assets/js/auth.js',
+  'assets/js/connection-ux.js',
   'assets/js/chat.js',
   'assets/js/groups.js',
   'assets/js/media.js',

@@ -35,7 +35,13 @@ import { Emitter, backoffDelay } from './utils.js';
 /** @typedef {'idle'|'connecting'|'open'|'reconnecting'|'offline'|'closed'} ConnectionState */
 
 const HEARTBEAT_INTERVAL = 25000;
-const HEARTBEAT_TIMEOUT = 12000;
+// A pong may legitimately be delayed by a slow radio or a busy server; 15s
+// still recycles a zombie connection within one heartbeat cycle + margin.
+const HEARTBEAT_TIMEOUT = 15000;
+// A handshake that never completes (cold server, black-holed SYN) must not
+// hang the client in "connecting" forever: recycle it into the normal
+// bounded backoff instead. (Runtime-overridable for tests/deployment tuning.)
+const CONNECT_TIMEOUT = Number(runtimeConfig.CONNECT_TIMEOUT) || 15000;
 const MAX_RECONNECT_DELAY = 30000;
 const MAX_QUEUE = 40;
 
@@ -64,6 +70,7 @@ class RealtimeClient {
   #state = 'idle';
   #attempt = 0;
   #reconnectTimer = null;
+  #connectTimer = null;
   #heartbeatTimer = null;
   #pongTimer = null;
   #queue = [];
@@ -192,6 +199,7 @@ class RealtimeClient {
 
     const epoch = ++this.#epoch;
     this.#everOpened = false;
+    const startedAt = Date.now();
 
     let socket;
     let url;
@@ -206,19 +214,34 @@ class RealtimeClient {
     debug('connecting', url);
     this.#socket = socket;
 
+    // Safety net: a handshake stuck for CONNECT_TIMEOUT (cold backend,
+    // silently dropped upgrade) is recycled into the normal backoff path
+    // instead of leaving the client in "connecting" forever.
+    this.#connectTimer = setTimeout(() => {
+      if (epoch !== this.#epoch || !this.#socket) return;
+      if (this.#socket.readyState !== WebSocket.CONNECTING) return;
+      debug('handshake timeout after', CONNECT_TIMEOUT);
+      try { this.#socket.close(4000, 'connect-timeout'); } catch { /* ignore */ }
+      this.#socket = null;
+      this.#epoch += 1; // orphan this generation's handlers
+      this.#scheduleReconnect();
+    }, CONNECT_TIMEOUT);
+
     socket.addEventListener('open', () => {
       if (epoch !== this.#epoch) return;
+      clearTimeout(this.#connectTimer);
+      this.#connectTimer = null;
       this.#attempt = 0;
       this.#everOpened = true;
       this.#recovering = false;
       // A connection that actually opened proves the credential works, so the
       // one-shot refresh budget is restored for the next outage.
       this.#refreshUsed = false;
-      debug('open');
+      debug('open in', `${Date.now() - startedAt}ms`);
       this.#setState('open');
       this.#flushQueue();
       this.#startHeartbeat();
-      socketEvents.emit('open', { epoch });
+      socketEvents.emit('open', { epoch, durationMs: Date.now() - startedAt });
     });
 
     socket.addEventListener('message', (event) => {
@@ -263,10 +286,12 @@ class RealtimeClient {
 
     socket.addEventListener('close', (event) => {
       if (epoch !== this.#epoch) return;
+      clearTimeout(this.#connectTimer);
+      this.#connectTimer = null;
       this.#clearTimers();
       this.#socket = null;
       const openedThisTime = this.#everOpened;
-      debug('close', { code: event.code, reason: event.reason || '', opened: openedThisTime });
+      debug('close', { code: event.code, reason: event.reason || '', opened: openedThisTime, livedMs: Date.now() - startedAt });
       socketEvents.emit('close', { code: event.code, reason: event.reason });
 
       if (this.#manualClose) {
@@ -441,12 +466,17 @@ class RealtimeClient {
   #clearTimers() {
     clearTimeout(this.#reconnectTimer);
     this.#reconnectTimer = null;
+    clearTimeout(this.#connectTimer);
+    this.#connectTimer = null;
     this.#clearHeartbeat();
   }
 
   #bindLifecycle() {
     window.addEventListener('online', () => {
       if (this.#manualClose || !this.#started) return;
+      // A genuine connectivity transition starts a fresh cycle (the offline
+      // handler closed the socket and froze the timers). This is the only
+      // place besides a successful open that resets the backoff.
       this.#attempt = 0;
       if (!this.isOpen) this.#connect(); // exactly one controlled attempt
     });
@@ -461,12 +491,13 @@ class RealtimeClient {
     });
 
     // PWA backgrounding / tab suspension: reconnect promptly on return and
-    // let listeners resynchronise state from REST.
+    // let listeners resynchronise state from REST. The backoff position is
+    // deliberately NOT reset here — repeatedly backgrounding/foregrounding a
+    // tab against a struggling server must not restart the retry storm.
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState !== 'visible') return;
       if (this.#manualClose || !this.#started) return;
       if (!this.isOpen) {
-        this.#attempt = 0;
         this.#connect();
       } else {
         socketEvents.emit('resume');
@@ -477,7 +508,6 @@ class RealtimeClient {
       if (!event.persisted) return;
       if (this.#manualClose || !this.#started) return;
       if (!this.isOpen) {
-        this.#attempt = 0;
         this.#connect();
       }
     });

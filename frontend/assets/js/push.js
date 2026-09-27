@@ -97,8 +97,14 @@ function watchForUpdates(reg) {
   });
 
   let reloading = false;
+  // A controllerchange fires both when an update is accepted (reload wanted)
+  // and on the very FIRST registration, when activate()'s clients.claim()
+  // takes control of a page that was previously uncontrolled. That first
+  // claim is not an update — reloading there would run every page (and its
+  // API calls) twice for nothing.
+  const hadController = Boolean(navigator.serviceWorker.controller);
   navigator.serviceWorker.addEventListener('controllerchange', () => {
-    if (reloading) return;
+    if (reloading || !hadController) return;
     reloading = true;
     window.location.reload();
   });

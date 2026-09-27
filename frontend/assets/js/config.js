@@ -165,7 +165,9 @@ export const config = Object.freeze({
   AUTH_MODE: String(RUNTIME.authMode || readMeta('nexora-auth-mode') || 'cookie').toLowerCase(),
   CSRF_COOKIE: RUNTIME.csrfCookie || readMeta('nexora-csrf-cookie') || 'csrftoken',
   CSRF_HEADER: RUNTIME.csrfHeader || readMeta('nexora-csrf-header') || 'X-CSRFToken',
-  REQUEST_TIMEOUT: Number(RUNTIME.requestTimeout) || 20000,
+  REQUEST_TIMEOUT: Number(RUNTIME.requestTimeout) || 15000,
+  /** WebSocket handshake guard: recycle a stuck CONNECTING socket (ms). */
+  CONNECT_TIMEOUT: Number(RUNTIME.connectTimeoutMs) || 15000,
   UPLOAD_TIMEOUT: Number(RUNTIME.uploadTimeout) || 0,
   SOCKET_PATH: RUNTIME.socketPath || readMeta('nexora-ws-path') || '/ws/app/',
   IS_LOCAL_DEV: isLocalDevFrontend(),

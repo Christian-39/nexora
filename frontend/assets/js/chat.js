@@ -108,6 +108,7 @@ export class ChatController {
     this.activeId = null;
     this.listCursor = null;
     this.listLoading = false;
+    this.listAbort = null;
     this.listQuery = '';
     this.listFilter = 'all';
     this.threadAbort = null;
@@ -150,6 +151,7 @@ export class ChatController {
   destroy() {
     this.destroyed = true;
     this.threadAbort?.abort();
+    this.listAbort?.abort();
     this.recorder?.cancel();
   }
 
@@ -199,6 +201,10 @@ export class ChatController {
     const { listEl } = this.refs;
     if (!listEl || this.listLoading) return;
     this.listLoading = true;
+    // A new list request supersedes any in-flight one (search typing, filter
+    // switching); the abandoned request is aborted instead of racing back.
+    this.listAbort?.abort();
+    this.listAbort = new AbortController();
 
     if (reset) {
       this.listCursor = null;
@@ -216,7 +222,7 @@ export class ChatController {
       if (this.options.scope === 'groups') params.type = 'group';
       if (this.options.scope === 'direct') params.type = 'direct';
 
-      const response = await api.conversations.list(params);
+      const response = await api.conversations.list(params, { signal: this.listAbort.signal });
       const page = normalizePage(response.data ?? response);
 
       if (reset) {
@@ -236,6 +242,7 @@ export class ChatController {
       this.listCursor = page.next;
       this.renderList();
     } catch (error) {
+      if (error instanceof ApiError && error.isAborted) return; // superseded, not failed
       clear(listEl);
       listEl.append(errorState({ title: 'Unable to load conversations', text: error.message, onRetry: () => this.loadConversations({ reset: true }) }));
     } finally {

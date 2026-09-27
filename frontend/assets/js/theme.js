@@ -14,6 +14,11 @@ import { Emitter, isHexColor, isSafeHttpUrl, prefs } from './utils.js';
 const THEME_KEY = 'theme';
 const CONFIG_CACHE_KEY = 'publicConfig';
 const CONFIG_CACHE_TTL = 15 * 60 * 1000; // branding is public + low-churn
+// How long a cached configuration is served without even revalidating. A
+// multi-page app navigates often; without this gate every navigation made a
+// /api/public/config/ request the HTTP cache and a 5-minute freshness window
+// now make redundant. Force refreshes (admin saves) bypass it.
+const CONFIG_FRESH_WINDOW = 5 * 60 * 1000;
 
 export const themeEvents = new Emitter();
 
@@ -135,13 +140,19 @@ function readCache() {
   return cached.value || null;
 }
 
+function cacheAge() {
+  const cached = prefs.get(CONFIG_CACHE_KEY);
+  return cached?.at ? Date.now() - cached.at : Number.POSITIVE_INFINITY;
+}
+
 function writeCache(value) {
   prefs.set(CONFIG_CACHE_KEY, { at: Date.now(), value });
 }
 
 /**
  * Load and apply public configuration. Safe to call on every page.
- * Uses a short-lived local cache so first paint is branded, then revalidates.
+ * Paints from the local cache immediately, and only touches the network when
+ * the cache is missing or older than the freshness window (or on force).
  * @param {object} [options] { force }
  */
 export async function loadBranding(options = {}) {
@@ -154,7 +165,14 @@ export async function loadBranding(options = {}) {
     applyBranding(currentConfig);
   }
 
-  // 2. Revalidate against the backend.
+  // 2. Fresh enough? Serve from cache with zero network work. Explicit
+  //    refreshes (administrator saves) always revalidate.
+  if (cached && !options.force && cacheAge() < CONFIG_FRESH_WINDOW) {
+    themeEvents.emit('config', currentConfig);
+    return currentConfig;
+  }
+
+  // 3. Revalidate against the backend.
   loadPromise = (async () => {
     try {
       const data = await api.publicConfig();

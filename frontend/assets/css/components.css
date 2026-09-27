@@ -658,6 +658,7 @@
   animation: nx-spin 700ms linear infinite;
   flex: none;
 }
+.spinner--sm { width: 13px; height: 13px; }
 .spinner--lg { width: 28px; height: 28px; border-width: 3px; }
 .loading-row {
   display: flex;

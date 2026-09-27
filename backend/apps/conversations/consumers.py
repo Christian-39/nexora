@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 
 from channels.db import database_sync_to_async
@@ -31,6 +32,10 @@ from . import realtime
 
 TYPING_TIMEOUT = 8
 MAX_JOINED_CONVERSATIONS = 40
+
+#: Structured, credential-free lifecycle logging: connect/close timings and
+#: close codes are the only way to diagnose production reconnect loops.
+logger = logging.getLogger("nexora.realtime")
 
 
 class BaseAuthenticatedConsumer(AsyncJsonWebsocketConsumer):
@@ -93,6 +98,7 @@ class AppConsumer(BaseAuthenticatedConsumer):
         if not await self._authenticate():
             return
 
+        started = time.monotonic()
         self.joined: set[str] = set()
         self.typing_tasks: dict[str, asyncio.Task] = {}
         self.presence_audience: list[str] = []
@@ -101,16 +107,23 @@ class AppConsumer(BaseAuthenticatedConsumer):
         await self.accept()
         self._start_expiry_watch()
 
-        self.presence_audience = await self._presence_audience()
-        for group in self.presence_audience:
-            await self.channel_layer.group_add(group, self.channel_name)
-
-        if await self._presence_enabled():
+        # ONE database query + ONE cache read replaces the previous three
+        # full peer scans and N per-peer cache lookups, so the handshake (and
+        # therefore every page navigation, which opens a fresh socket) stops
+        # paying a presence tax proportional to the member count.
+        presence = await self._presence_bootstrap()
+        self.presence_active = presence is not None
+        if presence is not None:
+            peers, online_map, audience_groups = presence
+            self.presence_audience = audience_groups
+            for group in audience_groups:
+                await self.channel_layer.group_add(group, self.channel_name)
             first = await self._presence_increment()
             if first:
-                realtime.broadcast_presence(
-                    self.user.id, online=True, audience=await self._watchers()
-                )
+                realtime.broadcast_presence(self.user.id, online=True, audience=[*peers, str(self.user.id)])
+            snapshot = [{"user_id": str(x), "online": bool(online_map.get(f"presence:{x}", 0))} for x in peers]
+        else:
+            snapshot = []
 
         await self.send_json(
             {
@@ -118,9 +131,13 @@ class AppConsumer(BaseAuthenticatedConsumer):
                 "data": {
                     "user_id": str(self.user.id),
                     "server_time": timezone.now().isoformat(),
-                    "presence": await self._presence_snapshot(),
+                    "presence": snapshot,
                 },
             }
+        )
+        logger.info(
+            "ws.connect user=%s presence_peers=%s ready_ms=%.0f",
+            self.user.id, len(snapshot), (time.monotonic() - started) * 1000,
         )
 
     async def disconnect(self, code):
@@ -133,20 +150,30 @@ class AppConsumer(BaseAuthenticatedConsumer):
             return
         for conversation_id in list(getattr(self, "joined", ())):
             await self.channel_layer.group_discard(realtime.conversation_group(conversation_id), self.channel_name)
-        for group in getattr(self, "presence_audience", ()):
+        # The audience groups are remembered from the handshake: disconnect must
+        # not re-run the peer query (it ran on connect; membership churn since
+        # then is irrelevant to leaving groups).
+        audience_groups = getattr(self, "presence_audience", ())
+        for group in audience_groups:
             await self.channel_layer.group_discard(group, self.channel_name)
         await self.channel_layer.group_discard(realtime.user_group(self.user.id), self.channel_name)
 
-        if await self._presence_enabled():
+        # presence_active (not the audience length) decides the decrement: a
+        # user with zero observable peers still has a presence counter to clear.
+        if getattr(self, "presence_active", False):
             last = await self._presence_decrement()
             if last:
                 last_seen = await self._touch_last_seen()
+                # Broadcast to the same audience the connect used; the peer ids
+                # are derivable from the group names without another query.
+                peers = [group.removeprefix("user_") for group in audience_groups]
                 realtime.broadcast_presence(
                     self.user.id,
                     online=False,
                     last_seen=last_seen if self.user.show_last_seen else None,
-                    audience=await self._watchers(),
+                    audience=[*peers, str(self.user.id)],
                 )
+        logger.info("ws.disconnect user=%s code=%s", getattr(self, "user", None) and self.user.id, code)
 
     # -- inbound ------------------------------------------------------------
 
@@ -311,17 +338,24 @@ class AppConsumer(BaseAuthenticatedConsumer):
         return ids
 
     @database_sync_to_async
-    def _presence_audience(self) -> list[str]:
-        return [realtime.user_group(x) for x in _presence_peers(self.user)]
+    def _presence_bootstrap(self):
+        """Presence handshake data in ONE database query + ONE cache read.
 
-    @database_sync_to_async
-    def _watchers(self) -> list[str]:
-        return [str(x) for x in _presence_peers(self.user)] + [str(self.user.id)]
+        Returns ``(peer_ids, online_map, audience_groups)`` or ``None`` when
+        presence is disabled for this deployment. ``_presence_peers`` is
+        queried once (it used to run three times per connection) and the
+        per-peer ``cache.get`` loop is replaced by a single ``get_many`` —
+        with a remote Redis that difference alone is N network round trips
+        per handshake.
+        """
+        from apps.platform_settings.services import messaging_policy
 
-    @database_sync_to_async
-    def _presence_snapshot(self) -> list[dict]:
+        if not messaging_policy()["presence_enabled"]:
+            return None
         peers = _presence_peers(self.user)
-        return [{"user_id": str(x), "online": bool(cache.get(f"presence:{x}", 0))} for x in peers]
+        online_map = cache.get_many([f"presence:{x}" for x in peers]) if peers else {}
+        audience_groups = [realtime.user_group(x) for x in peers]
+        return peers, online_map, audience_groups
 
     @database_sync_to_async
     def _touch_last_seen(self):
@@ -330,12 +364,6 @@ class AppConsumer(BaseAuthenticatedConsumer):
         now = timezone.now()
         User.objects.filter(id=self.user.id).update(last_seen=now)
         return now
-
-    @database_sync_to_async
-    def _presence_enabled(self) -> bool:
-        from apps.platform_settings.services import messaging_policy
-
-        return messaging_policy()["presence_enabled"]
 
     @database_sync_to_async
     def _typing_enabled(self) -> bool:

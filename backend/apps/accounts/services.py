@@ -11,7 +11,7 @@ def normalize_phone(value):
  return phonenumbers.format_number(p,phonenumbers.PhoneNumberFormat.E164)
 def initial_pin(phone):return ''.join(c for c in normalize_phone(phone) if c.isdigit())[:6]
 @transaction.atomic
-def create_member(*,actor,phone,full_name,email=''):
+def create_member(*,actor,phone,full_name,email='',is_active=True):
  """Only an administrator can create a member.
 
  The initial PIN is the first six digits of the normalized phone number and
@@ -24,7 +24,7 @@ def create_member(*,actor,phone,full_name,email=''):
  except ValidationError as exc:raise DRFValidationError({'phone':exc.messages})
  if User.objects.filter(phone=normalized).exists():raise DRFValidationError({'phone':['A user with that phone number already exists.']})
  pin=initial_pin(normalized)
- return User.objects.create_user(phone=normalized,password=pin,full_name=full_name,email=email,role=User.Role.MEMBER,credential_state=User.Credential.INITIAL)
+ return User.objects.create_user(phone=normalized,password=pin,full_name=full_name,email=email,role=User.Role.MEMBER,credential_state=User.Credential.INITIAL,is_active=bool(is_active))
 def register_failure(user,*,limit=5,minutes=15):
  """Count a failed sign-in and lock the account once the limit is reached.
 

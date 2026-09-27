@@ -39,6 +39,25 @@ const DEFAULTS = {
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 const RETRY_STATUSES = new Set([408, 425, 429, 502, 503, 504]);
 
+/* ============================================================
+   In-flight GET de-duplication
+   When several components ask for the same resource in the same tick
+   (page bootstrap + controller init, two widgets rendering the same list),
+   one network request serves them all. Only requests the caller did NOT
+   attach an AbortSignal to may be shared: a shared request must never be
+   cancelled under one caller's feet. POST/PATCH/… are never deduplicated.
+   ============================================================ */
+
+const inflightGets = new Map();
+
+function dedupeGet(url, run) {
+  const existing = inflightGets.get(url);
+  if (existing) return existing;
+  const promise = run().finally(() => inflightGets.delete(url));
+  inflightGets.set(url, promise);
+  return promise;
+}
+
 export const apiEvents = new Emitter();
 
 /* ============================================================
@@ -422,6 +441,18 @@ export async function refreshSession() {
  * @param {boolean} [options.allowRefresh]
  */
 export async function request(path, options = {}) {
+  const verb = String(options.method || 'GET').toUpperCase();
+  // Identical, cancellable-by-nobody GETs are shared while in flight.
+  // Requests carrying a caller's AbortSignal keep a private lifecycle so a
+  // page navigating away can never cancel another caller's request.
+  if (SAFE_METHODS.has(verb) && !options.signal) {
+    const url = buildUrl(path, options.params);
+    return dedupeGet(url, () => executeRequest(path, options));
+  }
+  return executeRequest(path, options);
+}
+
+async function executeRequest(path, options = {}) {
   const {
     method = 'GET',
     params,
@@ -706,10 +737,10 @@ export const api = {
   /* ---- auth ---- */
   auth: {
     login: (identifier, pin, options) =>
-      post('/api/auth/login/', { identifier, phone: identifier, pin }, { ...options, allowRefresh: false, retries: 0 }),
-    logout: (options) => post('/api/auth/logout/', {}, { ...options, allowRefresh: false, retries: 0 }),
-    refresh: (options) => post('/api/auth/refresh/', {}, { ...options, allowRefresh: false, retries: 0 }),
-    changePin: (payload, options) => post('/api/auth/change-pin/', payload, { ...options, retries: 0 }),
+      post('/api/auth/login/', { identifier, phone: identifier, pin }, { timeout: 20000, ...options, allowRefresh: false, retries: 0 }),
+    logout: (options) => post('/api/auth/logout/', {}, { timeout: 10000, ...options, allowRefresh: false, retries: 0 }),
+    refresh: (options) => post('/api/auth/refresh/', {}, { timeout: 15000, ...options, allowRefresh: false, retries: 0 }),
+    changePin: (payload, options) => post('/api/auth/change-pin/', payload, { timeout: 15000, ...options, retries: 0 }),
     sessions: (options) => get('/api/auth/sessions/', null, options),
     revokeSession: (id, options) => del(`/api/auth/sessions/${encodeURIComponent(id)}/`, options),
   },
@@ -727,8 +758,11 @@ export const api = {
   members: {
     list: (params, options) => request('/api/members/', { ...options, method: 'GET', params, raw: true }),
     get: (id, options) => get(`/api/members/${encodeURIComponent(id)}/`, null, options),
-    create: (payload, options) => post('/api/members/', payload, options),
-    update: (id, payload, options) => patch(`/api/members/${encodeURIComponent(id)}/`, payload, options),
+    // Member creation runs validation + user creation in one transaction;
+    // a moderate, explicit timeout keeps the button's busy state honest.
+    create: (payload, options) => post('/api/members/', payload, { timeout: 20000, ...options }),
+    update: (id, payload, options) =>
+      patch(`/api/members/${encodeURIComponent(id)}/`, payload, { timeout: 20000, ...options }),
     setActive: (id, isActive, options) =>
       post(`/api/members/${encodeURIComponent(id)}/${isActive ? 'activate' : 'deactivate'}/`, {}, options),
     resetCredential: (id, options) => post(`/api/members/${encodeURIComponent(id)}/reset-pin/`, {}, options),

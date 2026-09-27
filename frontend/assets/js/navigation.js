@@ -16,9 +16,10 @@
 import { authEvents, getUser, isAdmin, logout } from './auth.js';
 import { apiEvents, resolveMediaUrl } from './api.js';
 import { getThemePreference, setTheme } from './theme.js';
+import { createConnectionUX } from './connection-ux.js';
 import { avatar, icon, iconButton, openMenu, toast } from './ui.js';
 import { clear, el, formatCount, prefs, trapFocus } from './utils.js';
-import { connectionLabel, realtime, socketEvents } from './websocket.js';
+import { realtime, socketEvents } from './websocket.js';
 import { unreadEvents, getUnread } from './notifications.js';
 
 const NAV_COLLAPSE_KEY = 'navCollapsed';
@@ -427,8 +428,19 @@ export function navToggleButton() {
    ============================================================ */
 
 /**
- * Mount the "offline / reconnecting / connected" banner.
- * Never claims delivery; it only reports transport state.
+ * Mount the connection indicator.
+ *
+ * Design contract (see connection-ux.js for the policy):
+ *   - normal operation shows NOTHING;
+ *   - a blip shorter than the grace period shows NOTHING;
+ *   - a persistent disruption shows a compact, fixed, non-blocking pill that
+ *     never pushes layout, never covers the composer, never steals focus and
+ *     never interrupts modals (it sits below the modal layer);
+ *   - offline shows a compact pill immediately;
+ *   - recovery is one subtle, self-fading hint — no repeated flashing.
+ *
+ * The transport keeps working regardless: REST stays authoritative and the
+ * socket reconnects on its own schedule; this is display only.
  */
 export function mountConnectionBanner(container) {
   bannerRoot = container || document.getElementById('conn-banner');
@@ -436,52 +448,66 @@ export function mountConnectionBanner(container) {
   bannerRoot.setAttribute('role', 'status');
   bannerRoot.setAttribute('aria-live', 'polite');
 
-  const paint = (state) => {
-    const effective = navigator.onLine === false ? 'offline' : state;
+  const paint = (view) => {
     clear(bannerRoot);
-
-    if (effective === 'open') {
-      if (bannerRoot.dataset.state && bannerRoot.dataset.state !== 'connected') {
-        bannerRoot.dataset.state = 'connected';
-        bannerRoot.append(icon('wifi', { size: 15 }), el('span', { text: 'Connected' }));
-        setTimeout(() => {
-          if (bannerRoot.dataset.state === 'connected') bannerRoot.dataset.state = '';
-        }, 1800);
-      } else {
-        bannerRoot.dataset.state = '';
-      }
-      return;
-    }
-
-    if (effective === 'offline') {
-      bannerRoot.dataset.state = 'offline';
-      bannerRoot.append(icon('wifi-off', { size: 15 }), el('span', { text: "You're offline. Messages will not send until you reconnect." }));
-      return;
-    }
-
-    if (effective === 'reconnecting' || effective === 'connecting') {
-      bannerRoot.dataset.state = 'reconnecting';
-      bannerRoot.append(el('span', { class: 'spinner', style: { width: '13px', height: '13px' } }), el('span', { text: connectionLabel(effective) }));
-      return;
-    }
-
-    if (effective === 'closed') {
-      bannerRoot.dataset.state = 'error';
-      bannerRoot.append(icon('alert-circle', { size: 15 }), el('span', { text: 'Disconnected from live updates.' }));
-      const retry = el('button', { type: 'button', class: 'btn btn--sm btn--ghost', text: 'Reconnect' });
-      retry.addEventListener('click', () => realtime.restart());
-      bannerRoot.append(retry);
-      return;
-    }
-
     bannerRoot.dataset.state = '';
+
+    switch (view.mode) {
+      case 'offline':
+        bannerRoot.dataset.state = 'offline';
+        bannerRoot.append(
+          icon('wifi-off', { size: 15 }),
+          el('span', { text: "You're offline. Messages will send when you reconnect." })
+        );
+        return;
+
+      case 'disrupted':
+        bannerRoot.dataset.state = 'reconnecting';
+        bannerRoot.append(
+          el('span', { class: 'spinner spinner--sm' }),
+          el('span', { text: 'Reconnecting…' }),
+          el('span', { class: 'conn-banner__hint', text: 'Messages still send.' })
+        );
+        return;
+
+      case 'failed':
+        bannerRoot.dataset.state = 'error';
+        bannerRoot.append(
+          icon('cloud-off', { size: 15 }),
+          el('span', { text: 'Live updates are disconnected.' })
+        );
+        const retry = el('button', { type: 'button', class: 'btn btn--sm btn--ghost', text: 'Reconnect' });
+        retry.addEventListener('click', () => realtime.restart());
+        bannerRoot.append(retry);
+        return;
+
+      case 'recovered':
+        bannerRoot.dataset.state = 'recovered';
+        bannerRoot.append(icon('wifi', { size: 15 }), el('span', { text: 'Back online' }));
+        return;
+
+      case 'hidden':
+      default:
+        return;
+    }
   };
 
-  socketEvents.on('state', paint);
-  window.addEventListener('online', () => paint(realtime.state));
-  window.addEventListener('offline', () => paint('offline'));
-  apiEvents.on('offline', () => paint('offline'));
-  paint(realtime.state);
+  const ux = createConnectionUX({ onChange: paint });
+
+  socketEvents.on('state', (state, detail) => {
+    // stop() during logout/session-expiry is expected: no permanent "failed"
+    // pill for a page that is navigating away to the sign-in screen.
+    if (state === 'closed' && detail && (detail.reason === 'logout' || detail.reason === 'session-expired')) {
+      ux.destroy();
+      paint({ mode: 'hidden' });
+      return;
+    }
+    ux.handleState(state, detail);
+  });
+  window.addEventListener('online', () => ux.handleOnline(realtime.state));
+  window.addEventListener('offline', () => ux.handleOffline());
+  apiEvents.on('offline', () => ux.handleOffline());
+  ux.handleState(realtime.state);
 }
 
 /* ============================================================

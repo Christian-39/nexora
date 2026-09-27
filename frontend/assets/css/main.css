@@ -420,29 +420,56 @@ body.app-body {
 .status-page__text { color: var(--text-muted); }
 .status-page__actions { margin-top: var(--sp-6); display: flex; gap: var(--sp-3); justify-content: center; flex-wrap: wrap; }
 
-/* ---- Connection banner ---- */
+/* ---- Connection indicator ----
+   A compact, FIXED, non-blocking pill. It never participates in layout (so
+   it cannot push the page or the composer around), sits above page content
+   but BELOW modals/toasts, ignores pointer events except on its own surface,
+   and cannot steal focus. It appears only after the connection-ux grace
+   period, so ordinary blips never show anything at all. */
 .conn-banner {
+  position: fixed;
+  top: calc(var(--app-header-h, 56px) + var(--sp-2));
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 30; /* above sticky content (10), below drawer (40)/modals (60)/toasts (80) */
   display: none;
   align-items: center;
   justify-content: center;
   gap: var(--sp-2);
-  padding: var(--sp-2) var(--sp-4);
+  max-width: min(92vw, 480px);
+  padding: var(--sp-2) var(--sp-3);
   font-size: var(--fs-sm);
   font-weight: var(--fw-medium);
-  border-bottom: 1px solid transparent;
-  flex: none;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  box-shadow: var(--shadow-md, 0 4px 12px rgba(0, 0, 0, 0.18));
+  pointer-events: none; /* the pill never blocks the page beneath it */
 }
+.conn-banner > button { pointer-events: auto; }
 .conn-banner[data-state="offline"],
 .conn-banner[data-state="reconnecting"],
-.conn-banner[data-state="error"] { display: flex; }
+.conn-banner[data-state="error"],
+.conn-banner[data-state="recovered"] { display: flex; }
 .conn-banner[data-state="offline"] {
-  background: var(--danger-soft); color: var(--danger); border-bottom-color: var(--danger);
+  background: var(--danger-soft); color: var(--danger); border-color: var(--danger);
 }
 .conn-banner[data-state="reconnecting"] {
-  background: var(--warning-soft); color: var(--warning); border-bottom-color: var(--warning);
+  background: var(--warning-soft); color: var(--warning); border-color: var(--warning);
 }
 .conn-banner[data-state="error"] {
-  background: var(--danger-soft); color: var(--danger); border-bottom-color: var(--danger);
+  background: var(--danger-soft); color: var(--danger); border-color: var(--danger);
+}
+.conn-banner[data-state="recovered"] {
+  background: var(--success-soft, rgba(30, 122, 78, 0.12)); color: var(--success, #1e7a4e);
+}
+.conn-banner__hint { opacity: 0.8; font-weight: var(--fw-normal); white-space: nowrap; }
+.conn-banner .spinner--sm { width: 13px; height: 13px; flex: none; }
+
+@media (max-width: 767px) {
+  /* Keep the pill clear of the hamburger header row and readable on small
+     screens without ever covering the composer at the bottom. */
+  .conn-banner { top: calc(var(--app-header-h, 56px) + var(--sp-1)); max-width: 94vw; }
+  .conn-banner__hint { display: none; }
 }
 
 /* ---- Utilities ---- */
