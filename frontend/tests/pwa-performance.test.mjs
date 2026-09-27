@@ -1,0 +1,45 @@
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import test from 'node:test';
+
+const sw = await readFile(new URL('../sw.js', import.meta.url), 'utf8');
+const login = await readFile(new URL('../login.html', import.meta.url), 'utf8');
+const auth = await readFile(new URL('../assets/js/auth.js', import.meta.url), 'utf8');
+const chatCss = await readFile(new URL('../assets/css/chat.css', import.meta.url), 'utf8');
+const mainCss = await readFile(new URL('../assets/css/main.css', import.meta.url), 'utf8');
+
+
+test('installed shell navigation and code are served cache-first', () => {
+  assert.match(sw, /request\.mode === 'navigate'[\s\S]*handleNavigation/);
+  assert.match(sw, /isCodeAsset[\s\S]*cacheFirstCode/);
+  assert.match(sw, /const cached = await cache\.match\(page/);
+  assert.doesNotMatch(sw, /event\.respondWith\(networkFirst\(request\)\)/);
+});
+
+
+test('API traffic remains network-only and outside Cache Storage', () => {
+  assert.match(sw, /PRIVATE_PATH[\s\S]*networkOnlyApi/);
+  const networkOnly = sw.split('async function networkOnlyApi', 2)[1].split('async function handleNavigation', 1)[0];
+  assert.doesNotMatch(networkOnly, /caches?\.(?:open|put|match)/);
+});
+
+
+test('login installs the shell and sixth PIN digit requests submit', () => {
+  assert.match(login, /registerServiceWorker\(\)/);
+  assert.match(login, /onComplete:[\s\S]*form\.requestSubmit\(\)/);
+  assert.match(login, /if \(loginInFlight\) return/);
+});
+
+
+test('successful login consumes the profile returned by login without mandatory me request', () => {
+  assert.match(auth, /payload\?\.id \? payload : null/);
+});
+
+
+test('chat uses visual viewport sizing and natural message wrapping', () => {
+  assert.match(mainCss, /--app-viewport-height, 100dvh/);
+  const bubble = chatCss.split('.bubble {', 2)[1].split('}', 1)[0];
+  assert.match(bubble, /overflow-wrap: break-word/);
+  assert.match(bubble, /word-break: normal/);
+  assert.doesNotMatch(bubble, /overflow-wrap: anywhere/);
+});

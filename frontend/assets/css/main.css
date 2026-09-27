@@ -3,7 +3,7 @@
 html, body { height: 100%; }
 
 body.app-body {
-  height: 100dvh;
+  height: var(--app-viewport-height, 100dvh);
   overflow: hidden;
   overscroll-behavior: none;
 }
@@ -15,7 +15,7 @@ body.app-body {
 .app-shell {
   display: grid;
   grid-template-columns: var(--nav-w) minmax(0, 1fr);
-  height: 100dvh;
+  height: var(--app-viewport-height, 100dvh);
   background: var(--bg);
 }
 .app-shell[data-nav="collapsed"] {

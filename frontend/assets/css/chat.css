@@ -292,8 +292,9 @@
   border-radius: var(--r-lg);
   border-bottom-left-radius: var(--r-xs);
   box-shadow: var(--shadow-xs);
-  overflow-wrap: anywhere;
-  word-break: break-word;
+  /* Keep normal words in the bubble's intrinsic width calculation. */
+  overflow-wrap: break-word;
+  word-break: normal;
 }
 .msg-row[data-dir="out"] .bubble {
   background: var(--bubble-out-bg);
@@ -316,14 +317,22 @@
   font-size: var(--fs-base);
   line-height: var(--lh-normal);
   white-space: pre-wrap;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
+  word-break: normal;
 }
-.bubble__text a { text-decoration: underline; color: inherit; font-weight: var(--fw-medium); }
+.bubble__text a {
+  text-decoration: underline;
+  color: inherit;
+  font-weight: var(--fw-medium);
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
 .bubble__caption {
   padding: var(--sp-1) var(--sp-2) 0;
   font-size: var(--fs-base);
   white-space: pre-wrap;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
+  word-break: normal;
 }
 .bubble__footer {
   display: flex;

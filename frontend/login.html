@@ -115,8 +115,12 @@
     import { ApiError } from './assets/js/api.js';
     import { buildPinInput, buildPinFields } from './assets/js/pin.js';
     import { announce, setBusy, setFieldError, showAlert, hideAlert } from './assets/js/ui.js';
+    import { registerServiceWorker } from './assets/js/push.js';
     import { $, el } from './assets/js/utils.js';
 
+    // Installation/update work is independent of authentication and must start
+    // on the login screen so the next launch has a complete local shell.
+    registerServiceWorker();
     loadBranding().then(() => {
       const config = getConfig();
       const contact = $('#org-contact');
@@ -132,7 +136,14 @@
     const changeSection = $('#change-section');
     const subtitle = $('#auth-subtitle');
 
-    const pin = buildPinInput({ label: 'PIN', autocomplete: 'current-password' });
+    let loginInFlight = false;
+    const pin = buildPinInput({
+      label: 'PIN',
+      autocomplete: 'current-password',
+      onComplete: () => {
+        if (!loginInFlight && !form.hidden) form.requestSubmit();
+      },
+    });
     $('#pin-slot').append(pin.group, pin.errorEl);
 
     const changeFields = buildPinFields({ includeCurrent: false });
@@ -145,11 +156,19 @@
     else if (reason === 'signed-out') showAlert(alertEl, 'You have been signed out.', 'info');
     else if (reason === 'unauthorized') showAlert(alertEl, 'Please sign in to continue.', 'info');
 
-    /* ---- already signed in? ---- */
-    redirectIfAuthenticated().then((redirected) => {
-      if (!redirected && mustChangeCredential()) showChangeStep();
-      if (!redirected) identifier.focus();
-    });
+    /* ---- already signed in? ----
+       The form is interactive and focused before any backend request. Session
+       discovery is deliberately idle/background work; it never gates typing. */
+    identifier.focus();
+    let sessionProbeCancelled = false;
+    const probeSession = () => {
+      if (sessionProbeCancelled || loginInFlight) return;
+      redirectIfAuthenticated().then((redirected) => {
+        if (!redirected && mustChangeCredential()) showChangeStep();
+      });
+    };
+    if ('requestIdleCallback' in window) window.requestIdleCallback(probeSession, { timeout: 1500 });
+    else setTimeout(probeSession, 750);
 
     if (params.get('change') === '1') showChangeStep();
 
@@ -163,6 +182,8 @@
     /* ============ Sign in ============ */
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
+      if (loginInFlight) return;
+      sessionProbeCancelled = true;
       hideAlert(alertEl);
       setFieldError(identifier, identifierError, '');
       pin.setError('');
@@ -182,6 +203,7 @@
         return;
       }
 
+      loginInFlight = true;
       setBusy(submitBtn, true, 'Signing in');
       pin.setDisabled(true);
       identifier.disabled = true;
@@ -199,6 +221,7 @@
         pin.reset();
         handleAuthError(error);
       } finally {
+        loginInFlight = false;
         setBusy(submitBtn, false);
         pin.setDisabled(false);
         identifier.disabled = false;
@@ -220,8 +243,12 @@
         showAlert(alertEl, 'This account is temporarily locked. Contact your administrator.', 'error');
         return;
       }
-      if (error.isForbidden || error.code === 'ACCOUNT_INACTIVE') {
+      if (error.code === 'ACCOUNT_INACTIVE') {
         showAlert(alertEl, 'This account cannot sign in. Contact your administrator.', 'error');
+        return;
+      }
+      if (error.isForbidden) {
+        showAlert(alertEl, 'The secure sign-in request could not be verified. Reload and try again.', 'warning');
         return;
       }
       if (error.isAuth || error.isValidation) {
@@ -232,6 +259,10 @@
       }
       if (error.isOffline || error.isNetwork || error.isTimeout) {
         showAlert(alertEl, 'Unable to reach the server. Check your connection and try again.', 'warning');
+        return;
+      }
+      if (error.isServer) {
+        showAlert(alertEl, 'The sign-in service is temporarily unavailable. Please try again shortly.', 'warning');
         return;
       }
       showAlert(alertEl, error.message, 'error');

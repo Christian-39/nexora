@@ -19,14 +19,38 @@ export const notificationEvents = new Emitter();
    Unread state
    ============================================================ */
 
+const UNREAD_CACHE_KEY = 'nexora.unreadSnapshot.v1';
+
+function readUnreadSnapshot() {
+  try {
+    const value = JSON.parse(sessionStorage.getItem(UNREAD_CACHE_KEY) || 'null');
+    return value && typeof value === 'object' ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+const cachedUnread = readUnreadSnapshot();
 const unread = {
-  total: 0,
-  conversations: 0,
-  groups: 0,
-  notifications: 0,
+  total: Number(cachedUnread.total) || 0,
+  conversations: Number(cachedUnread.conversations) || 0,
+  groups: Number(cachedUnread.groups) || 0,
+  notifications: Number(cachedUnread.notifications) || 0,
   /** conversationId -> count */
-  byConversation: new Map(),
+  byConversation: new Map(Array.isArray(cachedUnread.byConversation) ? cachedUnread.byConversation : []),
 };
+
+function persistUnread() {
+  try {
+    sessionStorage.setItem(UNREAD_CACHE_KEY, JSON.stringify({
+      total: unread.total,
+      conversations: unread.conversations,
+      groups: unread.groups,
+      notifications: unread.notifications,
+      byConversation: Array.from(unread.byConversation.entries()).slice(0, 200),
+    }));
+  } catch { /* storage unavailable */ }
+}
 
 export function getUnread() {
   return {
@@ -50,6 +74,7 @@ function recompute() {
   unread.conversations = conversations;
   unread.groups = groups || unread.groups;
   unread.total = unread.conversations + unread.notifications;
+  persistUnread();
   unreadEvents.emit('change', getUnread());
   syncAppBadge(unread.total);
 }
@@ -72,6 +97,7 @@ export function applyUnreadSummary(summary) {
   if (typeof summary.notifications_unread === 'number') unread.notifications = summary.notifications_unread;
   if (typeof summary.total === 'number') {
     unread.total = summary.total;
+    persistUnread();
     unreadEvents.emit('change', getUnread());
     syncAppBadge(unread.total);
     return;

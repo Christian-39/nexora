@@ -99,7 +99,12 @@ def test_is_active_false_creates_an_inactive_account(admin):
 
 @pytest.mark.django_db
 def test_nigerian_and_international_numbers_are_normalized(admin):
-    for raw, expected in [("+234 801 234 5678", "+2348012345678"), ("+44 20 7946 0958", "+442079460958")]:
+    for raw, expected in [
+        ("+234 801 234 5678", "+2348012345678"),
+        ("0802 345 6789", "+2348023456789"),
+        ("0803-456-7890", "+2348034567890"),
+        ("+44 20 7946 0958", "+442079460958"),
+    ]:
         response = authed(admin).post(
             "/api/members/", {"display_name": "N", "phone": raw}, format="json"
         )

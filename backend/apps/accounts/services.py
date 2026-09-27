@@ -5,8 +5,17 @@ from django.core.exceptions import ValidationError
 from .models import User
 
 def normalize_phone(value):
- try:p=phonenumbers.parse(str(value),None)
- except phonenumbers.NumberParseException:raise ValidationError('Enter an international phone number, e.g. +2348012345678.')
+ """Return one authoritative E.164 identity.
+
+ Nigerian local input is a documented product input, so numbers without a
+ leading ``+`` are parsed in the deployment's NG product region. Explicit
+ international numbers retain their own country code. Formatting characters
+ and spaces are handled by libphonenumber.
+ """
+ raw = str(value or '').strip()
+ region = None if raw.startswith('+') else 'NG'
+ try:p=phonenumbers.parse(raw,region)
+ except phonenumbers.NumberParseException:raise ValidationError('Enter a valid phone number, e.g. 08012345678 or +2348012345678.')
  if not phonenumbers.is_valid_number(p):raise ValidationError('Invalid phone number.')
  return phonenumbers.format_number(p,phonenumbers.PhoneNumberFormat.E164)
 def initial_pin(phone):return ''.join(c for c in normalize_phone(phone) if c.isdigit())[:6]

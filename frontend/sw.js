@@ -12,7 +12,7 @@
  * client can classify, never a stale message list.
  */
 
-const VERSION = 'v1.3.0';
+const VERSION = 'v1.4.0';
 const PRECACHE = `nexora-shell-${VERSION}`;
 const RUNTIME = `nexora-static-${VERSION}`;
 const OFFLINE_URL = 'offline.html';
@@ -104,8 +104,10 @@ self.addEventListener('activate', (event) => {
       await Promise.all(
         keys.filter((key) => key.startsWith('nexora-') && key !== PRECACHE && key !== RUNTIME).map((key) => caches.delete(key))
       );
+      // Navigation preload would still start a network request even when the
+      // shell is already cached, defeating instant warm startup.
       if (self.registration.navigationPreload) {
-        await self.registration.navigationPreload.enable();
+        await self.registration.navigationPreload.disable();
       }
       await self.clients.claim();
     })()
@@ -147,20 +149,18 @@ self.addEventListener('fetch', (event) => {
   if (url.origin !== self.location.origin) return; // let the network handle it
   if (request.headers.get('upgrade') === 'websocket') return;
 
-  // Navigations: network-first with an offline fallback.
+  // Navigations and application code come from this worker's coherent,
+  // revisioned precache. A Render/Vercel round trip must never sit in front of
+  // an already-installed shell. New deployments are fetched by the *new*
+  // worker during install and become active only through the update prompt,
+  // so HTML, CSS and modules cannot be mixed across releases.
   if (request.mode === 'navigate') {
     event.respondWith(handleNavigation(event));
     return;
   }
 
-  // Application CODE (js/css/manifest): network-first.
-  //
-  // Cache-first was able to keep an old build alive across reloads, which is
-  // exactly how a fixed bug appears to "survive a refresh". The cached copy is
-  // still kept and is still served instantly when the network fails, so
-  // offline behaviour is unchanged.
   if (isCodeAsset(url.pathname)) {
-    event.respondWith(networkFirst(request));
+    event.respondWith(cacheFirstCode(request));
     return;
   }
 
@@ -178,20 +178,22 @@ function isStaticAsset(pathname) {
   return /\.(?:png|jpg|jpeg|webp|svg|ico|woff2?)$/i.test(pathname);
 }
 
-/** Fresh code when online, cached code when not. Never used for /api/. */
-async function networkFirst(request) {
-  const cache = await caches.open(RUNTIME);
-  try {
-    const response = await fetch(request);
-    if (response && response.ok && response.type === 'basic') {
-      cache.put(request, response.clone()).catch(() => {});
-    }
-    return response;
-  } catch {
-    const cached = (await cache.match(request)) || (await caches.open(PRECACHE).then((c) => c.match(request)));
-    if (cached) return cached;
-    throw new Error('offline');
+/** Installed code is immutable for one SW version and therefore cache-first. */
+async function cacheFirstCode(request) {
+  const precache = await caches.open(PRECACHE);
+  const cached = await precache.match(request, { ignoreSearch: true });
+  if (cached) return cached;
+
+  // An optional code asset that was not in the manifest may still be fetched
+  // once and retained in the versioned runtime cache.
+  const runtime = await caches.open(RUNTIME);
+  const runtimeHit = await runtime.match(request, { ignoreSearch: true });
+  if (runtimeHit) return runtimeHit;
+  const response = await fetch(request);
+  if (response?.ok && response.type === 'basic') {
+    runtime.put(request, response.clone()).catch(() => {});
   }
+  return response;
 }
 
 /**
@@ -215,17 +217,21 @@ async function networkOnlyApi(request) {
 }
 
 async function handleNavigation(event) {
+  const cache = await caches.open(PRECACHE);
+  const url = new URL(event.request.url);
+  const page = url.pathname.replace(/^\//, '') || 'index.html';
+
+  // Query strings (notification targets, next=…) select application state,
+  // not a different HTML document, so match the shell pathname only.
+  const cached = await cache.match(page, { ignoreSearch: true });
+  if (cached) return cached;
+
+  // This is an unrecognised same-origin route, not part of the installed app
+  // shell. Use navigation preload/network and retain the offline fallback.
   try {
-    const preload = await event.preloadResponse;
-    if (preload) return preload;
-    const response = await fetch(event.request);
-    return response;
+    return (await event.preloadResponse) || (await fetch(event.request));
   } catch {
-    const cache = await caches.open(PRECACHE);
-    const url = new URL(event.request.url);
-    // Prefer the exact shell page if we precached it.
-    const cached = await cache.match(url.pathname.replace(/^\//, '') || 'index.html');
-    return cached || (await cache.match(OFFLINE_URL)) || Response.error();
+    return (await cache.match(OFFLINE_URL)) || Response.error();
   }
 }
 

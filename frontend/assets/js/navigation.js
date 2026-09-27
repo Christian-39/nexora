@@ -63,12 +63,33 @@ function paintBrand() {
 let activeKey = null;
 let headerRoot = null;
 let drawer = null;
+let viewportSizingMounted = false;
+
+/**
+ * Android Chrome/PWA occasionally leaves 100dvh at the keyboard-resized value
+ * after the keyboard closes. VisualViewport is the browser's authoritative
+ * visible area, so mirror it into CSS without fixed device-specific heights.
+ */
+function mountViewportSizing() {
+  if (viewportSizingMounted) return;
+  viewportSizingMounted = true;
+  const viewport = window.visualViewport;
+  const update = () => {
+    const height = Math.round(viewport?.height || window.innerHeight || 0);
+    if (height > 0) document.documentElement.style.setProperty('--app-viewport-height', `${height}px`);
+  };
+  update();
+  viewport?.addEventListener('resize', update, { passive: true });
+  viewport?.addEventListener('scroll', update, { passive: true });
+  window.addEventListener('resize', update, { passive: true });
+}
 
 /**
  * Mount the primary navigation.
  * @param {object} options { active: string, container?: HTMLElement }
  */
 export function mountNavigation(options = {}) {
+  mountViewportSizing();
   activeKey = options.active || document.body.dataset.page || null;
   navRoot = options.container || document.getElementById('app-nav');
   if (!navRoot) return;

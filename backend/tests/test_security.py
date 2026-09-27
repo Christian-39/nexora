@@ -12,7 +12,10 @@ from tests.conftest import authed, client_id
 
 @pytest.mark.django_db
 def test_initial_pin_rule_and_duplicate_phone_rejected(admin):
-    member = create_member(actor=admin, phone="+2348012345678", full_name="A")
+    member = create_member(actor=admin, phone="0801 234 5678", full_name="A")
+    assert member.phone == "+2348012345678"
+    # Repository requirements define the first six digits of canonical E.164
+    # (including country code) as the authoritative initial-PIN rule.
     assert initial_pin(member.phone) == "234801"
     assert member.check_password("234801")
     assert member.credential_state == "INITIAL"

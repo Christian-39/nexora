@@ -16,7 +16,7 @@ const LENGTH = 6;
  * A single six-digit input group.
  * @param {object} options { label, name, autocomplete, describedBy }
  */
-export function buildPinInput({ label = 'PIN', autocomplete = 'off', required = true } = {}) {
+export function buildPinInput({ label = 'PIN', autocomplete = 'off', required = true, onComplete = null } = {}) {
   const groupId = uid('pin');
   const errorId = `${groupId}-error`;
 
@@ -54,6 +54,7 @@ export function buildPinInput({ label = 'PIN', autocomplete = 'off', required = 
       input.value = digits;
       clearError();
       if (digits && i < LENGTH - 1) cells[i + 1].focus();
+      notifyComplete();
     });
 
     input.addEventListener('keydown', (event) => {
@@ -90,6 +91,21 @@ export function buildPinInput({ label = 'PIN', autocomplete = 'off', required = 
     const nextEmpty = cells.findIndex((c) => !c.value);
     (nextEmpty === -1 ? cells[LENGTH - 1] : cells[nextEmpty]).focus();
     clearError();
+    notifyComplete();
+  }
+
+  let completionQueued = false;
+  function notifyComplete() {
+    if (typeof onComplete !== 'function' || completionQueued) return;
+    const value = cells.map((cell) => cell.value).join('');
+    if (!/^\d{6}$/.test(value)) return;
+    completionQueued = true;
+    queueMicrotask(() => {
+      completionQueued = false;
+      // Re-check because the user can press Backspace before the microtask.
+      const current = cells.map((cell) => cell.value).join('');
+      if (/^\d{6}$/.test(current)) onComplete(current);
+    });
   }
 
   const errorEl = el('div', { class: 'field__error', id: errorId, role: 'alert' });

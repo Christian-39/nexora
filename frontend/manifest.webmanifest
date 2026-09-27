@@ -3,7 +3,7 @@
   "short_name": "Nexora",
   "description": "Private administrator-controlled messaging and community platform.",
   "id": "/",
-  "start_url": "./index.html",
+  "start_url": "./login.html?source=pwa",
   "scope": "./",
   "display": "standalone",
   "display_override": ["standalone", "minimal-ui"],

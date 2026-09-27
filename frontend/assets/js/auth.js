@@ -18,7 +18,42 @@ export const authEvents = new Emitter();
 const ROLE_ADMIN = 'admin';
 const ROLE_MEMBER = 'member';
 
-let currentUser = null;
+const PROFILE_CACHE_KEY = 'nexora.sessionProfile.v1';
+
+function readCachedProfile() {
+  try {
+    const value = JSON.parse(sessionStorage.getItem(PROFILE_CACHE_KEY) || 'null');
+    if (!value || typeof value !== 'object' || !value.id) return null;
+    return value;
+  } catch {
+    return null;
+  }
+}
+
+function writeCachedProfile(user) {
+  try {
+    if (!user) {
+      sessionStorage.removeItem(PROFILE_CACHE_KEY);
+      return;
+    }
+    // Presentation-only state. No PIN, cookie, token, email or phone is stored.
+    sessionStorage.setItem(PROFILE_CACHE_KEY, JSON.stringify({
+      id: user.id,
+      full_name: user.full_name || user.display_name || user.name || '',
+      display_name: user.display_name || user.full_name || user.name || '',
+      role: normalizeRole(user.role || (user.is_admin ? 'admin' : 'member')),
+      is_admin: user.is_admin === true,
+      avatar_url: user.avatar_url || null,
+      credential_state: user.credential_state || null,
+      must_change_pin: !!user.must_change_pin,
+    }));
+  } catch { /* storage unavailable/private mode */ }
+}
+
+// Restore only safe display state synchronously so the multi-page shell can
+// paint identity/role immediately. The HttpOnly cookie and /api/me/ remain the
+// sole authority and always revalidate this snapshot.
+let currentUser = readCachedProfile();
 let bootstrapPromise = null;
 let signingOut = false;
 /**
@@ -68,6 +103,7 @@ function normalizeRole(role) {
 function setUser(user) {
   const previous = currentUser;
   currentUser = user ? { ...user, role: normalizeRole(user.role || (user.is_admin ? 'admin' : 'member')) } : null;
+  writeCachedProfile(currentUser);
   if (previous?.id !== currentUser?.id || (!previous) !== (!currentUser)) {
     authEvents.emit('user', currentUser);
   } else {
@@ -102,6 +138,7 @@ export function bootstrap(options = {}) {
       if (error instanceof ApiError && error.isAuth) {
         // The backend positively rejected the credential: this is a real logout.
         sessionUnverified = false;
+        clearLocalSessionArtifacts();
         setUser(null);
         return null;
       }
@@ -209,7 +246,11 @@ export async function login(identifier, pin) {
     const token = payload?.access || payload?.access_token || payload?.token;
     if (token) tokenStore.set(token);
   }
-  let user = payload?.user || payload?.me || null;
+  // The current backend returns the profile directly as the envelope's data;
+  // older deployments nested it under `user`/`me`. Recognising the direct
+  // shape avoids a second blocking /api/me/ round trip on every successful
+  // sign-in (especially costly while Render/MySQL is waking).
+  let user = payload?.user || payload?.me || (payload?.id ? payload : null);
   if (!user) user = await api.me.get();
   setUser(user);
   authEvents.emit('login', currentUser);
@@ -261,6 +302,10 @@ function clearLocalSessionArtifacts() {
   prefs.remove('lastConversation');
   prefs.remove('unreadSnapshot');
   prefs.remove('draft');
+  try {
+    sessionStorage.removeItem('nexora.unreadSnapshot.v1');
+    sessionStorage.removeItem(PROFILE_CACHE_KEY);
+  } catch { /* storage unavailable */ }
   try {
     // Drop any private caches the service worker may hold for this user.
     navigator.serviceWorker?.controller?.postMessage({ type: 'NEXORA_CLEAR_PRIVATE_CACHE' });
@@ -330,6 +375,7 @@ apiEvents.on('unauthorized', () => {
   // The session is gone: the socket must not keep reconnecting behind the
   // "session expired" screen.
   realtime.stop('session-expired');
+  clearLocalSessionArtifacts();
   setUser(null);
   authEvents.emit('session-expired');
 });

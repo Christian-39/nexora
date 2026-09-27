@@ -62,17 +62,23 @@
 
   <script type="module">
     import { loadBranding } from './assets/js/theme.js';
-    import { bootstrap, isAdmin } from './assets/js/auth.js';
+    import { getUser, isAdmin } from './assets/js/auth.js';
+    import { registerServiceWorker } from './assets/js/push.js';
 
+    registerServiceWorker();
     loadBranding();
 
     (async () => {
-      const user = await bootstrap();
-      if (!user) {
-        window.location.replace('login.html');
+      // A safe session-scoped profile snapshot lets repeat launches route to
+      // the correct shell without waiting for /api/me/. The destination still
+      // verifies the HttpOnly session before loading private data.
+      if (getUser()) {
+        window.location.replace(isAdmin() ? 'admin.html' : 'chat.html');
         return;
       }
-      window.location.replace(isAdmin() ? 'admin.html' : 'chat.html');
+      // With no local hint, show the interactive login shell immediately; it
+      // performs non-blocking session discovery in the background.
+      window.location.replace('login.html');
     })();
   </script>
 </body>
