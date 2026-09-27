@@ -1,0 +1,1372 @@
+From 2316d45d3c4412cb5cd656532199b36acb348246 Mon Sep 17 00:00:00 2001
+From: Nexora Audit <audit@nexora.local>
+Date: Sun, 27 Sep 2026 08:09:45 +0000
+Subject: [PATCH] =?UTF-8?q?fix:=20production=20audit=20=E2=80=94=20shell-f?=
+ =?UTF-8?q?irst=20boot,=20no=20false=20logout,=20mobile=20bottom=20nav,=20?=
+ =?UTF-8?q?dashboard=20contract,=20security=20pagination,=20media/voice=20?=
+ =?UTF-8?q?retry?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ AUDIT_REPORT.md                         | 206 ++++++++++++++++++++++++
+ DEPLOYMENT_REPORT.md                    |   6 +-
+ README.md                               |   6 +-
+ backend/apps/accounts/views.py          |  41 ++++-
+ backend/apps/security/views.py          |  27 ++++
+ backend/tests/test_deployment_config.py |   6 +-
+ backend/tests/test_frontend_contract.py |  30 +++-
+ backend/tests/test_security.py          |  31 ++++
+ backend/tests/test_settings_and_push.py |  13 ++
+ frontend/README.md                      |   4 +-
+ frontend/admin.html                     |  46 +++++-
+ frontend/assets/css/responsive.css      |  57 ++++++-
+ frontend/assets/js/auth.js              |  29 +++-
+ frontend/assets/js/chat.js              | 103 ++++++++++--
+ frontend/assets/js/messages.js          |  11 ++
+ frontend/assets/js/navigation.js        |  29 +++-
+ frontend/assets/js/theme.js             |  23 ++-
+ frontend/chat.html                      |  11 +-
+ frontend/groups.html                    |  11 +-
+ frontend/members.html                   |  11 +-
+ frontend/profile.html                   |  11 +-
+ frontend/settings.html                  |  11 +-
+ frontend/tests/api-csrf.test.mjs        |   2 +-
+ frontend/tests/api-dedup.test.mjs       |   2 +-
+ frontend/tests/config.test.mjs          |   8 +-
+ frontend/tests/websocket.test.mjs       |   2 +-
+ render.yaml                             |   4 +-
+ 27 files changed, 658 insertions(+), 83 deletions(-)
+ create mode 100644 AUDIT_REPORT.md
+
+diff --git a/AUDIT_REPORT.md b/AUDIT_REPORT.md
+new file mode 100644
+index 0000000..f96f9d5
+--- /dev/null
++++ b/AUDIT_REPORT.md
+@@ -0,0 +1,206 @@
++# NEXORA — Production Audit & Root‑Cause Fix Report
++
++**Branch:** `fix/production-audit`
++**Scope of this pass (agreed triage):** the six highest‑impact, well‑diagnosed
++root causes — auth logout regression, shell/topbar flicker, mobile bottom‑nav
++regression, dashboard staleness, member‑creation feedback, media/voice retry —
++plus the deployment/URL contract cleanup they surfaced. Delivered as a git
++branch + patch. All changes are surgical; the vanilla‑JS ES‑module + Django
++Channels architecture is untouched.
++
++> **Verification honesty:** every result below was executed locally. What was
++> **NOT** executed: anything requiring the live Vercel/Render deployment, the
++> production MySQL/Redis, real object storage, a real browser, or a real mobile
++> device (no push access, no credentials). Those items are marked **NOT
++> EXECUTED** and reasoned about from the code, not claimed as passing.
++
++## Test results (executed)
++
++| Suite | Command | Before | After |
++|---|---|---|---|
++| Backend | `pytest` (SQLite in‑memory, PyMySQL fallback) | 152 pass / **1 fail** | **155 pass / 0 fail** |
++| Django checks | `manage.py check` | clean | clean |
++| Migrations | `makemigrations --check` | no drift | **no drift** (no schema change) |
++| Frontend | `node --test frontend/tests/` | 48 pass / **5 fail** | **53 pass / 0 fail** |
++
++The 6 baseline failures were all caused by an **obsolete backend URL**
++(`nexora-backend-ptsc.onrender.com`) hard‑coded in test/deploy files while the
++app already used the correct `nexora-f397.onrender.com`. A failing contract test
++can block CI/auto‑deploy, so this was a real (not cosmetic) finding.
++
++---
++
++## Root causes & fixes
++
++### 1. Authentication regression — false logout on a temporary backend outage
++- **Symptom:** logged in, then logged out "for no reason."
++- **Root cause (frontend):** `auth.js › bootstrap()` returns `null` for BOTH a
++  real `401` and a network/timeout/5xx failure. `requireSession()` treated any
++  `null` as "no session" → `redirectToLogin()`. On Render free‑tier cold starts
++  (`/api/me/` times out), a **valid** session was thrown to the sign‑in screen.
++- **Fix:** `bootstrap()` now records `sessionUnverified` when the failure is
++  connectivity‑only (`isNetwork/isOffline/isTimeout/isServer`) vs a real `401`.
++  `requireSession()` only redirects on a **confirmed** auth failure; on
++  connectivity failure it keeps the (already‑mounted) shell and emits
++  `session-unverified`. Backend authorization is unchanged and still
++  authoritative. *(api.js already had correct 401→single‑refresh→retry, refresh
++  de‑dup, and network classification — left intact.)*
++- **Files:** `frontend/assets/js/auth.js`.
++
++### 2. Application shell / topbar / sidebar disappears then reappears
++- **Symptom:** navigate → chrome vanishes for seconds → returns.
++- **Root cause (frontend):** every authenticated page did
++  `await requireSession()` **before** `mountNavigation()`. The shell literally
++  did not exist until `/api/me/` resolved — the "WAIT FOR SESSION → MOUNT SHELL"
++  anti‑pattern the brief describes.
++- **Fix:** reordered all six pages to **mount the shell first**
++  (`mountNavigation` + `mountConnectionBanner` + `mountSessionGuards`), paint
++  cached branding, then validate the session in the background and load page
++  data. The nav renders as a guest and **reconciles** when `authEvents 'user'`
++  fires (that subscription already existed). Combined with fix #1, a slow/cold
++  backend no longer blanks or bounces the UI.
++- **Files:** `admin.html`, `chat.html`, `members.html`, `groups.html`,
++  `settings.html`, `profile.html`.
++
++### 3. Sidebar logo / branding regression
++- **Symptom:** org name/logo render empty in the sidebar/header.
++- **Root cause (lifecycle):** exactly the brief's hypothesis —
++  `loadBranding()`→`applyBranding()` queried `[data-brand="logo"]/[org-name]`
++  **before** `mountNavigation()` created those nodes. When the branding cache was
++  "fresh" (<5 min) the network revalidation path returned early and never
++  re‑applied, so the freshly‑created slots stayed blank.
++- **Fix:** `navigation.js` repaints branding into the shell nodes right after it
++  creates them (`render`, `renderHeader`, `openDrawer`) via a new
++  `applyBranding(config, { sideEffects: false })` mode in `theme.js` that
++  repaints names/logo/colours **without** re‑fetching the manifest or
++  cache‑busting the favicon on every re‑render. Public‑config caching &
++  background revalidation are preserved; private data is never cached as public.
++- **Files:** `frontend/assets/js/theme.js`, `frontend/assets/js/navigation.js`.
++
++### 4. Mobile bottom navigation regression
++- **Symptom:** the fixed bottom nav bar disappeared after the latest deploy.
++- **Root cause (regression, confirmed via git):** the first commit rendered
++  `.app-nav` as a **fixed bottom bar** at ≤767px ("Primary nav becomes a bottom
++  bar"). Commit **`afc2d79 "updated"`** replaced it with
++  `.app-nav { display:none }` + a header hamburger + drawer.
++- **Fix:** restored the original bottom‑bar CSS (nav reflows to `grid-row: 2`,
++  horizontal `flex`, icon+label items, `env(safe-area-inset-bottom)`, hidden only
++  in full‑screen thread view) and hid the now‑redundant hamburger. **No hamburger
++  or new drawer is introduced as the replacement** — existing icons/labels/links
++  /active states are preserved. Because the bar is a normal grid row inside a
++  `100dvh` shell, it stays pinned above the Android keyboard without
++  `position:fixed`/`100vh` hacks. *(The legacy drawer code remains but is
++  unreachable — smallest safe change; fully reversible.)*
++- **Files:** `frontend/assets/css/responsive.css`, `navigation.js` (doc), and the
++  contract test `test_frontend_contract.py` (it previously asserted the *buggy*
++  hamburger layout — updated to assert the restored bottom bar).
++
++### 5. Dashboard data not updating
++- **Symptom:** create member / send message, dashboard doesn't reflect it.
++- **Root cause (frontend↔backend contract mismatch, NOT cache):** the backend
++  returned a **nested** payload (`members.total`, `messages.last_7_days`,
++  `conversations.groups` …) but `admin.html` read **flat** keys
++  (`total_members`, `messages_today`, `media_today` …). No key matched → every
++  metric rendered `—`/`0` regardless of DB changes. A full refresh could never
++  fix it. There is **no cache** on `/api/dashboard/`, so it was pure contract.
++- **Fix:** the dashboard view now returns the flat, correctly‑scoped keys the UI
++  reads **alongside** the nested structure (kept because a test asserts it).
++  "Today" is computed on the deployment timezone's calendar day; all message
++  counters (all‑time / 7‑day / today / media‑today / voice‑today) are folded into
++  a **single aggregate query**; "unread conversations" counts **distinct**
++  conversations. No hard‑coded values, no fabricated realtime. The dashboard
++  refetches on navigation, the Refresh button, and socket‑open (all pre‑existing).
++- **Files:** `backend/apps/accounts/views.py` (+ test coverage in
++  `test_settings_and_push.py`).
++
++### 6. Security events — real database pagination (exactly 10/page)
++- **Symptom:** widget showed 8; brief requires exactly 10 with prev/next.
++- **Root cause:** `admin.html` requested `{ limit: 8 }` — `limit` isn't even the
++  cursor param (`cursor`/`page_size` are), so it was a client‑side cap over a
++  30‑row default page: the "SELECT‑all then slice in JS" anti‑pattern.
++- **Fix (DB‑level):** dedicated `SecurityEventPagination(CursorPagination)` with
++  `page_size = 10`, ordered by the indexed `-created_at` (no new index needed —
++  `SecurityEvent.created_at` is already `db_index=True`). Frontend now requests
++  `page_size: 10` and renders working **Previous/Next** (disabled states, follows
++  opaque cursors, no full‑page reload).
++- **Files:** `backend/apps/security/views.py`, `frontend/admin.html` (+ tests in
++  `test_security.py`).
++
++### 7. Attachment / voice upload retry (confirmed bug)
++- **Symptom:** upload fails → "Re‑attach the file to send it again." → file lost.
++- **Root cause (frontend resource lifecycle):**
++  1. `sendMedia()` called `this.clearDraft()` — which **disposes** the draft
++     (revokes the preview object URL) — on the *same* draft it was uploading and
++     the optimistic bubble was still showing.
++  2. `finally { draft.dispose() }` destroyed the `File/Blob` on **every** outcome,
++     including failure, so retry was impossible.
++  3. `retryMessage()` for media just told the user to re‑attach and removed it.
++  *(The plumbing was already correct: `uploadDraft` reuses the same `client_id`,
++  guards concurrent uploads, and the backend dedupes on `client_id`.)*
++- **Fix:** failed/unconfirmed media drafts are retained in a `pendingMedia`
++  Map (keyed by `client_id`) holding the `File/Blob`, MIME/name/size, preview and
++  poster URL. `detachDraft()` clears the composer tray **without** disposing the
++  in‑flight resource. `retryMessage()` re‑sends the **same** draft with the
++  **same `client_id`** — no reselection, no re‑recording, and the backend dedupe
++  guarantees no duplicate server message (also safe for the "response‑lost then
++  retry" and "success then WebSocket event then retry" races). Resources are
++  disposed exactly once — on confirm, abort, explicit discard, or controller
++  destroy — including the video poster object URL (fixes a leak). Optimistic
++  rendering and true SENT/DELIVERED/READ status (never faked) are preserved.
++- **Files:** `frontend/assets/js/chat.js`, `frontend/assets/js/messages.js`
++  (new `markLocalSending`).
++
++### 8. Obsolete backend URL / deployment contract
++- **Finding:** `nexora-backend-ptsc.onrender.com` lingered in test files,
++  `render.yaml` (`ALLOWED_HOSTS`), and docs; the app (`config.js`) already used
++  the correct `nexora-f397.onrender.com`.
++- **Fix:** normalized every reference to `nexora-f397.onrender.com`. Render still
++  works either way because `settings.py` appends `RENDER_EXTERNAL_HOSTNAME` to
++  `ALLOWED_HOSTS`, but the stale value was misleading and broke the URL contract
++  tests. CORS/CSRF (`nexora-eight-lilac.vercel.app`) and cross‑site cookies
++  (`SameSite=None; Secure`) were already correct — unchanged.
++- **Files:** `render.yaml`, `README.md`, `DEPLOYMENT_REPORT.md`,
++  `frontend/README.md`, `backend/tests/*`, `frontend/tests/*`.
++
++---
++
++## Cache strategy (unchanged, verified correct)
++- **Cached (safe/public):** static JS/CSS (revalidated — see note), images
++  (1 week), public branding/config (localStorage, 5‑min freshness window +
++  background revalidation), the generated PWA manifest.
++- **Never publicly cached:** `/api/me/`, messages, members, dashboard, security
++  events, notifications, private media (all `cache: no-store`; SW does not cache
++  authenticated responses).
++- **Note on `vercel.json`:** JS/CSS use `max-age=0, must-revalidate` — this is
++  **correct** for un‑hashed filenames; aggressive immutable caching would serve
++  stale application code after a deploy (the exact hazard the brief warns about).
++  Left as‑is deliberately.
++
++## Verified good (audited, no change needed)
++- **Member‑creation frontend** (`members.js`) already has success toast, field +
++  form‑level error mapping (`mapMemberErrors`), busy‑state duplicate protection,
++  and local reconciliation. Backend `create()` validates and returns typed 400s.
++- **api.js**: in‑flight GET de‑dup, refresh de‑dup, 401 single‑refresh‑then‑retry,
++  timeout/offline classification.
++- **websocket.js**: single socket, bounded backoff + jitter, HTTP‑vs‑WS auth
++  separation, one refresh attempt, heartbeat zombie recycling.
++
++## NOT EXECUTED (require live infra / real devices — reasoned, not claimed)
++- End‑to‑end login/logout, session survival across refresh, and refresh‑storm
++  behavior against the live Render backend.
++- Real Android keyboard / `visualViewport` behavior and the 320–430px breakpoint
++  matrix in a real browser (changes are CSS‑grid + `dvh` + safe‑area, designed to
++  satisfy them).
++- Live dashboard realtime, WebSocket reconnect UX, and media/voice round‑trip
++  through real object storage + FFmpeg workers.
++- MySQL‑specific query plans (tests run on SQLite; no schema/index change was
++  made, so production query shape is unchanged except the dashboard's single
++  combined aggregate).
++
++## How to apply
++```bash
++git checkout -b fix/production-audit
++git apply nexora-production-audit.patch   # or: git am < ...  /  merge the branch
++# backend:  pytest   &&  python manage.py check
++# frontend: node --test frontend/tests/
++```
+diff --git a/DEPLOYMENT_REPORT.md b/DEPLOYMENT_REPORT.md
+index a66674f..02f9b18 100644
+--- a/DEPLOYMENT_REPORT.md
++++ b/DEPLOYMENT_REPORT.md
+@@ -65,7 +65,7 @@ by an automated test or a live run recorded at the end of this document.
+ DJANGO_ENV=production
+ DEBUG=False
+ SECRET_KEY=<64+ random chars>                       # secret
+-ALLOWED_HOSTS=nexora-backend-ptsc.onrender.com
++ALLOWED_HOSTS=nexora-f397.onrender.com
+ CORS_ALLOWED_ORIGINS=https://nexora-eight-lilac.vercel.app
+ CSRF_TRUSTED_ORIGINS=https://nexora-eight-lilac.vercel.app
+ COOKIE_SAMESITE=None
+@@ -122,7 +122,7 @@ Do **not** use `config.wsgi` — it cannot serve WebSockets.
+ 3. **Backend on Render** — Blueprint (`render.yaml`) or manually: new *Web
+    Service* → repo → `rootDir: backend` → build/start from §4 → paste §3
+    variables → deploy. First boot runs migrations. Verify:
+-   `curl -i https://nexora-backend-ptsc.onrender.com/health/` → `200`.
++   `curl -i https://nexora-f397.onrender.com/health/` → `200`.
+ 4. **Create the first administrator** (Render Shell):
+    `python manage.py createsuperuser --phone +234…`
+ 5. **Workers** — three *Background Workers*, same repo/rootDir, commands from
+@@ -132,7 +132,7 @@ Do **not** use `config.wsgi` — it cannot serve WebSockets.
+    picked up automatically. No file edits are needed: `config.js` resolves to
+    the Render backend.
+ 7. **Verify in a browser** on `https://nexora-eight-lilac.vercel.app`:
+-   sign in, DevTools → Network → WS shows `wss://nexora-backend-ptsc.onrender.com/ws/app/`
++   sign in, DevTools → Network → WS shows `wss://nexora-f397.onrender.com/ws/app/`
+    status 101; send a message in two tabs; toggle airplane mode and back —
+    the banner goes `offline → reconnecting → connected` and settles.
+ 8. **If the frontend moves to another domain**, update `CORS_ALLOWED_ORIGINS`
+diff --git a/README.md b/README.md
+index 3f57b86..df7c670 100644
+--- a/README.md
++++ b/README.md
+@@ -111,7 +111,7 @@ Then open <http://127.0.0.1:5500/login.html>.
+    on **the same hostname**, port 8000;
+ 4. **the deployed backend** (`PRODUCTION_API_ORIGIN` in `config.js`) — this
+    project's hosted frontend lives on Vercel and its API on Render, so a hosted
+-   page resolves to `https://nexora-backend-ptsc.onrender.com`;
++   page resolves to `https://nexora-f397.onrender.com`;
+ 5. **same origin** — used when the page is already served *by* the backend
+    (reverse proxy / `devserver.py`), or when an override says `same-origin`.
+ 
+@@ -148,7 +148,7 @@ API returns `403 PERMISSION_DENIED` until they do.
+ Vercel static frontend            https://nexora-eight-lilac.vercel.app
+         │ HTTPS + WSS
+         ▼
+-Render Python web service         https://nexora-backend-ptsc.onrender.com
++Render Python web service         https://nexora-f397.onrender.com
+   Gunicorn + UvicornWorker + Django Channels
+         ├── external managed MySQL 8
+         ├── external managed Redis        (REDIS_URL — channels, cache, presence)
+@@ -184,7 +184,7 @@ WebSockets — deploying it silently removes every realtime feature.
+ DJANGO_ENV=production
+ DEBUG=False
+ SECRET_KEY=<64+ random characters>
+-ALLOWED_HOSTS=nexora-backend-ptsc.onrender.com
++ALLOWED_HOSTS=nexora-f397.onrender.com
+ CORS_ALLOWED_ORIGINS=https://nexora-eight-lilac.vercel.app
+ CSRF_TRUSTED_ORIGINS=https://nexora-eight-lilac.vercel.app
+ COOKIE_SAMESITE=None            # cross-site frontend
+diff --git a/backend/apps/accounts/views.py b/backend/apps/accounts/views.py
+index ed76df1..9ca1868 100644
+--- a/backend/apps/accounts/views.py
++++ b/backend/apps/accounts/views.py
+@@ -542,27 +542,58 @@ def dashboard(request):
+     from apps.security.models import SecurityEvent
+ 
+     since = timezone.now() - timezone.timedelta(days=7)
++    # "Today" is the current calendar day in the deployment's configured
++    # timezone (settings.TIME_ZONE); with USE_TZ this is the correct boundary
++    # for "messages today" rather than a rolling 24h or a UTC-midnight window.
++    start_today = timezone.localtime().replace(hour=0, minute=0, second=0, microsecond=0)
+     members = User.objects.filter(role=User.Role.MEMBER).aggregate(
+         total=Count("id"),
+         active=Count("id", filter=Q(is_active=True)),
+         inactive=Count("id", filter=Q(is_active=False)),
+         pending_pin=Count("id", filter=~Q(credential_state="CHANGED")),
+     )
++    # One aggregate query covers all message counters (all-time, 7-day and
++    # today) instead of issuing a separate COUNT per metric.
+     messages = Message.objects.aggregate(
+         total=Count("id"),
+         last_7_days=Count("id", filter=Q(created_at__gte=since)),
+         media=Count("id", filter=Q(type__in=["IMAGE", "VIDEO"])),
+         voice=Count("id", filter=Q(type="VOICE")),
++        today=Count("id", filter=Q(created_at__gte=start_today)),
++        media_today=Count("id", filter=Q(created_at__gte=start_today, type__in=["IMAGE", "VIDEO"])),
++        voice_today=Count("id", filter=Q(created_at__gte=start_today, type="VOICE")),
++    )
++    conversations = {
++        "total": Conversation.objects.filter(is_active=True).count(),
++        "private": Conversation.objects.filter(is_active=True, kind="ADMIN_PRIVATE").count(),
++        "groups": Group.objects.filter(is_active=True).count(),
++    }
++    # Distinct conversations (not raw receipts) with unread messages for this admin.
++    unread_conversations = (
++        MessageReceipt.objects.filter(recipient=request.user, read_at__isnull=True)
++        .values("message__conversation_id")
++        .distinct()
++        .count()
+     )
+     data = {
+         "members": members,
+-        "conversations": {
+-            "total": Conversation.objects.filter(is_active=True).count(),
+-            "private": Conversation.objects.filter(is_active=True, kind="ADMIN_PRIVATE").count(),
+-            "groups": Group.objects.filter(is_active=True).count(),
+-        },
++        "conversations": conversations,
+         "messages": messages,
+         "unread": MessageReceipt.objects.filter(recipient=request.user, read_at__isnull=True).count(),
++        # ---- Flat, front-end-facing metric keys (admin.html reads these) ----
++        # Kept alongside the nested structure above so existing API consumers
++        # and the contract test remain valid while the dashboard renders real
++        # numbers instead of the em-dash placeholders caused by the old
++        # nested/flat key mismatch.
++        "total_members": members["total"],
++        "active_members": members["active"],
++        "inactive_members": members["inactive"],
++        "active_conversations": conversations["total"],
++        "unread_conversations": unread_conversations,
++        "total_groups": conversations["groups"],
++        "messages_today": messages["today"],
++        "media_today": messages["media_today"],
++        "voice_notes_today": messages["voice_today"],
+         "recent_activity": [
+             {
+                 "action": row.action,
+diff --git a/backend/apps/security/views.py b/backend/apps/security/views.py
+index 4735442..3799b3d 100644
+--- a/backend/apps/security/views.py
++++ b/backend/apps/security/views.py
+@@ -8,6 +8,7 @@ Infrastructure secrets are never readable or writable here.
+ 
+ from rest_framework.exceptions import PermissionDenied, ValidationError
+ from rest_framework.generics import ListAPIView
++from rest_framework.pagination import CursorPagination
+ from rest_framework.response import Response
+ from rest_framework.views import APIView
+ 
+@@ -19,8 +20,34 @@ from .models import SecurityEvent
+ from .serializers import SecurityEventSerializer
+ 
+ 
++class SecurityEventPagination(CursorPagination):
++    """Exactly ten security events per page, paginated at the database level.
++
++    Cursor pagination issues a stable ``LIMIT 11`` window ordered by
++    ``-created_at`` (covered by the ``security/models`` created_at index) and
++    exposes opaque next/previous cursors — no ``SELECT *`` + JavaScript slice.
++    """
++
++    page_size = 10
++    ordering = "-created_at"
++
++    def get_paginated_response(self, data):
++        return Response(
++            {
++                "success": True,
++                "message": "Security events retrieved",
++                "data": {
++                    "next": self.get_next_link(),
++                    "previous": self.get_previous_link(),
++                    "results": data,
++                },
++            }
++        )
++
++
+ class SecurityEventListView(ListAPIView):
+     serializer_class = SecurityEventSerializer
++    pagination_class = SecurityEventPagination
+ 
+     def get_queryset(self):
+         if self.request.user.role != "ADMIN":
+diff --git a/backend/tests/test_deployment_config.py b/backend/tests/test_deployment_config.py
+index 8e47400..bea21ba 100644
+--- a/backend/tests/test_deployment_config.py
++++ b/backend/tests/test_deployment_config.py
+@@ -29,7 +29,7 @@ PRODUCTION_ENV = {
+     "DJANGO_ENV": "production",
+     "DEBUG": "False",
+     "SECRET_KEY": "a-unique-production-secret-key-of-more-than-32-characters",
+-    "ALLOWED_HOSTS": "nexora-backend-ptsc.onrender.com",
++    "ALLOWED_HOSTS": "nexora-f397.onrender.com",
+     "CORS_ALLOWED_ORIGINS": "https://nexora-eight-lilac.vercel.app",
+     "CSRF_TRUSTED_ORIGINS": "https://nexora-eight-lilac.vercel.app",
+     "COOKIE_SAMESITE": "None",
+@@ -179,9 +179,9 @@ def test_samesite_none_without_secure_is_refused():
+ 
+ def test_the_render_hostname_is_always_an_allowed_host():
+     settings = load_settings(
+-        ALLOWED_HOSTS="example.org", RENDER_EXTERNAL_HOSTNAME="nexora-backend-ptsc.onrender.com"
++        ALLOWED_HOSTS="example.org", RENDER_EXTERNAL_HOSTNAME="nexora-f397.onrender.com"
+     )
+-    assert "nexora-backend-ptsc.onrender.com" in settings.ALLOWED_HOSTS
++    assert "nexora-f397.onrender.com" in settings.ALLOWED_HOSTS
+ 
+ 
+ def test_production_requires_mysql_and_private_storage():
+diff --git a/backend/tests/test_frontend_contract.py b/backend/tests/test_frontend_contract.py
+index e544adb..8c5cfe1 100644
+--- a/backend/tests/test_frontend_contract.py
++++ b/backend/tests/test_frontend_contract.py
+@@ -271,7 +271,7 @@ def test_every_json_response_uses_the_same_envelope(admin, member_a, private_thr
+ 
+ CSS = FRONTEND / "assets" / "css"
+ 
+-PRODUCTION_API = "https://nexora-backend-ptsc.onrender.com"
++PRODUCTION_API = "https://nexora-f397.onrender.com"
+ PRODUCTION_FRONTEND = "https://nexora-eight-lilac.vercel.app"
+ 
+ 
+@@ -402,8 +402,28 @@ def test_no_global_overflow_x_hidden_workaround():
+     assert not offenders, f"global overflow-x:hidden workaround found: {offenders}"
+ 
+ 
+-def test_the_mobile_breakpoint_does_not_inherit_the_desktop_sidebar():
++def test_the_mobile_breakpoint_uses_the_fixed_bottom_navigation():
++    """Mobile primary navigation is the fixed bottom bar, not a hamburger drawer.
++
++    The bottom bar is the intended (and previously shipped) mobile navigation;
++    a regression had replaced it with a header hamburger + drawer. On mobile the
++    sidebar reflows into a horizontal bar in the second shell grid row and the
++    header hamburger is hidden (secondary destinations live in the profile menu).
++    """
+     responsive = (CSS / "responsive.css").read_text()
+-    mobile_block = responsive.split("@media (max-width: 767px) {", 1)[1]
+-    assert ".app-nav { display: none; }" in mobile_block
+-    assert ".app-header__menu { display: inline-flex; }" in mobile_block
++    after = responsive.split("@media (max-width: 767px) {", 1)[1]
++    # Bound the block to its own media query so later ones (landscape, print,
++    # which legitimately hide the bar) are not scanned.
++    mobile_block = after.split("@media", 1)[0]
++    # The nav is NOT globally hidden on mobile — it becomes the bottom bar. The
++    # only nav-hiding rule permitted is the thread-open full-screen exception.
++    stripped = mobile_block.replace(
++        '.app-shell[data-mobile-view="thread"] .app-nav { display: none; }', ""
++    )
++    assert ".app-nav { display: none; }" not in stripped
++    assert "grid-row: 2;" in mobile_block
++    assert "flex-direction: row;" in mobile_block
++    # The bottom bar is only hidden when a thread is open full-screen.
++    assert '.app-shell[data-mobile-view="thread"] .app-nav { display: none; }' in mobile_block
++    # The header hamburger is redundant on mobile now and is hidden.
++    assert ".app-header__menu { display: none; }" in mobile_block
+diff --git a/backend/tests/test_security.py b/backend/tests/test_security.py
+index 20e39d2..13ef2df 100644
+--- a/backend/tests/test_security.py
++++ b/backend/tests/test_security.py
+@@ -237,3 +237,34 @@ def test_security_headers_present():
+     assert "Content-Security-Policy" in response
+     assert "Permissions-Policy" in response
+     assert response["Referrer-Policy"] == "same-origin"
++
++
++@pytest.mark.django_db
++def test_security_events_paginate_at_exactly_ten_per_page(admin):
++    """The security log paginates at the database (10/page) via cursors — never
++    a SELECT-all sliced in the client."""
++    from apps.security.models import SecurityEvent
++
++    SecurityEvent.objects.bulk_create(
++        [SecurityEvent(event="LOGIN_FAILED", metadata={"n": i}) for i in range(23)]
++    )
++
++    page1 = authed(admin).get("/api/security/events/").json()["data"]
++    assert len(page1["results"]) == 10
++    assert page1["next"]
++    assert page1["previous"] is None
++
++    # Follow the cursor to the second page.
++    cursor = page1["next"].split("cursor=", 1)[1].split("&", 1)[0]
++    page2 = authed(admin).get(f"/api/security/events/?cursor={cursor}").json()["data"]
++    assert len(page2["results"]) == 10
++    assert page2["previous"]
++
++    # Explicit page_size cannot exceed the fixed page size contract.
++    forced = authed(admin).get("/api/security/events/?page_size=50").json()["data"]
++    assert len(forced["results"]) == 10
++
++
++@pytest.mark.django_db
++def test_security_events_require_admin(member_a):
++    assert authed(member_a).get("/api/security/events/").status_code == 403
+diff --git a/backend/tests/test_settings_and_push.py b/backend/tests/test_settings_and_push.py
+index 3e230a0..49c6b32 100644
+--- a/backend/tests/test_settings_and_push.py
++++ b/backend/tests/test_settings_and_push.py
+@@ -146,6 +146,19 @@ def test_dashboard_reports_real_counts(admin, member_a, member_b, private_thread
+     assert data["members"]["total"] == 2
+     assert data["members"]["active"] == 2
+     assert data["members"]["pending_pin"] >= 1
++
++    # Flat, front-end-facing keys (admin.html reads these) must mirror the nested
++    # structure and expose real numbers, not placeholders. This is the contract
++    # whose mismatch previously left every dashboard metric showing an em dash.
++    assert data["total_members"] == 2
++    assert data["active_members"] == 2
++    assert data["inactive_members"] == 0
++    assert data["active_conversations"] >= 1
++    assert data["total_groups"] == 0
++    # The admin just sent one message today.
++    assert data["messages_today"] >= 1
++    for key in ("unread_conversations", "media_today", "voice_notes_today"):
++        assert key in data and isinstance(data[key], int)
+     assert data["messages"]["total"] == 1
+     assert data["conversations"]["total"] == 1
+ 
+diff --git a/frontend/README.md b/frontend/README.md
+index 83e2e62..54f059c 100644
+--- a/frontend/README.md
++++ b/frontend/README.md
+@@ -56,13 +56,13 @@ name a host):
+    `http://127.0.0.1:8000`; the hostname is never rewritten, because cookies are
+    scoped by host);
+ 4. hosted — `PRODUCTION_API_ORIGIN`, i.e.
+-   `https://nexora-backend-ptsc.onrender.com`;
++   `https://nexora-f397.onrender.com`;
+ 5. same origin — when the page is already served by the backend, or when an
+    override says `same-origin`.
+ 
+ The WebSocket origin is always derived from the resolved API origin
+ (`http→ws`, `https→wss`), so production resolves to
+-`wss://nexora-backend-ptsc.onrender.com/ws/app/` and local to
++`wss://nexora-f397.onrender.com/ws/app/` and local to
+ `ws://127.0.0.1:8000/ws/app/`. No module builds its own socket host.
+ 
+ **This deployment is cross-origin** (frontend on Vercel, API on Render), so the
+diff --git a/frontend/admin.html b/frontend/admin.html
+index d378279..912651f 100644
+--- a/frontend/admin.html
++++ b/frontend/admin.html
+@@ -120,13 +120,17 @@
+       { key: 'voice_notes_today', label: 'Voice notes today' },
+     ];
+ 
++    // Shell first: paint the persistent shell immediately (branding from
++    // cache), then validate the admin session in the background so a cold
++    // backend never blanks the dashboard chrome. Backend stays authoritative.
++    mountNavigation({ active: 'admin' });
++    mountConnectionBanner();
++    mountSessionGuards();
++
+     (async () => {
+       const user = await requireSession({ adminOnly: true });
+       if (!user) return;
+ 
+-      mountNavigation({ active: 'admin' });
+-      mountConnectionBanner();
+-      mountSessionGuards();
+       registerServiceWorker();
+       realtime.start('/ws/app/');
+       refreshUnread();
+@@ -215,29 +219,57 @@
+       }
+     }
+ 
+-    async function loadSecurity() {
++    /** Pull the opaque `cursor` value out of a DRF cursor-pagination link. */
++    function cursorParam(link) {
++      if (!link) return null;
++      try {
++        return new URL(link, window.location.origin).searchParams.get('cursor');
++      } catch {
++        return null;
++      }
++    }
++
++    // Exactly ten security events per page, paginated at the database via the
++    // backend cursor paginator. Prev/Next follow the returned cursors; the page
++    // never reloads.
++    async function loadSecurity(cursor = null) {
+       const container = $('#security-events');
+       clear(container);
+       container.append(skeletonList(4, { avatar: false }));
+       try {
+-        const response = await api.security.events({ limit: 8 });
++        const params = { page_size: 10 };
++        if (cursor) params.cursor = cursor;
++        const response = await api.security.events(params);
+         const page = normalizePage(response.data ?? response);
+         clear(container);
+-        if (!page.items.length) {
++        if (!page.items.length && !cursor) {
+           container.append(emptyState({ icon: 'shield-check', title: 'No security events', text: 'Sign-in failures and lockouts will appear here.' }));
+           return;
+         }
+         container.append(renderActivityList(page.items, true));
++        container.append(renderSecurityPager(page));
+       } catch (error) {
+         clear(container);
+         container.append(
+           error instanceof ApiError && (error.isNotFound || error.isForbidden)
+             ? emptyState({ icon: 'shield-check', title: 'Security log unavailable', text: 'You do not have access to the security log, or it is not enabled.' })
+-            : errorState({ text: error.message, onRetry: loadSecurity })
++            : errorState({ text: error.message, onRetry: () => loadSecurity(cursor) })
+         );
+       }
+     }
+ 
++    function renderSecurityPager(page) {
++      const prevCursor = cursorParam(page.previous);
++      const nextCursor = cursorParam(page.next);
++      const pager = el('div', { class: 'row row-wrap', style: { justifyContent: 'flex-end', gap: 'var(--sp-2)', marginTop: 'var(--sp-2)' } });
++      const prev = el('button', { type: 'button', class: 'btn btn--sm', text: 'Previous', disabled: !page.previous });
++      const next = el('button', { type: 'button', class: 'btn btn--sm', text: 'Next', disabled: !page.next });
++      prev.addEventListener('click', () => loadSecurity(prevCursor));
++      next.addEventListener('click', () => loadSecurity(nextCursor));
++      pager.append(prev, next);
++      return pager;
++    }
++
+     function renderActivityList(items, security = false) {
+       const list = el('div', { class: 'activity-list' });
+       for (const entry of items) {
+diff --git a/frontend/assets/css/responsive.css b/frontend/assets/css/responsive.css
+index 9118b59..51d2008 100644
+--- a/frontend/assets/css/responsive.css
++++ b/frontend/assets/css/responsive.css
+@@ -48,18 +48,63 @@
+    <= 767px — single-pane mobile experience
+    ============================================================ */
+ @media (max-width: 767px) {
+-  /* Primary navigation is the header hamburger + drawer.
+-     The sidebar is removed entirely so no desktop rule can leak into the
+-     mobile layout, and the shell becomes a single full-width column. */
++  /* Primary navigation is the fixed BOTTOM BAR (WhatsApp-style), not a
++     hamburger drawer. The shell becomes a single full-width column with a
++     second, auto-height row that carries the bottom navigation. Because the
++     bar is a normal grid row inside a 100dvh shell, it stays pinned above the
++     Android keyboard (the dynamic viewport shrinks) without position:fixed
++     hacks, and env(safe-area-inset-bottom) keeps it clear of the home bar. */
+   .app-shell,
+   .app-shell[data-nav="collapsed"],
+   .app-shell[data-nav="none"] {
+     grid-template-columns: minmax(0, 1fr);
+-    grid-template-rows: minmax(0, 1fr);
++    grid-template-rows: minmax(0, 1fr) auto;
+   }
+-  .app-nav { display: none; }
++  .app-nav {
++    grid-row: 2;
++    flex-direction: row;
++    border-right: none;
++    border-top: 1px solid var(--border);
++    padding: 0;
++    padding-bottom: var(--safe-bottom);
++    display: flex;
++  }
++  .app-nav__brand,
++  .app-nav__section,
++  .app-nav__footer { display: none; }
++  .app-nav__list {
++    flex-direction: row;
++    justify-content: space-around;
++    align-items: stretch;
++    padding: var(--sp-1);
++    gap: 0;
++    overflow: visible;
++    width: 100%;
++  }
++  .nav-item {
++    flex: 1;
++    min-width: 0;
++    flex-direction: column;
++    gap: 2px;
++    justify-content: center;
++    padding: var(--sp-2) var(--sp-1);
++    position: relative;
++  }
++  .nav-item__label {
++    display: block;
++    font-size: 0.6875rem; /* 11px */
++    font-weight: var(--fw-medium);
++    text-align: center;
++    width: 100%;
++  }
++  .nav-item__badge { position: absolute; top: 2px; right: 50%; margin: 0; transform: translateX(22px); }
++  /* Hide the bottom bar only when a thread is open full-screen. */
++  .app-shell[data-mobile-view="thread"] .app-nav { display: none; }
+ 
+-  .app-header__menu { display: inline-flex; }
++  /* The bottom bar carries primary navigation, so the header hamburger is
++     redundant on mobile. Secondary destinations (Profile, Settings, Appearance,
++     Sign out) remain reachable through the top-right profile menu. */
++  .app-header__menu { display: none; }
+   .app-header__brand { display: flex; }
+   .app-header { gap: var(--sp-2); padding-left: calc(var(--sp-2) + var(--safe-left)); }
+ 
+diff --git a/frontend/assets/js/auth.js b/frontend/assets/js/auth.js
+index fbd2710..f407424 100644
+--- a/frontend/assets/js/auth.js
++++ b/frontend/assets/js/auth.js
+@@ -21,6 +21,18 @@ const ROLE_MEMBER = 'member';
+ let currentUser = null;
+ let bootstrapPromise = null;
+ let signingOut = false;
++/**
++ * True when the most recent bootstrap could NOT verify the session because the
++ * backend/network was unavailable (timeout, offline, 5xx) rather than because
++ * the backend actually rejected the credential (401/403). A connectivity
++ * failure must never be mistaken for a logout.
++ */
++let sessionUnverified = false;
++
++/** Whether the last session check failed for connectivity reasons only. */
++export function isSessionUnverified() {
++  return sessionUnverified;
++}
+ 
+ /* ============================================================
+    Session state
+@@ -84,17 +96,24 @@ export function bootstrap(options = {}) {
+   bootstrapPromise = (async () => {
+     try {
+       const me = await api.me.get({ retries: 1, timeout: 12000 });
++      sessionUnverified = false;
+       return setUser(me);
+     } catch (error) {
+       if (error instanceof ApiError && error.isAuth) {
++        // The backend positively rejected the credential: this is a real logout.
++        sessionUnverified = false;
+         setUser(null);
+         return null;
+       }
+-      // Network/server issues must not silently log the user out.
++      // Network/server issues must not silently log the user out. Flag the
++      // session as *unverified* (not gone) so requireSession keeps the shell
++      // mounted instead of bouncing to the sign-in screen.
+       if (error instanceof ApiError && (error.isNetwork || error.isOffline || error.isTimeout || error.isServer)) {
++        sessionUnverified = true;
+         authEvents.emit('bootstrap-error', error);
+         return null;
+       }
++      sessionUnverified = false;
+       setUser(null);
+       return null;
+     } finally {
+@@ -112,6 +131,14 @@ export function bootstrap(options = {}) {
+ export async function requireSession(options = {}) {
+   const user = await bootstrap();
+   if (!user) {
++    if (sessionUnverified) {
++      // Could not confirm the session because the backend/network was
++      // unreachable. Keep the (already-mounted) shell in place and let the
++      // caller degrade gracefully; a later request reconciles the real state.
++      // We deliberately do NOT redirect to login on a connectivity failure.
++      authEvents.emit('session-unverified');
++      return null;
++    }
+     redirectToLogin();
+     return null;
+   }
+diff --git a/frontend/assets/js/chat.js b/frontend/assets/js/chat.js
+index 1213cbc..45dce76 100644
+--- a/frontend/assets/js/chat.js
++++ b/frontend/assets/js/chat.js
+@@ -39,6 +39,7 @@ import {
+   loadLatest,
+   loadOlder,
+   markLocalFailed,
++  markLocalSending,
+   markLocalUnconfirmed,
+   messageEvents,
+   messagePreview,
+@@ -117,6 +118,11 @@ export class ChatController {
+     this.draft = null;          // pending media attachment
+     this.recorder = null;
+     this.recording = null;      // { blob, duration, mimeType, name }
++    // Media drafts whose upload has not yet confirmed, keyed by client_id.
++    // A FAILED/UNCONFIRMED upload keeps its draft (File/Blob + preview) here so
++    // it can be retried WITHOUT the user reselecting or re-recording the file.
++    // Entry: { draft, caption, replyToId, posterUrl }
++    this.pendingMedia = new Map();
+     this.pinnedScroll = null;
+     this.atBottom = true;
+     this.newWhileAway = 0;
+@@ -153,6 +159,47 @@ export class ChatController {
+     this.threadAbort?.abort();
+     this.listAbort?.abort();
+     this.recorder?.cancel();
++    // Release any retained media resources so a long session cannot leak
++    // File/Blob object URLs.
++    for (const entry of this.pendingMedia.values()) this.disposePending(entry);
++    this.pendingMedia.clear();
++  }
++
++  /** Remove a local message and release any retained upload resources for it. */
++  discardPending(clientId) {
++    const entry = this.pendingMedia.get(clientId);
++    if (entry) {
++      this.pendingMedia.delete(clientId);
++      this.disposePending(entry);
++    }
++    removeLocal(this.activeId, clientId);
++  }
++
++  /** Dispose a retained pending-upload entry's resources exactly once. */
++  disposePending(entry) {
++    if (!entry) return;
++    try { entry.draft?.dispose?.(); } catch { /* already disposed */ }
++    if (entry.posterUrl) {
++      try { URL.revokeObjectURL(entry.posterUrl); } catch { /* ignore */ }
++    }
++  }
++
++  /**
++   * Clear the composer tray and forget the current draft WITHOUT disposing it.
++   * Used once a draft has been handed to the upload lifecycle: the pending-upload
++   * machinery now owns its File/Blob and preview URL until the upload is
++   * confirmed or the message is explicitly discarded. Disposing here would
++   * revoke the very preview URL the optimistic bubble is still showing and the
++   * File a retry would need.
++   */
++  detachDraft() {
++    this.draft = null;
++    this.recording = null;
++    const { trayEl } = this.refs;
++    if (trayEl) {
++      clear(trayEl);
++      trayEl.hidden = true;
++    }
+   }
+ 
+   /* ============================================================
+@@ -690,7 +737,7 @@ export class ChatController {
+       btn.addEventListener('click', () => this.retryMessage(message));
+       const discard = el('button', { type: 'button', class: 'btn btn--sm btn--ghost', text: 'Discard' });
+       discard.addEventListener('click', () => {
+-        removeLocal(this.activeId, message.clientId);
++        this.discardPending(message.clientId);
+       });
+       retry.append(btn, discard);
+       bubble.append(retry);
+@@ -711,7 +758,7 @@ export class ChatController {
+     const cancel = el('button', { type: 'button', class: 'btn btn--sm btn--ghost', text: 'Cancel' });
+     cancel.addEventListener('click', () => {
+       cancelUpload(message.clientId);
+-      removeLocal(this.activeId, message.clientId);
++      this.discardPending(message.clientId);
+     });
+     overlay.append(cancel);
+     wrap.append(overlay);
+@@ -1406,13 +1453,14 @@ export class ChatController {
+     const replyTo = this.replyTo;
+     this.cancelContext();
+ 
++    const posterUrl = draft.kind === 'video' && draft.poster ? URL.createObjectURL(draft.poster) : null;
+     const optimistic = createOptimistic(id, {
+       kind: draft.kind,
+       caption,
+       media: {
+         id: null,
+         url: draft.previewUrl,
+-        thumbnailUrl: draft.kind === 'video' && draft.poster ? URL.createObjectURL(draft.poster) : draft.previewUrl,
++        thumbnailUrl: posterUrl || draft.previewUrl,
+         mimeType: draft.mimeType,
+         size: draft.size,
+         width: draft.width,
+@@ -1429,31 +1477,50 @@ export class ChatController {
+     getStore(id).byClientId.set(draft.clientId, optimistic);
+ 
+     if (this.refs.inputEl) this.refs.inputEl.value = '';
+-    this.clearDraft();
++    // Hand the draft to the pending-upload lifecycle: clear the composer tray
++    // WITHOUT disposing the File/Blob or the preview the bubble still shows.
++    this.detachDraft();
+     this.scrollToBottom();
+ 
++    await this.performMediaUpload(id, draft, { caption, replyToId: replyTo?.id ?? null, posterUrl });
++  }
++
++  /**
++   * Upload a retained draft and reconcile the optimistic message. On any
++   * non-abort failure the draft (File/Blob + preview) is KEPT in pendingMedia
++   * so retryMessage() can re-send it with the same client_id — the user never
++   * has to reselect the file. The backend deduplicates on client_id, so a retry
++   * after a lost response cannot create a duplicate server message.
++   */
++  async performMediaUpload(id, draft, { caption, replyToId, posterUrl = null }) {
++    this.pendingMedia.set(draft.clientId, { draft, caption, replyToId, posterUrl });
+     try {
+       const created = await uploadDraft(id, draft, {
+         caption,
+-        replyToId: replyTo?.id ?? null,
++        replyToId,
+         onProgress: ({ percent }) => setLocalProgress(id, draft.clientId, percent),
+       });
+       confirmOptimistic(id, draft.clientId, created);
++      // Success: the message now points at server media — release local resources.
++      this.pendingMedia.delete(draft.clientId);
++      this.disposePending({ draft, posterUrl });
+       announce('Attachment sent.');
+     } catch (error) {
+       if (error instanceof ApiError && error.isAborted) {
++        this.pendingMedia.delete(draft.clientId);
++        this.disposePending({ draft, posterUrl });
+         removeLocal(id, draft.clientId);
+         return;
+       }
+       if (error instanceof ApiError && (error.isTimeout || error.isNetwork || error.isOffline)) {
++        // Outcome unknown: keep the draft retained (do NOT dispose) so a retry
++        // can re-send the same file.
+         markLocalUnconfirmed(id, draft.clientId);
+         announce('Upload status is being confirmed.');
+       } else {
+         markLocalFailed(id, draft.clientId, error);
+         toastApiError(error);
+       }
+-    } finally {
+-      draft.dispose?.();
+     }
+   }
+ 
+@@ -1462,8 +1529,8 @@ export class ChatController {
+     const file = new File([recording.blob], recording.name, { type: recording.mimeType });
+     const draft = await createDraft(file, 'voice');
+     draft.duration = recording.duration;
+-    this.recording = null;
+-    this.clearDraft();
++    // Detach the recording state without disposing the just-built draft.
++    this.detachDraft();
+     await this.sendMedia(draft, caption);
+   }
+ 
+@@ -1477,7 +1544,23 @@ export class ChatController {
+       }
+       return;
+     }
+-    toast('Re-attach the file to send it again.', { type: 'info' });
++
++    // Media/voice: re-send the retained draft with the SAME client_id. No
++    // reselection, no re-recording, and the backend dedupes so no duplicate.
++    const pending = this.pendingMedia.get(message.clientId);
++    if (pending?.draft) {
++      markLocalSending(id, message.clientId);
++      await this.performMediaUpload(id, pending.draft, {
++        caption: pending.caption,
++        replyToId: pending.replyToId,
++        posterUrl: pending.posterUrl,
++      });
++      return;
++    }
++
++    // The draft is genuinely gone (e.g. the tab was reloaded — an in-memory
++    // File cannot survive that). Reselection is the only remaining option.
++    toast('This file is no longer available. Please attach it again to send.', { type: 'info' });
+     removeLocal(id, message.clientId);
+   }
+ 
+diff --git a/frontend/assets/js/messages.js b/frontend/assets/js/messages.js
+index ced6085..8e13102 100644
+--- a/frontend/assets/js/messages.js
++++ b/frontend/assets/js/messages.js
+@@ -453,6 +453,17 @@ export function markLocalFailed(conversationId, clientId, error) {
+   return message;
+ }
+ 
++/** Move a failed/unconfirmed local message back to SENDING (used on retry). */
++export function markLocalSending(conversationId, clientId) {
++  const store = getStore(conversationId);
++  const message = store.byClientId.get(clientId);
++  if (!message) return null;
++  message.status = STATUS.SENDING;
++  message.error = null;
++  messageEvents.emit('updated', store.id, message);
++  return message;
++}
++
+ /** Outcome unknown (timeout / connection lost) — never claim delivery. */
+ export function markLocalUnconfirmed(conversationId, clientId) {
+   const store = getStore(conversationId);
+diff --git a/frontend/assets/js/navigation.js b/frontend/assets/js/navigation.js
+index 4a14140..0aeca9e 100644
+--- a/frontend/assets/js/navigation.js
++++ b/frontend/assets/js/navigation.js
+@@ -5,9 +5,12 @@
+  * unread badges, connection banner and sign-out.
+  *
+  * Layout contract (see responsive.css):
+- *   >= 1024px  full sidebar          + slim header carrying theme/profile
+- *   768-1023px icon-only nav rail    + slim header carrying theme/profile
+- *   <= 767px   NO sidebar: header with a hamburger that opens a drawer
++ *   >= 1024px  full sidebar               + slim header carrying theme/profile
++ *   768-1023px icon-only nav rail         + slim header carrying theme/profile
++ *   <= 767px   fixed BOTTOM navigation bar + slim header carrying theme/profile
++ *              (secondary destinations live in the top-right profile menu; the
++ *               drawer below is a legacy fallback and is not surfaced at this
++ *               breakpoint — the hamburger is hidden by responsive.css).
+  *
+  * Role filtering here is UX only. Every hidden destination is still enforced
+  * by the backend; a member typing admin.html receives 403 from the API.
+@@ -15,7 +18,7 @@
+ 
+ import { authEvents, getUser, isAdmin, logout } from './auth.js';
+ import { apiEvents, resolveMediaUrl } from './api.js';
+-import { getThemePreference, setTheme } from './theme.js';
++import { getThemePreference, setTheme, applyBranding, getConfig } from './theme.js';
+ import { createConnectionUX } from './connection-ux.js';
+ import { avatar, icon, iconButton, openMenu, toast } from './ui.js';
+ import { clear, el, formatCount, prefs, trapFocus } from './utils.js';
+@@ -46,6 +49,17 @@ const DRAWER_ITEMS = [
+ 
+ let navRoot = null;
+ let bannerRoot = null;
++
++/**
++ * Paint the current (cached or live) branding into brand slots that were just
++ * created by the shell. applyBranding queries the whole document, so calling it
++ * after the nav/header/drawer nodes exist is what stops freshly-mounted logo
++ * and organization-name slots from rendering empty. Side effects (favicon /
++ * PWA manifest) are skipped — those are owned by theme.loadBranding().
++ */
++function paintBrand() {
++  applyBranding(getConfig(), { sideEffects: false });
++}
+ let activeKey = null;
+ let headerRoot = null;
+ let drawer = null;
+@@ -114,6 +128,9 @@ function render() {
+ 
+   navRoot.append(footer);
+   updateBadges();
++  // The brand slots above were created empty; paint the current branding into
++  // them (they exist now, so this is not a no-op like an earlier applyBranding).
++  paintBrand();
+ }
+ 
+ function navEntry(item, { bare = false } = {}) {
+@@ -223,6 +240,8 @@ function renderHeader() {
+   controls.append(profileBtn);
+ 
+   headerRoot.append(controls);
++  // Paint branding into the header's freshly-created logo/name slots.
++  paintBrand();
+ }
+ 
+ function resolveAvatarUrl(user) {
+@@ -349,6 +368,8 @@ export function openDrawer(opener = null) {
+   drawerOpener = opener || document.getElementById('nav-toggle');
+   drawer = buildDrawer();
+   document.body.append(drawer);
++  // Paint branding into the drawer's brand slots now that they are in the DOM.
++  paintBrand();
+   // Force a frame so the CSS transition runs from the closed position.
+   drawer.hidden = false;
+   requestAnimationFrame(() => drawer?.setAttribute('data-open', 'true'));
+diff --git a/frontend/assets/js/theme.js b/frontend/assets/js/theme.js
+index b81ba74..90f9fce 100644
+--- a/frontend/assets/js/theme.js
++++ b/frontend/assets/js/theme.js
+@@ -200,8 +200,17 @@ export async function loadBranding(options = {}) {
+ 
+ /**
+  * Apply configuration to the document. Every value is validated before use.
++ *
++ * @param {object} [config]
++ * @param {object} [options]
++ * @param {boolean} [options.sideEffects=true] When false, only the in-document
++ *   brand nodes (names, logo, colours, title) are repainted; the favicon and
++ *   PWA manifest are left untouched. Used to (re)paint brand slots that are
++ *   created *after* the initial load — e.g. the navigation shell — without
++ *   re-fetching the manifest or cache-busting the favicon on every re-render.
+  */
+-export function applyBranding(config = currentConfig) {
++export function applyBranding(config = currentConfig, options = {}) {
++  const { sideEffects = true } = options;
+   const root = document.documentElement;
+ 
+   // --- Colours: strict #RRGGBB only ---
+@@ -252,13 +261,15 @@ export function applyBranding(config = currentConfig) {
+ 
+   // --- Favicon ---
+   const faviconUrl = resolveMediaUrl(config.favicon_url) || logoUrl;
+-  if (faviconUrl && isSafeHttpUrl(faviconUrl)) applyFavicon(faviconUrl);
++  if (sideEffects && faviconUrl && isSafeHttpUrl(faviconUrl)) applyFavicon(faviconUrl);
+ 
+   // --- Manifest branding hints for the service worker / install prompt ---
+-  const manifestName = safeText(config.pwa?.name) || brandName;
+-  document.querySelector('meta[name="application-name"]')?.setAttribute('content', manifestName);
+-  document.querySelector('meta[name="apple-mobile-web-app-title"]')?.setAttribute('content', safeText(config.app_short_name) || manifestName);
+-  applyManifest(config, { name: manifestName, shortName: safeText(config.app_short_name) || manifestName, icon: faviconUrl || logoUrl });
++  if (sideEffects) {
++    const manifestName = safeText(config.pwa?.name) || brandName;
++    document.querySelector('meta[name="application-name"]')?.setAttribute('content', manifestName);
++    document.querySelector('meta[name="apple-mobile-web-app-title"]')?.setAttribute('content', safeText(config.app_short_name) || manifestName);
++    applyManifest(config, { name: manifestName, shortName: safeText(config.app_short_name) || manifestName, icon: faviconUrl || logoUrl });
++  }
+ 
+   themeEvents.emit('branding', config);
+ }
+diff --git a/frontend/chat.html b/frontend/chat.html
+index 5978887..3dbe577 100644
+--- a/frontend/chat.html
++++ b/frontend/chat.html
+@@ -131,14 +131,17 @@
+ 
+     loadBranding();
+ 
++    // Shell first: paint the persistent app shell immediately (branding from
++    // cache), then validate the session in the background. The shell must never
++    // wait on /api/me/ — a cold backend would otherwise blank the UI for seconds.
++    mountNavigation({ active: 'chat' });
++    mountConnectionBanner();
++    mountSessionGuards();
++
+     (async () => {
+       const user = await requireSession();
+       if (!user) return;
+ 
+-      mountNavigation({ active: 'chat' });
+-      mountConnectionBanner();
+-      mountSessionGuards();
+-
+       // Decorate icon-only buttons that are declared in markup.
+       $('#composer-attach').append(icon('paperclip'));
+       $('#composer-voice').append(icon('mic'));
+diff --git a/frontend/groups.html b/frontend/groups.html
+index 4a3bc33..20e0ce2 100644
+--- a/frontend/groups.html
++++ b/frontend/groups.html
+@@ -89,13 +89,16 @@
+ 
+     loadBranding();
+ 
++    // Shell first: paint the persistent app shell immediately (branding from
++    // cache), then validate the session in the background so a cold backend
++    // never blanks the sidebar/topbar.
++    mountNavigation({ active: 'groups' });
++    mountConnectionBanner();
++    mountSessionGuards();
++
+     (async () => {
+       const user = await requireSession();
+       if (!user) return;
+-
+-      mountNavigation({ active: 'groups' });
+-      mountConnectionBanner();
+-      mountSessionGuards();
+       registerServiceWorker();
+       realtime.start('/ws/app/');
+       refreshUnread();
+diff --git a/frontend/members.html b/frontend/members.html
+index db8848d..a7b8b25 100644
+--- a/frontend/members.html
++++ b/frontend/members.html
+@@ -92,13 +92,18 @@
+ 
+     loadBranding();
+ 
++    // Shell first: the persistent shell paints immediately (branding from
++    // cache); the session is validated in the background so a slow /api/me/
++    // never blanks the sidebar/topbar. Admin authorization stays authoritative
++    // on the backend — requireSession still redirects on a confirmed failure.
++    mountNavigation({ active: 'members' });
++    mountConnectionBanner();
++    mountSessionGuards();
++
+     (async () => {
+       const user = await requireSession({ adminOnly: true });
+       if (!user) return;
+ 
+-      mountNavigation({ active: 'members' });
+-      mountConnectionBanner();
+-      mountSessionGuards();
+       registerServiceWorker();
+       realtime.start('/ws/app/');
+       refreshUnread();
+diff --git a/frontend/profile.html b/frontend/profile.html
+index f6e376e..8912b96 100644
+--- a/frontend/profile.html
++++ b/frontend/profile.html
+@@ -73,13 +73,16 @@
+ 
+     loadBranding();
+ 
++    // Shell first: paint the persistent app shell immediately (branding from
++    // cache), then validate the session in the background so a cold backend
++    // never blanks the sidebar/topbar.
++    mountNavigation({ active: 'profile' });
++    mountConnectionBanner();
++    mountSessionGuards();
++
+     (async () => {
+       const user = await requireSession();
+       if (!user) return;
+-
+-      mountNavigation({ active: 'profile' });
+-      mountConnectionBanner();
+-      mountSessionGuards();
+       registerServiceWorker();
+       realtime.start('/ws/app/');
+       refreshUnread();
+diff --git a/frontend/settings.html b/frontend/settings.html
+index 9d3c75a..656a403 100644
+--- a/frontend/settings.html
++++ b/frontend/settings.html
+@@ -73,13 +73,16 @@
+ 
+     loadBranding();
+ 
++    // Shell first: paint the persistent app shell immediately (branding from
++    // cache), then validate the session in the background so a cold backend
++    // never blanks the sidebar/topbar.
++    mountNavigation({ active: 'settings' });
++    mountConnectionBanner();
++    mountSessionGuards();
++
+     (async () => {
+       const user = await requireSession();
+       if (!user) return;
+-
+-      mountNavigation({ active: 'settings' });
+-      mountConnectionBanner();
+-      mountSessionGuards();
+       registerServiceWorker();
+       realtime.start('/ws/app/');
+       refreshUnread();
+diff --git a/frontend/tests/api-csrf.test.mjs b/frontend/tests/api-csrf.test.mjs
+index a5ba866..c615aa0 100644
+--- a/frontend/tests/api-csrf.test.mjs
++++ b/frontend/tests/api-csrf.test.mjs
+@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
+ import test from 'node:test';
+ 
+ const API_MODULE = new URL('../assets/js/api.js', import.meta.url).href;
+-const API_ORIGIN = 'https://nexora-backend-ptsc.onrender.com';
++const API_ORIGIN = 'https://nexora-f397.onrender.com';
+ let moduleCounter = 0;
+ 
+ function installEnvironment() {
+diff --git a/frontend/tests/api-dedup.test.mjs b/frontend/tests/api-dedup.test.mjs
+index 762d025..1baf065 100644
+--- a/frontend/tests/api-dedup.test.mjs
++++ b/frontend/tests/api-dedup.test.mjs
+@@ -11,7 +11,7 @@
+ import assert from 'node:assert/strict';
+ import test from 'node:test';
+ 
+-const API_ORIGIN = 'https://nexora-backend-ptsc.onrender.com';
++const API_ORIGIN = 'https://nexora-f397.onrender.com';
+ let moduleCounter = 0;
+ 
+ function installEnvironment(fetchImpl) {
+diff --git a/frontend/tests/config.test.mjs b/frontend/tests/config.test.mjs
+index bd3f378..c6a9137 100644
+--- a/frontend/tests/config.test.mjs
++++ b/frontend/tests/config.test.mjs
+@@ -14,7 +14,7 @@ import test from 'node:test';
+ 
+ const MODULE = new URL('../assets/js/config.js', import.meta.url).href;
+ 
+-const PRODUCTION_API = 'https://nexora-backend-ptsc.onrender.com';
++const PRODUCTION_API = 'https://nexora-f397.onrender.com';
+ const PRODUCTION_FRONTEND = 'https://nexora-eight-lilac.vercel.app';
+ 
+ let counter = 0;
+@@ -43,8 +43,8 @@ test('production: REST requests go to the Render backend, not the Vercel host',
+ 
+ test('production: the WebSocket resolves to wss on the Render backend', async () => {
+   const { config, buildSocketUrl } = await loadConfig({ hostname: 'nexora-eight-lilac.vercel.app' });
+-  assert.equal(config.WS_ORIGIN, 'wss://nexora-backend-ptsc.onrender.com');
+-  assert.equal(buildSocketUrl('/ws/app/'), 'wss://nexora-backend-ptsc.onrender.com/ws/app/');
++  assert.equal(config.WS_ORIGIN, 'wss://nexora-f397.onrender.com');
++  assert.equal(buildSocketUrl('/ws/app/'), 'wss://nexora-f397.onrender.com/ws/app/');
+   assert.ok(!buildSocketUrl('/ws/app/').includes('vercel.app'));
+ });
+ 
+@@ -84,7 +84,7 @@ test('a same-origin deployment can opt out of the hosted default', async () => {
+ });
+ 
+ test('a page served BY the backend stays same-origin', async () => {
+-  const { config } = await loadConfig({ hostname: 'nexora-backend-ptsc.onrender.com' });
++  const { config } = await loadConfig({ hostname: 'nexora-f397.onrender.com' });
+   assert.equal(config.API_ORIGIN, '');
+ });
+ 
+diff --git a/frontend/tests/websocket.test.mjs b/frontend/tests/websocket.test.mjs
+index aac6aad..8a335ff 100644
+--- a/frontend/tests/websocket.test.mjs
++++ b/frontend/tests/websocket.test.mjs
+@@ -161,7 +161,7 @@ test('the socket URL is the production Render endpoint', async () => {
+   const { realtime } = await loadClient();
+   realtime.start('/ws/app/');
+   assert.equal(FakeWebSocket.instances.length, 1);
+-  assert.equal(FakeWebSocket.instances[0].url, 'wss://nexora-backend-ptsc.onrender.com/ws/app/');
++  assert.equal(FakeWebSocket.instances[0].url, 'wss://nexora-f397.onrender.com/ws/app/');
+   realtime.stop();
+ });
+ 
+diff --git a/render.yaml b/render.yaml
+index 3d90110..21b3c95 100644
+--- a/render.yaml
++++ b/render.yaml
+@@ -38,7 +38,7 @@ services:
+       - key: WEB_CONCURRENCY
+         value: "2"
+       - key: ALLOWED_HOSTS
+-        value: nexora-backend-ptsc.onrender.com
++        value: nexora-f397.onrender.com
+       - key: CORS_ALLOWED_ORIGINS
+         value: https://nexora-eight-lilac.vercel.app
+       - key: CSRF_TRUSTED_ORIGINS
+@@ -100,7 +100,7 @@ services:
+       - key: DEBUG
+         value: "False"
+       - key: ALLOWED_HOSTS
+-        value: nexora-backend-ptsc.onrender.com
++        value: nexora-f397.onrender.com
+       - key: CORS_ALLOWED_ORIGINS
+         value: https://nexora-eight-lilac.vercel.app
+       - key: CSRF_TRUSTED_ORIGINS
+-- 
+2.47.3
+

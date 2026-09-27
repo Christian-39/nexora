@@ -271,7 +271,7 @@ def test_every_json_response_uses_the_same_envelope(admin, member_a, private_thr
 
 CSS = FRONTEND / "assets" / "css"
 
-PRODUCTION_API = "https://nexora-backend-ptsc.onrender.com"
+PRODUCTION_API = "https://nexora-f397.onrender.com"
 PRODUCTION_FRONTEND = "https://nexora-eight-lilac.vercel.app"
 
 
@@ -402,8 +402,28 @@ def test_no_global_overflow_x_hidden_workaround():
     assert not offenders, f"global overflow-x:hidden workaround found: {offenders}"
 
 
-def test_the_mobile_breakpoint_does_not_inherit_the_desktop_sidebar():
+def test_the_mobile_breakpoint_uses_the_fixed_bottom_navigation():
+    """Mobile primary navigation is the fixed bottom bar, not a hamburger drawer.
+
+    The bottom bar is the intended (and previously shipped) mobile navigation;
+    a regression had replaced it with a header hamburger + drawer. On mobile the
+    sidebar reflows into a horizontal bar in the second shell grid row and the
+    header hamburger is hidden (secondary destinations live in the profile menu).
+    """
     responsive = (CSS / "responsive.css").read_text()
-    mobile_block = responsive.split("@media (max-width: 767px) {", 1)[1]
-    assert ".app-nav { display: none; }" in mobile_block
-    assert ".app-header__menu { display: inline-flex; }" in mobile_block
+    after = responsive.split("@media (max-width: 767px) {", 1)[1]
+    # Bound the block to its own media query so later ones (landscape, print,
+    # which legitimately hide the bar) are not scanned.
+    mobile_block = after.split("@media", 1)[0]
+    # The nav is NOT globally hidden on mobile — it becomes the bottom bar. The
+    # only nav-hiding rule permitted is the thread-open full-screen exception.
+    stripped = mobile_block.replace(
+        '.app-shell[data-mobile-view="thread"] .app-nav { display: none; }', ""
+    )
+    assert ".app-nav { display: none; }" not in stripped
+    assert "grid-row: 2;" in mobile_block
+    assert "flex-direction: row;" in mobile_block
+    # The bottom bar is only hidden when a thread is open full-screen.
+    assert '.app-shell[data-mobile-view="thread"] .app-nav { display: none; }' in mobile_block
+    # The header hamburger is redundant on mobile now and is hidden.
+    assert ".app-header__menu { display: none; }" in mobile_block

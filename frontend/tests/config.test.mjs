@@ -14,7 +14,7 @@ import test from 'node:test';
 
 const MODULE = new URL('../assets/js/config.js', import.meta.url).href;
 
-const PRODUCTION_API = 'https://nexora-backend-ptsc.onrender.com';
+const PRODUCTION_API = 'https://nexora-f397.onrender.com';
 const PRODUCTION_FRONTEND = 'https://nexora-eight-lilac.vercel.app';
 
 let counter = 0;
@@ -43,8 +43,8 @@ test('production: REST requests go to the Render backend, not the Vercel host', 
 
 test('production: the WebSocket resolves to wss on the Render backend', async () => {
   const { config, buildSocketUrl } = await loadConfig({ hostname: 'nexora-eight-lilac.vercel.app' });
-  assert.equal(config.WS_ORIGIN, 'wss://nexora-backend-ptsc.onrender.com');
-  assert.equal(buildSocketUrl('/ws/app/'), 'wss://nexora-backend-ptsc.onrender.com/ws/app/');
+  assert.equal(config.WS_ORIGIN, 'wss://nexora-f397.onrender.com');
+  assert.equal(buildSocketUrl('/ws/app/'), 'wss://nexora-f397.onrender.com/ws/app/');
   assert.ok(!buildSocketUrl('/ws/app/').includes('vercel.app'));
 });
 
@@ -84,7 +84,7 @@ test('a same-origin deployment can opt out of the hosted default', async () => {
 });
 
 test('a page served BY the backend stays same-origin', async () => {
-  const { config } = await loadConfig({ hostname: 'nexora-backend-ptsc.onrender.com' });
+  const { config } = await loadConfig({ hostname: 'nexora-f397.onrender.com' });
   assert.equal(config.API_ORIGIN, '');
 });
 

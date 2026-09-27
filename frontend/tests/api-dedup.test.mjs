@@ -11,7 +11,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-const API_ORIGIN = 'https://nexora-backend-ptsc.onrender.com';
+const API_ORIGIN = 'https://nexora-f397.onrender.com';
 let moduleCounter = 0;
 
 function installEnvironment(fetchImpl) {

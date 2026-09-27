@@ -39,6 +39,7 @@ import {
   loadLatest,
   loadOlder,
   markLocalFailed,
+  markLocalSending,
   markLocalUnconfirmed,
   messageEvents,
   messagePreview,
@@ -117,6 +118,11 @@ export class ChatController {
     this.draft = null;          // pending media attachment
     this.recorder = null;
     this.recording = null;      // { blob, duration, mimeType, name }
+    // Media drafts whose upload has not yet confirmed, keyed by client_id.
+    // A FAILED/UNCONFIRMED upload keeps its draft (File/Blob + preview) here so
+    // it can be retried WITHOUT the user reselecting or re-recording the file.
+    // Entry: { draft, caption, replyToId, posterUrl }
+    this.pendingMedia = new Map();
     this.pinnedScroll = null;
     this.atBottom = true;
     this.newWhileAway = 0;
@@ -153,6 +159,47 @@ export class ChatController {
     this.threadAbort?.abort();
     this.listAbort?.abort();
     this.recorder?.cancel();
+    // Release any retained media resources so a long session cannot leak
+    // File/Blob object URLs.
+    for (const entry of this.pendingMedia.values()) this.disposePending(entry);
+    this.pendingMedia.clear();
+  }
+
+  /** Remove a local message and release any retained upload resources for it. */
+  discardPending(clientId) {
+    const entry = this.pendingMedia.get(clientId);
+    if (entry) {
+      this.pendingMedia.delete(clientId);
+      this.disposePending(entry);
+    }
+    removeLocal(this.activeId, clientId);
+  }
+
+  /** Dispose a retained pending-upload entry's resources exactly once. */
+  disposePending(entry) {
+    if (!entry) return;
+    try { entry.draft?.dispose?.(); } catch { /* already disposed */ }
+    if (entry.posterUrl) {
+      try { URL.revokeObjectURL(entry.posterUrl); } catch { /* ignore */ }
+    }
+  }
+
+  /**
+   * Clear the composer tray and forget the current draft WITHOUT disposing it.
+   * Used once a draft has been handed to the upload lifecycle: the pending-upload
+   * machinery now owns its File/Blob and preview URL until the upload is
+   * confirmed or the message is explicitly discarded. Disposing here would
+   * revoke the very preview URL the optimistic bubble is still showing and the
+   * File a retry would need.
+   */
+  detachDraft() {
+    this.draft = null;
+    this.recording = null;
+    const { trayEl } = this.refs;
+    if (trayEl) {
+      clear(trayEl);
+      trayEl.hidden = true;
+    }
   }
 
   /* ============================================================
@@ -690,7 +737,7 @@ export class ChatController {
       btn.addEventListener('click', () => this.retryMessage(message));
       const discard = el('button', { type: 'button', class: 'btn btn--sm btn--ghost', text: 'Discard' });
       discard.addEventListener('click', () => {
-        removeLocal(this.activeId, message.clientId);
+        this.discardPending(message.clientId);
       });
       retry.append(btn, discard);
       bubble.append(retry);
@@ -711,7 +758,7 @@ export class ChatController {
     const cancel = el('button', { type: 'button', class: 'btn btn--sm btn--ghost', text: 'Cancel' });
     cancel.addEventListener('click', () => {
       cancelUpload(message.clientId);
-      removeLocal(this.activeId, message.clientId);
+      this.discardPending(message.clientId);
     });
     overlay.append(cancel);
     wrap.append(overlay);
@@ -1406,13 +1453,14 @@ export class ChatController {
     const replyTo = this.replyTo;
     this.cancelContext();
 
+    const posterUrl = draft.kind === 'video' && draft.poster ? URL.createObjectURL(draft.poster) : null;
     const optimistic = createOptimistic(id, {
       kind: draft.kind,
       caption,
       media: {
         id: null,
         url: draft.previewUrl,
-        thumbnailUrl: draft.kind === 'video' && draft.poster ? URL.createObjectURL(draft.poster) : draft.previewUrl,
+        thumbnailUrl: posterUrl || draft.previewUrl,
         mimeType: draft.mimeType,
         size: draft.size,
         width: draft.width,
@@ -1429,31 +1477,50 @@ export class ChatController {
     getStore(id).byClientId.set(draft.clientId, optimistic);
 
     if (this.refs.inputEl) this.refs.inputEl.value = '';
-    this.clearDraft();
+    // Hand the draft to the pending-upload lifecycle: clear the composer tray
+    // WITHOUT disposing the File/Blob or the preview the bubble still shows.
+    this.detachDraft();
     this.scrollToBottom();
 
+    await this.performMediaUpload(id, draft, { caption, replyToId: replyTo?.id ?? null, posterUrl });
+  }
+
+  /**
+   * Upload a retained draft and reconcile the optimistic message. On any
+   * non-abort failure the draft (File/Blob + preview) is KEPT in pendingMedia
+   * so retryMessage() can re-send it with the same client_id — the user never
+   * has to reselect the file. The backend deduplicates on client_id, so a retry
+   * after a lost response cannot create a duplicate server message.
+   */
+  async performMediaUpload(id, draft, { caption, replyToId, posterUrl = null }) {
+    this.pendingMedia.set(draft.clientId, { draft, caption, replyToId, posterUrl });
     try {
       const created = await uploadDraft(id, draft, {
         caption,
-        replyToId: replyTo?.id ?? null,
+        replyToId,
         onProgress: ({ percent }) => setLocalProgress(id, draft.clientId, percent),
       });
       confirmOptimistic(id, draft.clientId, created);
+      // Success: the message now points at server media — release local resources.
+      this.pendingMedia.delete(draft.clientId);
+      this.disposePending({ draft, posterUrl });
       announce('Attachment sent.');
     } catch (error) {
       if (error instanceof ApiError && error.isAborted) {
+        this.pendingMedia.delete(draft.clientId);
+        this.disposePending({ draft, posterUrl });
         removeLocal(id, draft.clientId);
         return;
       }
       if (error instanceof ApiError && (error.isTimeout || error.isNetwork || error.isOffline)) {
+        // Outcome unknown: keep the draft retained (do NOT dispose) so a retry
+        // can re-send the same file.
         markLocalUnconfirmed(id, draft.clientId);
         announce('Upload status is being confirmed.');
       } else {
         markLocalFailed(id, draft.clientId, error);
         toastApiError(error);
       }
-    } finally {
-      draft.dispose?.();
     }
   }
 
@@ -1462,8 +1529,8 @@ export class ChatController {
     const file = new File([recording.blob], recording.name, { type: recording.mimeType });
     const draft = await createDraft(file, 'voice');
     draft.duration = recording.duration;
-    this.recording = null;
-    this.clearDraft();
+    // Detach the recording state without disposing the just-built draft.
+    this.detachDraft();
     await this.sendMedia(draft, caption);
   }
 
@@ -1477,7 +1544,23 @@ export class ChatController {
       }
       return;
     }
-    toast('Re-attach the file to send it again.', { type: 'info' });
+
+    // Media/voice: re-send the retained draft with the SAME client_id. No
+    // reselection, no re-recording, and the backend dedupes so no duplicate.
+    const pending = this.pendingMedia.get(message.clientId);
+    if (pending?.draft) {
+      markLocalSending(id, message.clientId);
+      await this.performMediaUpload(id, pending.draft, {
+        caption: pending.caption,
+        replyToId: pending.replyToId,
+        posterUrl: pending.posterUrl,
+      });
+      return;
+    }
+
+    // The draft is genuinely gone (e.g. the tab was reloaded — an in-memory
+    // File cannot survive that). Reselection is the only remaining option.
+    toast('This file is no longer available. Please attach it again to send.', { type: 'info' });
     removeLocal(id, message.clientId);
   }
 

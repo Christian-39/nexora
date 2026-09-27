@@ -131,13 +131,16 @@
 
     loadBranding();
 
+    // Shell first: paint the persistent app shell immediately (branding from
+    // cache), then validate the session in the background. The shell must never
+    // wait on /api/me/ — a cold backend would otherwise blank the UI for seconds.
+    mountNavigation({ active: 'chat' });
+    mountConnectionBanner();
+    mountSessionGuards();
+
     (async () => {
       const user = await requireSession();
       if (!user) return;
-
-      mountNavigation({ active: 'chat' });
-      mountConnectionBanner();
-      mountSessionGuards();
 
       // Decorate icon-only buttons that are declared in markup.
       $('#composer-attach').append(icon('paperclip'));

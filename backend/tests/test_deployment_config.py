@@ -29,7 +29,7 @@ PRODUCTION_ENV = {
     "DJANGO_ENV": "production",
     "DEBUG": "False",
     "SECRET_KEY": "a-unique-production-secret-key-of-more-than-32-characters",
-    "ALLOWED_HOSTS": "nexora-backend-ptsc.onrender.com",
+    "ALLOWED_HOSTS": "nexora-f397.onrender.com",
     "CORS_ALLOWED_ORIGINS": "https://nexora-eight-lilac.vercel.app",
     "CSRF_TRUSTED_ORIGINS": "https://nexora-eight-lilac.vercel.app",
     "COOKIE_SAMESITE": "None",
@@ -179,9 +179,9 @@ def test_samesite_none_without_secure_is_refused():
 
 def test_the_render_hostname_is_always_an_allowed_host():
     settings = load_settings(
-        ALLOWED_HOSTS="example.org", RENDER_EXTERNAL_HOSTNAME="nexora-backend-ptsc.onrender.com"
+        ALLOWED_HOSTS="example.org", RENDER_EXTERNAL_HOSTNAME="nexora-f397.onrender.com"
     )
-    assert "nexora-backend-ptsc.onrender.com" in settings.ALLOWED_HOSTS
+    assert "nexora-f397.onrender.com" in settings.ALLOWED_HOSTS
 
 
 def test_production_requires_mysql_and_private_storage():

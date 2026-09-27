@@ -200,8 +200,17 @@ export async function loadBranding(options = {}) {
 
 /**
  * Apply configuration to the document. Every value is validated before use.
+ *
+ * @param {object} [config]
+ * @param {object} [options]
+ * @param {boolean} [options.sideEffects=true] When false, only the in-document
+ *   brand nodes (names, logo, colours, title) are repainted; the favicon and
+ *   PWA manifest are left untouched. Used to (re)paint brand slots that are
+ *   created *after* the initial load — e.g. the navigation shell — without
+ *   re-fetching the manifest or cache-busting the favicon on every re-render.
  */
-export function applyBranding(config = currentConfig) {
+export function applyBranding(config = currentConfig, options = {}) {
+  const { sideEffects = true } = options;
   const root = document.documentElement;
 
   // --- Colours: strict #RRGGBB only ---
@@ -252,13 +261,15 @@ export function applyBranding(config = currentConfig) {
 
   // --- Favicon ---
   const faviconUrl = resolveMediaUrl(config.favicon_url) || logoUrl;
-  if (faviconUrl && isSafeHttpUrl(faviconUrl)) applyFavicon(faviconUrl);
+  if (sideEffects && faviconUrl && isSafeHttpUrl(faviconUrl)) applyFavicon(faviconUrl);
 
   // --- Manifest branding hints for the service worker / install prompt ---
-  const manifestName = safeText(config.pwa?.name) || brandName;
-  document.querySelector('meta[name="application-name"]')?.setAttribute('content', manifestName);
-  document.querySelector('meta[name="apple-mobile-web-app-title"]')?.setAttribute('content', safeText(config.app_short_name) || manifestName);
-  applyManifest(config, { name: manifestName, shortName: safeText(config.app_short_name) || manifestName, icon: faviconUrl || logoUrl });
+  if (sideEffects) {
+    const manifestName = safeText(config.pwa?.name) || brandName;
+    document.querySelector('meta[name="application-name"]')?.setAttribute('content', manifestName);
+    document.querySelector('meta[name="apple-mobile-web-app-title"]')?.setAttribute('content', safeText(config.app_short_name) || manifestName);
+    applyManifest(config, { name: manifestName, shortName: safeText(config.app_short_name) || manifestName, icon: faviconUrl || logoUrl });
+  }
 
   themeEvents.emit('branding', config);
 }

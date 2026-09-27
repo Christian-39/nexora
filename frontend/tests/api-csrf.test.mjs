@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 const API_MODULE = new URL('../assets/js/api.js', import.meta.url).href;
-const API_ORIGIN = 'https://nexora-backend-ptsc.onrender.com';
+const API_ORIGIN = 'https://nexora-f397.onrender.com';
 let moduleCounter = 0;
 
 function installEnvironment() {

@@ -453,6 +453,17 @@ export function markLocalFailed(conversationId, clientId, error) {
   return message;
 }
 
+/** Move a failed/unconfirmed local message back to SENDING (used on retry). */
+export function markLocalSending(conversationId, clientId) {
+  const store = getStore(conversationId);
+  const message = store.byClientId.get(clientId);
+  if (!message) return null;
+  message.status = STATUS.SENDING;
+  message.error = null;
+  messageEvents.emit('updated', store.id, message);
+  return message;
+}
+
 /** Outcome unknown (timeout / connection lost) — never claim delivery. */
 export function markLocalUnconfirmed(conversationId, clientId) {
   const store = getStore(conversationId);

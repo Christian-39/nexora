@@ -237,3 +237,34 @@ def test_security_headers_present():
     assert "Content-Security-Policy" in response
     assert "Permissions-Policy" in response
     assert response["Referrer-Policy"] == "same-origin"
+
+
+@pytest.mark.django_db
+def test_security_events_paginate_at_exactly_ten_per_page(admin):
+    """The security log paginates at the database (10/page) via cursors — never
+    a SELECT-all sliced in the client."""
+    from apps.security.models import SecurityEvent
+
+    SecurityEvent.objects.bulk_create(
+        [SecurityEvent(event="LOGIN_FAILED", metadata={"n": i}) for i in range(23)]
+    )
+
+    page1 = authed(admin).get("/api/security/events/").json()["data"]
+    assert len(page1["results"]) == 10
+    assert page1["next"]
+    assert page1["previous"] is None
+
+    # Follow the cursor to the second page.
+    cursor = page1["next"].split("cursor=", 1)[1].split("&", 1)[0]
+    page2 = authed(admin).get(f"/api/security/events/?cursor={cursor}").json()["data"]
+    assert len(page2["results"]) == 10
+    assert page2["previous"]
+
+    # Explicit page_size cannot exceed the fixed page size contract.
+    forced = authed(admin).get("/api/security/events/?page_size=50").json()["data"]
+    assert len(forced["results"]) == 10
+
+
+@pytest.mark.django_db
+def test_security_events_require_admin(member_a):
+    assert authed(member_a).get("/api/security/events/").status_code == 403

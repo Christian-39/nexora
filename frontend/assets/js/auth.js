@@ -21,6 +21,18 @@ const ROLE_MEMBER = 'member';
 let currentUser = null;
 let bootstrapPromise = null;
 let signingOut = false;
+/**
+ * True when the most recent bootstrap could NOT verify the session because the
+ * backend/network was unavailable (timeout, offline, 5xx) rather than because
+ * the backend actually rejected the credential (401/403). A connectivity
+ * failure must never be mistaken for a logout.
+ */
+let sessionUnverified = false;
+
+/** Whether the last session check failed for connectivity reasons only. */
+export function isSessionUnverified() {
+  return sessionUnverified;
+}
 
 /* ============================================================
    Session state
@@ -84,17 +96,24 @@ export function bootstrap(options = {}) {
   bootstrapPromise = (async () => {
     try {
       const me = await api.me.get({ retries: 1, timeout: 12000 });
+      sessionUnverified = false;
       return setUser(me);
     } catch (error) {
       if (error instanceof ApiError && error.isAuth) {
+        // The backend positively rejected the credential: this is a real logout.
+        sessionUnverified = false;
         setUser(null);
         return null;
       }
-      // Network/server issues must not silently log the user out.
+      // Network/server issues must not silently log the user out. Flag the
+      // session as *unverified* (not gone) so requireSession keeps the shell
+      // mounted instead of bouncing to the sign-in screen.
       if (error instanceof ApiError && (error.isNetwork || error.isOffline || error.isTimeout || error.isServer)) {
+        sessionUnverified = true;
         authEvents.emit('bootstrap-error', error);
         return null;
       }
+      sessionUnverified = false;
       setUser(null);
       return null;
     } finally {
@@ -112,6 +131,14 @@ export function bootstrap(options = {}) {
 export async function requireSession(options = {}) {
   const user = await bootstrap();
   if (!user) {
+    if (sessionUnverified) {
+      // Could not confirm the session because the backend/network was
+      // unreachable. Keep the (already-mounted) shell in place and let the
+      // caller degrade gracefully; a later request reconciles the real state.
+      // We deliberately do NOT redirect to login on a connectivity failure.
+      authEvents.emit('session-unverified');
+      return null;
+    }
     redirectToLogin();
     return null;
   }

@@ -56,13 +56,13 @@ name a host):
    `http://127.0.0.1:8000`; the hostname is never rewritten, because cookies are
    scoped by host);
 4. hosted — `PRODUCTION_API_ORIGIN`, i.e.
-   `https://nexora-backend-ptsc.onrender.com`;
+   `https://nexora-f397.onrender.com`;
 5. same origin — when the page is already served by the backend, or when an
    override says `same-origin`.
 
 The WebSocket origin is always derived from the resolved API origin
 (`http→ws`, `https→wss`), so production resolves to
-`wss://nexora-backend-ptsc.onrender.com/ws/app/` and local to
+`wss://nexora-f397.onrender.com/ws/app/` and local to
 `ws://127.0.0.1:8000/ws/app/`. No module builds its own socket host.
 
 **This deployment is cross-origin** (frontend on Vercel, API on Render), so the

@@ -542,27 +542,58 @@ def dashboard(request):
     from apps.security.models import SecurityEvent
 
     since = timezone.now() - timezone.timedelta(days=7)
+    # "Today" is the current calendar day in the deployment's configured
+    # timezone (settings.TIME_ZONE); with USE_TZ this is the correct boundary
+    # for "messages today" rather than a rolling 24h or a UTC-midnight window.
+    start_today = timezone.localtime().replace(hour=0, minute=0, second=0, microsecond=0)
     members = User.objects.filter(role=User.Role.MEMBER).aggregate(
         total=Count("id"),
         active=Count("id", filter=Q(is_active=True)),
         inactive=Count("id", filter=Q(is_active=False)),
         pending_pin=Count("id", filter=~Q(credential_state="CHANGED")),
     )
+    # One aggregate query covers all message counters (all-time, 7-day and
+    # today) instead of issuing a separate COUNT per metric.
     messages = Message.objects.aggregate(
         total=Count("id"),
         last_7_days=Count("id", filter=Q(created_at__gte=since)),
         media=Count("id", filter=Q(type__in=["IMAGE", "VIDEO"])),
         voice=Count("id", filter=Q(type="VOICE")),
+        today=Count("id", filter=Q(created_at__gte=start_today)),
+        media_today=Count("id", filter=Q(created_at__gte=start_today, type__in=["IMAGE", "VIDEO"])),
+        voice_today=Count("id", filter=Q(created_at__gte=start_today, type="VOICE")),
+    )
+    conversations = {
+        "total": Conversation.objects.filter(is_active=True).count(),
+        "private": Conversation.objects.filter(is_active=True, kind="ADMIN_PRIVATE").count(),
+        "groups": Group.objects.filter(is_active=True).count(),
+    }
+    # Distinct conversations (not raw receipts) with unread messages for this admin.
+    unread_conversations = (
+        MessageReceipt.objects.filter(recipient=request.user, read_at__isnull=True)
+        .values("message__conversation_id")
+        .distinct()
+        .count()
     )
     data = {
         "members": members,
-        "conversations": {
-            "total": Conversation.objects.filter(is_active=True).count(),
-            "private": Conversation.objects.filter(is_active=True, kind="ADMIN_PRIVATE").count(),
-            "groups": Group.objects.filter(is_active=True).count(),
-        },
+        "conversations": conversations,
         "messages": messages,
         "unread": MessageReceipt.objects.filter(recipient=request.user, read_at__isnull=True).count(),
+        # ---- Flat, front-end-facing metric keys (admin.html reads these) ----
+        # Kept alongside the nested structure above so existing API consumers
+        # and the contract test remain valid while the dashboard renders real
+        # numbers instead of the em-dash placeholders caused by the old
+        # nested/flat key mismatch.
+        "total_members": members["total"],
+        "active_members": members["active"],
+        "inactive_members": members["inactive"],
+        "active_conversations": conversations["total"],
+        "unread_conversations": unread_conversations,
+        "total_groups": conversations["groups"],
+        "messages_today": messages["today"],
+        "media_today": messages["media_today"],
+        "voice_notes_today": messages["voice_today"],
         "recent_activity": [
             {
                 "action": row.action,

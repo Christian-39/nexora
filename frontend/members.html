@@ -92,13 +92,18 @@
 
     loadBranding();
 
+    // Shell first: the persistent shell paints immediately (branding from
+    // cache); the session is validated in the background so a slow /api/me/
+    // never blanks the sidebar/topbar. Admin authorization stays authoritative
+    // on the backend — requireSession still redirects on a confirmed failure.
+    mountNavigation({ active: 'members' });
+    mountConnectionBanner();
+    mountSessionGuards();
+
     (async () => {
       const user = await requireSession({ adminOnly: true });
       if (!user) return;
 
-      mountNavigation({ active: 'members' });
-      mountConnectionBanner();
-      mountSessionGuards();
       registerServiceWorker();
       realtime.start('/ws/app/');
       refreshUnread();

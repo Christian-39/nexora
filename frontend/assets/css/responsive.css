@@ -48,18 +48,63 @@
    <= 767px — single-pane mobile experience
    ============================================================ */
 @media (max-width: 767px) {
-  /* Primary navigation is the header hamburger + drawer.
-     The sidebar is removed entirely so no desktop rule can leak into the
-     mobile layout, and the shell becomes a single full-width column. */
+  /* Primary navigation is the fixed BOTTOM BAR (WhatsApp-style), not a
+     hamburger drawer. The shell becomes a single full-width column with a
+     second, auto-height row that carries the bottom navigation. Because the
+     bar is a normal grid row inside a 100dvh shell, it stays pinned above the
+     Android keyboard (the dynamic viewport shrinks) without position:fixed
+     hacks, and env(safe-area-inset-bottom) keeps it clear of the home bar. */
   .app-shell,
   .app-shell[data-nav="collapsed"],
   .app-shell[data-nav="none"] {
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto;
   }
-  .app-nav { display: none; }
+  .app-nav {
+    grid-row: 2;
+    flex-direction: row;
+    border-right: none;
+    border-top: 1px solid var(--border);
+    padding: 0;
+    padding-bottom: var(--safe-bottom);
+    display: flex;
+  }
+  .app-nav__brand,
+  .app-nav__section,
+  .app-nav__footer { display: none; }
+  .app-nav__list {
+    flex-direction: row;
+    justify-content: space-around;
+    align-items: stretch;
+    padding: var(--sp-1);
+    gap: 0;
+    overflow: visible;
+    width: 100%;
+  }
+  .nav-item {
+    flex: 1;
+    min-width: 0;
+    flex-direction: column;
+    gap: 2px;
+    justify-content: center;
+    padding: var(--sp-2) var(--sp-1);
+    position: relative;
+  }
+  .nav-item__label {
+    display: block;
+    font-size: 0.6875rem; /* 11px */
+    font-weight: var(--fw-medium);
+    text-align: center;
+    width: 100%;
+  }
+  .nav-item__badge { position: absolute; top: 2px; right: 50%; margin: 0; transform: translateX(22px); }
+  /* Hide the bottom bar only when a thread is open full-screen. */
+  .app-shell[data-mobile-view="thread"] .app-nav { display: none; }
 
-  .app-header__menu { display: inline-flex; }
+  /* The bottom bar carries primary navigation, so the header hamburger is
+     redundant on mobile. Secondary destinations (Profile, Settings, Appearance,
+     Sign out) remain reachable through the top-right profile menu. */
+  .app-header__menu { display: none; }
   .app-header__brand { display: flex; }
   .app-header { gap: var(--sp-2); padding-left: calc(var(--sp-2) + var(--safe-left)); }
 

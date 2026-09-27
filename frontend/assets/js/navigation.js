@@ -5,9 +5,12 @@
  * unread badges, connection banner and sign-out.
  *
  * Layout contract (see responsive.css):
- *   >= 1024px  full sidebar          + slim header carrying theme/profile
- *   768-1023px icon-only nav rail    + slim header carrying theme/profile
- *   <= 767px   NO sidebar: header with a hamburger that opens a drawer
+ *   >= 1024px  full sidebar               + slim header carrying theme/profile
+ *   768-1023px icon-only nav rail         + slim header carrying theme/profile
+ *   <= 767px   fixed BOTTOM navigation bar + slim header carrying theme/profile
+ *              (secondary destinations live in the top-right profile menu; the
+ *               drawer below is a legacy fallback and is not surfaced at this
+ *               breakpoint — the hamburger is hidden by responsive.css).
  *
  * Role filtering here is UX only. Every hidden destination is still enforced
  * by the backend; a member typing admin.html receives 403 from the API.
@@ -15,7 +18,7 @@
 
 import { authEvents, getUser, isAdmin, logout } from './auth.js';
 import { apiEvents, resolveMediaUrl } from './api.js';
-import { getThemePreference, setTheme } from './theme.js';
+import { getThemePreference, setTheme, applyBranding, getConfig } from './theme.js';
 import { createConnectionUX } from './connection-ux.js';
 import { avatar, icon, iconButton, openMenu, toast } from './ui.js';
 import { clear, el, formatCount, prefs, trapFocus } from './utils.js';
@@ -46,6 +49,17 @@ const DRAWER_ITEMS = [
 
 let navRoot = null;
 let bannerRoot = null;
+
+/**
+ * Paint the current (cached or live) branding into brand slots that were just
+ * created by the shell. applyBranding queries the whole document, so calling it
+ * after the nav/header/drawer nodes exist is what stops freshly-mounted logo
+ * and organization-name slots from rendering empty. Side effects (favicon /
+ * PWA manifest) are skipped — those are owned by theme.loadBranding().
+ */
+function paintBrand() {
+  applyBranding(getConfig(), { sideEffects: false });
+}
 let activeKey = null;
 let headerRoot = null;
 let drawer = null;
@@ -114,6 +128,9 @@ function render() {
 
   navRoot.append(footer);
   updateBadges();
+  // The brand slots above were created empty; paint the current branding into
+  // them (they exist now, so this is not a no-op like an earlier applyBranding).
+  paintBrand();
 }
 
 function navEntry(item, { bare = false } = {}) {
@@ -223,6 +240,8 @@ function renderHeader() {
   controls.append(profileBtn);
 
   headerRoot.append(controls);
+  // Paint branding into the header's freshly-created logo/name slots.
+  paintBrand();
 }
 
 function resolveAvatarUrl(user) {
@@ -349,6 +368,8 @@ export function openDrawer(opener = null) {
   drawerOpener = opener || document.getElementById('nav-toggle');
   drawer = buildDrawer();
   document.body.append(drawer);
+  // Paint branding into the drawer's brand slots now that they are in the DOM.
+  paintBrand();
   // Force a frame so the CSS transition runs from the closed position.
   drawer.hidden = false;
   requestAnimationFrame(() => drawer?.setAttribute('data-open', 'true'));

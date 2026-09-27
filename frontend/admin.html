@@ -120,13 +120,17 @@
       { key: 'voice_notes_today', label: 'Voice notes today' },
     ];
 
+    // Shell first: paint the persistent shell immediately (branding from
+    // cache), then validate the admin session in the background so a cold
+    // backend never blanks the dashboard chrome. Backend stays authoritative.
+    mountNavigation({ active: 'admin' });
+    mountConnectionBanner();
+    mountSessionGuards();
+
     (async () => {
       const user = await requireSession({ adminOnly: true });
       if (!user) return;
 
-      mountNavigation({ active: 'admin' });
-      mountConnectionBanner();
-      mountSessionGuards();
       registerServiceWorker();
       realtime.start('/ws/app/');
       refreshUnread();
@@ -215,27 +219,55 @@
       }
     }
 
-    async function loadSecurity() {
+    /** Pull the opaque `cursor` value out of a DRF cursor-pagination link. */
+    function cursorParam(link) {
+      if (!link) return null;
+      try {
+        return new URL(link, window.location.origin).searchParams.get('cursor');
+      } catch {
+        return null;
+      }
+    }
+
+    // Exactly ten security events per page, paginated at the database via the
+    // backend cursor paginator. Prev/Next follow the returned cursors; the page
+    // never reloads.
+    async function loadSecurity(cursor = null) {
       const container = $('#security-events');
       clear(container);
       container.append(skeletonList(4, { avatar: false }));
       try {
-        const response = await api.security.events({ limit: 8 });
+        const params = { page_size: 10 };
+        if (cursor) params.cursor = cursor;
+        const response = await api.security.events(params);
         const page = normalizePage(response.data ?? response);
         clear(container);
-        if (!page.items.length) {
+        if (!page.items.length && !cursor) {
           container.append(emptyState({ icon: 'shield-check', title: 'No security events', text: 'Sign-in failures and lockouts will appear here.' }));
           return;
         }
         container.append(renderActivityList(page.items, true));
+        container.append(renderSecurityPager(page));
       } catch (error) {
         clear(container);
         container.append(
           error instanceof ApiError && (error.isNotFound || error.isForbidden)
             ? emptyState({ icon: 'shield-check', title: 'Security log unavailable', text: 'You do not have access to the security log, or it is not enabled.' })
-            : errorState({ text: error.message, onRetry: loadSecurity })
+            : errorState({ text: error.message, onRetry: () => loadSecurity(cursor) })
         );
       }
+    }
+
+    function renderSecurityPager(page) {
+      const prevCursor = cursorParam(page.previous);
+      const nextCursor = cursorParam(page.next);
+      const pager = el('div', { class: 'row row-wrap', style: { justifyContent: 'flex-end', gap: 'var(--sp-2)', marginTop: 'var(--sp-2)' } });
+      const prev = el('button', { type: 'button', class: 'btn btn--sm', text: 'Previous', disabled: !page.previous });
+      const next = el('button', { type: 'button', class: 'btn btn--sm', text: 'Next', disabled: !page.next });
+      prev.addEventListener('click', () => loadSecurity(prevCursor));
+      next.addEventListener('click', () => loadSecurity(nextCursor));
+      pager.append(prev, next);
+      return pager;
     }
 
     function renderActivityList(items, security = false) {

@@ -73,13 +73,16 @@
 
     loadBranding();
 
+    // Shell first: paint the persistent app shell immediately (branding from
+    // cache), then validate the session in the background so a cold backend
+    // never blanks the sidebar/topbar.
+    mountNavigation({ active: 'profile' });
+    mountConnectionBanner();
+    mountSessionGuards();
+
     (async () => {
       const user = await requireSession();
       if (!user) return;
-
-      mountNavigation({ active: 'profile' });
-      mountConnectionBanner();
-      mountSessionGuards();
       registerServiceWorker();
       realtime.start('/ws/app/');
       refreshUnread();

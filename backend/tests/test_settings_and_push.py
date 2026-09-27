@@ -146,6 +146,19 @@ def test_dashboard_reports_real_counts(admin, member_a, member_b, private_thread
     assert data["members"]["total"] == 2
     assert data["members"]["active"] == 2
     assert data["members"]["pending_pin"] >= 1
+
+    # Flat, front-end-facing keys (admin.html reads these) must mirror the nested
+    # structure and expose real numbers, not placeholders. This is the contract
+    # whose mismatch previously left every dashboard metric showing an em dash.
+    assert data["total_members"] == 2
+    assert data["active_members"] == 2
+    assert data["inactive_members"] == 0
+    assert data["active_conversations"] >= 1
+    assert data["total_groups"] == 0
+    # The admin just sent one message today.
+    assert data["messages_today"] >= 1
+    for key in ("unread_conversations", "media_today", "voice_notes_today"):
+        assert key in data and isinstance(data[key], int)
     assert data["messages"]["total"] == 1
     assert data["conversations"]["total"] == 1
 

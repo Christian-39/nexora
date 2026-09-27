@@ -65,7 +65,7 @@ by an automated test or a live run recorded at the end of this document.
 DJANGO_ENV=production
 DEBUG=False
 SECRET_KEY=<64+ random chars>                       # secret
-ALLOWED_HOSTS=nexora-backend-ptsc.onrender.com
+ALLOWED_HOSTS=nexora-f397.onrender.com
 CORS_ALLOWED_ORIGINS=https://nexora-eight-lilac.vercel.app
 CSRF_TRUSTED_ORIGINS=https://nexora-eight-lilac.vercel.app
 COOKIE_SAMESITE=None
@@ -122,7 +122,7 @@ Do **not** use `config.wsgi` — it cannot serve WebSockets.
 3. **Backend on Render** — Blueprint (`render.yaml`) or manually: new *Web
    Service* → repo → `rootDir: backend` → build/start from §4 → paste §3
    variables → deploy. First boot runs migrations. Verify:
-   `curl -i https://nexora-backend-ptsc.onrender.com/health/` → `200`.
+   `curl -i https://nexora-f397.onrender.com/health/` → `200`.
 4. **Create the first administrator** (Render Shell):
    `python manage.py createsuperuser --phone +234…`
 5. **Workers** — three *Background Workers*, same repo/rootDir, commands from
@@ -132,7 +132,7 @@ Do **not** use `config.wsgi` — it cannot serve WebSockets.
    picked up automatically. No file edits are needed: `config.js` resolves to
    the Render backend.
 7. **Verify in a browser** on `https://nexora-eight-lilac.vercel.app`:
-   sign in, DevTools → Network → WS shows `wss://nexora-backend-ptsc.onrender.com/ws/app/`
+   sign in, DevTools → Network → WS shows `wss://nexora-f397.onrender.com/ws/app/`
    status 101; send a message in two tabs; toggle airplane mode and back —
    the banner goes `offline → reconnecting → connected` and settles.
 8. **If the frontend moves to another domain**, update `CORS_ALLOWED_ORIGINS`

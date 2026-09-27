@@ -8,6 +8,7 @@ Infrastructure secrets are never readable or writable here.
 
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.generics import ListAPIView
+from rest_framework.pagination import CursorPagination
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -19,8 +20,34 @@ from .models import SecurityEvent
 from .serializers import SecurityEventSerializer
 
 
+class SecurityEventPagination(CursorPagination):
+    """Exactly ten security events per page, paginated at the database level.
+
+    Cursor pagination issues a stable ``LIMIT 11`` window ordered by
+    ``-created_at`` (covered by the ``security/models`` created_at index) and
+    exposes opaque next/previous cursors — no ``SELECT *`` + JavaScript slice.
+    """
+
+    page_size = 10
+    ordering = "-created_at"
+
+    def get_paginated_response(self, data):
+        return Response(
+            {
+                "success": True,
+                "message": "Security events retrieved",
+                "data": {
+                    "next": self.get_next_link(),
+                    "previous": self.get_previous_link(),
+                    "results": data,
+                },
+            }
+        )
+
+
 class SecurityEventListView(ListAPIView):
     serializer_class = SecurityEventSerializer
+    pagination_class = SecurityEventPagination
 
     def get_queryset(self):
         if self.request.user.role != "ADMIN":

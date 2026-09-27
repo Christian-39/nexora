@@ -161,7 +161,7 @@ test('the socket URL is the production Render endpoint', async () => {
   const { realtime } = await loadClient();
   realtime.start('/ws/app/');
   assert.equal(FakeWebSocket.instances.length, 1);
-  assert.equal(FakeWebSocket.instances[0].url, 'wss://nexora-backend-ptsc.onrender.com/ws/app/');
+  assert.equal(FakeWebSocket.instances[0].url, 'wss://nexora-f397.onrender.com/ws/app/');
   realtime.stop();
 });
 

@@ -111,7 +111,7 @@ Then open <http://127.0.0.1:5500/login.html>.
    on **the same hostname**, port 8000;
 4. **the deployed backend** (`PRODUCTION_API_ORIGIN` in `config.js`) — this
    project's hosted frontend lives on Vercel and its API on Render, so a hosted
-   page resolves to `https://nexora-backend-ptsc.onrender.com`;
+   page resolves to `https://nexora-f397.onrender.com`;
 5. **same origin** — used when the page is already served *by* the backend
    (reverse proxy / `devserver.py`), or when an override says `same-origin`.
 
@@ -148,7 +148,7 @@ API returns `403 PERMISSION_DENIED` until they do.
 Vercel static frontend            https://nexora-eight-lilac.vercel.app
         │ HTTPS + WSS
         ▼
-Render Python web service         https://nexora-backend-ptsc.onrender.com
+Render Python web service         https://nexora-f397.onrender.com
   Gunicorn + UvicornWorker + Django Channels
         ├── external managed MySQL 8
         ├── external managed Redis        (REDIS_URL — channels, cache, presence)
@@ -184,7 +184,7 @@ WebSockets — deploying it silently removes every realtime feature.
 DJANGO_ENV=production
 DEBUG=False
 SECRET_KEY=<64+ random characters>
-ALLOWED_HOSTS=nexora-backend-ptsc.onrender.com
+ALLOWED_HOSTS=nexora-f397.onrender.com
 CORS_ALLOWED_ORIGINS=https://nexora-eight-lilac.vercel.app
 CSRF_TRUSTED_ORIGINS=https://nexora-eight-lilac.vercel.app
 COOKIE_SAMESITE=None            # cross-site frontend
