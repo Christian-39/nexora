@@ -1,6 +1,6 @@
 {
   "name": "NEXORA",
-  "short_name": "NEXORA",
+  "short_name": "Nexora",
   "description": "Private administrator-controlled messaging and community platform.",
   "id": "/",
   "start_url": "./index.html",
