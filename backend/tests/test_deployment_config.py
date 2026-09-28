@@ -191,7 +191,18 @@ def test_production_requires_mysql_and_private_storage():
         load_settings(STORAGE_BUCKET=None)
 
     settings = load_settings()
-    assert "mysql" in settings.DATABASES["default"]["ENGINE"]
+    engine = settings.DATABASES["default"]["ENGINE"]
+    # Production MySQL is served through the process-wide connection pool
+    # (config/db_pool_backend subclasses Django's MySQL backend). Under ASGI,
+    # Django's thread-local CONN_MAX_AGE cannot reuse connections, so the
+    # plain backend would pay a full remote handshake on every request.
+    assert engine == "config.db_pool_backend" or "mysql" in engine
+    if engine == "config.db_pool_backend":
+        pool = settings.DATABASES["default"]["POOL_OPTIONS"]
+        assert pool["POOL_SIZE"] >= 1
+        assert pool["PRE_PING"] is True
+        # The pool owns connection lifecycle; Django-level persistence off.
+        assert settings.DATABASES["default"]["CONN_MAX_AGE"] == 0
     assert settings.STORAGES["default"]["OPTIONS"]["default_acl"] == "private"
     assert settings.STORAGES["default"]["OPTIONS"]["querystring_auth"] is True
 

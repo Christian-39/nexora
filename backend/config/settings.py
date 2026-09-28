@@ -106,6 +106,24 @@ LANGUAGE_CODE = config("LANGUAGE_CODE", default="en-us")
 AUTH_PASSWORD_VALIDATORS: list[dict] = []  # six-digit PINs are validated explicitly.
 
 # ---------------------------------------------------------------------------
+# PIN hashing.
+#
+# Django's default PBKDF2 at 1,000,000 iterations measured ~256ms on a fast
+# CPU and multiples of that on a 0.5 vCPU production instance — a large part
+# of the login latency. Argon2id with the OWASP-recommended parameters
+# (m=19456 KiB, t=2, p=1) verifies in tens of milliseconds at equivalent or
+# better security. PBKDF2 stays in the list so existing hashes keep working;
+# Django transparently re-hashes each account to Argon2 on its next
+# successful login.
+# ---------------------------------------------------------------------------
+
+PASSWORD_HASHERS = [
+    "config.hashers.TunedArgon2PasswordHasher",
+    "django.contrib.auth.hashers.PBKDF2PasswordHasher",
+    "django.contrib.auth.hashers.PBKDF2SHA1PasswordHasher",
+]
+
+# ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
 # Preferred: DATABASE_URL. Alternative: discrete DATABASE_* values (MySQL 8+).
@@ -161,6 +179,55 @@ if "mysql" in DATABASES["default"].get("ENGINE", ""):
     DATABASES["default"]["OPTIONS"].setdefault("charset", "utf8mb4")
     DATABASES["default"]["OPTIONS"].setdefault(
         "init_command", "SET sql_mode='STRICT_TRANS_TABLES'"
+    )
+
+# ---------------------------------------------------------------------------
+# Database connection pooling (MySQL).
+#
+# Django serves HTTP through ASGI here (Channels). Under ASGI each request is
+# executed inside a fresh asgiref ThreadSensitiveContext whose single-use
+# executor thread is destroyed when the request ends. Django's persistent
+# connections (CONN_MAX_AGE) are *thread-local*, so they die with that thread:
+# measured in production, EVERY request paid a full TCP+TLS+MySQL handshake
+# (~1.3-2.1s to a remote database) despite CONN_MAX_AGE=300.
+#
+# A process-wide SQLAlchemy QueuePool (django-db-connection-pool) survives
+# thread churn: connections are checked out per request and returned on
+# close(). PRE_PING revalidates a pooled connection before reuse, replacing
+# CONN_HEALTH_CHECKS; RECYCLE keeps pooled connections younger than typical
+# provider wait_timeout/idle limits.
+# ---------------------------------------------------------------------------
+
+DATABASE_POOL = config("DATABASE_POOL", default=True, cast=bool)
+
+if (
+    DATABASE_POOL
+    and not TESTING
+    and DATABASES["default"]["ENGINE"] == "django.db.backends.mysql"
+):
+    DATABASES["default"]["ENGINE"] = "config.db_pool_backend"
+    # Sizing note: shared MySQL hosting commonly enforces max_user_connections
+    # (often 10-30) and sometimes max_connections_per_hour. The pool must stay
+    # comfortably below the *user* cap across ALL processes (gunicorn web
+    # workers + the three background workers). 3 persistent + 5 burst per
+    # process is deliberate; raise only after checking the provider's limits.
+    # Pooling also collapses the connections-per-hour figure from
+    # "two per HTTP request" to "a handful per process per recycle window".
+    DATABASES["default"]["POOL_OPTIONS"] = {
+        "POOL_SIZE": config("DATABASE_POOL_SIZE", default=3, cast=int),
+        "MAX_OVERFLOW": config("DATABASE_POOL_MAX_OVERFLOW", default=5, cast=int),
+        "RECYCLE": config("DATABASE_POOL_RECYCLE", default=280, cast=int),
+        "PRE_PING": True,
+    }
+    # The pool owns the connection lifecycle; Django-level persistence and
+    # health checks must not fight it.
+    DATABASES["default"]["CONN_MAX_AGE"] = 0
+else:
+    # Without the pool (e.g. non-MySQL engines), keep Django persistent
+    # connections and guard reuse with a health check so a connection killed
+    # by the provider's idle timeout cannot surface as a mid-request error.
+    DATABASES["default"]["CONN_HEALTH_CHECKS"] = config(
+        "DATABASE_CONN_HEALTH_CHECKS", default=True, cast=bool
     )
 
 # ---------------------------------------------------------------------------

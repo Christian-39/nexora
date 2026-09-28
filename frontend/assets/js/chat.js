@@ -140,11 +140,25 @@ export class ChatController {
     this.bindStoreEvents();
     this.bindRealtime();
 
-    await this.loadConversations({ reset: true });
-
+    // Chat-boot waterfall fix: the most likely initial thread is known BEFORE
+    // the conversation list returns (?c= deep link or the remembered last
+    // conversation). Warm its detail + history in parallel with the list —
+    // api.js deduplicates in-flight GETs and loadLatest() coalesces callers,
+    // so open() below joins these exact requests instead of starting a second
+    // sequential round-trip chain. Requests that turn out to be unnecessary
+    // are simply ignored; authorization stays entirely server-side.
     const requested = new URLSearchParams(window.location.search).get('c');
     const remembered = prefs.get('lastConversation');
-    const initial = requested || (!mobile.isSmall ? remembered : null);
+    const initialCandidate = requested || (!mobile.isSmall ? remembered : null);
+    if (initialCandidate) {
+      this.bootPrefetchedId = String(initialCandidate);
+      api.conversations.get(this.bootPrefetchedId).catch(() => {});
+      loadLatest(this.bootPrefetchedId, { force: true }).catch(() => {});
+    }
+
+    await this.loadConversations({ reset: true });
+
+    const initial = initialCandidate;
     if (initial && this.conversations.has(String(initial))) {
       this.open(String(initial));
     } else if (!mobile.isSmall && this.order.length) {
@@ -432,9 +446,14 @@ export class ChatController {
 
     try {
       // Fetch authoritative conversation metadata in parallel with history.
+      // If init() already prefetched THIS conversation, loadLatest() either
+      // joins the in-flight request or returns the just-loaded fresh page —
+      // no second fetch of data that arrived milliseconds ago.
+      const prefetched = this.bootPrefetchedId === id;
+      this.bootPrefetchedId = null;
       const [detail] = await Promise.allSettled([
         api.conversations.get(id, { signal: this.threadAbort.signal }),
-        loadLatest(id, { signal: this.threadAbort.signal, force: true }),
+        loadLatest(id, { signal: this.threadAbort.signal, force: !prefetched }),
       ]);
 
       if (detail.status === 'fulfilled' && detail.value) {

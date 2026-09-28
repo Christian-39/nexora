@@ -169,6 +169,12 @@
 .thread__identity:hover { background: var(--surface-hover); }
 .thread__meta { min-width: 0; }
 .thread__name {
+  /* Must be block: this is a <span>, and overflow/text-overflow are ignored on
+     a non-replaced inline box, so the ellipsis below was inert and a long
+     contact name escaped the header at 320px (measured: right edge 322.6px on
+     a 320px viewport). The sibling .thread__status is a <div> and truncated
+     correctly, which is what made the difference visible. */
+  display: block;
   font-size: var(--fs-base);
   font-weight: var(--fw-semibold);
   color: var(--text-heading);

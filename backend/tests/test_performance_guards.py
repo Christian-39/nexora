@@ -121,3 +121,82 @@ def test_conversation_list_is_query_bounded(admin, member_a, private_thread, dja
     # queries that scale with the member base. A flat bound proves the fix.
     sqls = [q["sql"] for q in ctx.captured_queries]
     assert len(ctx.captured_queries) <= 8, sqls
+
+
+# ------------------------------------------- notification aggregation lock
+
+
+@pytest.mark.django_db(transaction=True)
+def test_new_message_locking_read_runs_inside_a_transaction(admin, member_a, private_thread, monkeypatch):
+    """The send path must stay transactional, because it takes a row lock.
+
+    ``notify_new_message`` aggregates repeat notifications with
+    ``select_for_update()``. That is only legal inside a transaction: on MySQL
+    (production) a locking read issued in autocommit raises
+    TransactionManagementError, turning an ordinary message send into HTTP 500.
+    Today it is safe purely because ``send_message`` and ``create_text_message``
+    are decorated ``@transaction.atomic`` — an implicit dependency that a future
+    refactor could remove without any local symptom, since the suite runs on
+    SQLite, whose backend reports ``has_select_for_update = False`` and drops
+    the clause silently.
+
+    So this test pins the invariant instead of the implementation: whenever the
+    send path issues a locking read, the connection must not be in autocommit.
+    ``transaction=True`` is required, otherwise the enclosing test transaction
+    would satisfy the assertion by itself and prove nothing.
+    """
+    from django.db import connection
+    from django.db.models import QuerySet
+
+    observed = []
+    original = QuerySet.select_for_update
+
+    def spy(self, *args, **kwargs):
+        observed.append(connection.get_autocommit())
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(QuerySet, "select_for_update", spy)
+
+    # An eligible recipient is required: notify_new_message skips the locking
+    # read entirely for recipients who have message notifications disabled.
+    assert member_a.notify_messages, "fixture must have message notifications enabled"
+
+    # Pin the aggregation window instead of relying on the default: a zero
+    # window disables the locking read altogether. messaging_policy() also
+    # memoises in a process-local cache that cache.clear() does not reset, so
+    # that has to be invalidated too or a policy from an earlier test leaks in.
+    from apps.platform_settings import services as platform_services
+    from apps.platform_settings.models import PlatformConfiguration
+
+    PlatformConfiguration.objects.update_or_create(
+        pk=PlatformConfiguration.objects.values_list("pk", flat=True).first(),
+        defaults={"notification_aggregation_window_seconds": 60, "notification_previews": True},
+    )
+    platform_services._local.update(value=None, at=0.0)
+
+    first = authed(admin).post(
+        f"/api/conversations/{private_thread.id}/messages/",
+        {"client_id": "lock-guard-1", "text": "hello"},
+        format="json",
+    )
+    assert first.status_code == 201, getattr(first, "data", first.content)
+
+    # Second send inside the aggregation window: this is the branch that reads
+    # an existing notification row under the lock.
+    second = authed(admin).post(
+        f"/api/conversations/{private_thread.id}/messages/",
+        {"client_id": "lock-guard-2", "text": "hello again"},
+        format="json",
+    )
+    assert second.status_code == 201, getattr(second, "data", second.content)
+
+    assert observed, "the aggregation path must issue a locking read"
+    assert not any(observed), (
+        "select_for_update() was issued in autocommit mode; on MySQL this raises "
+        "TransactionManagementError and the send returns HTTP 500"
+    )
+
+    from apps.notifications.models import Notification
+
+    aggregated = Notification.objects.get(recipient=member_a, type="NEW_MESSAGE")
+    assert aggregated.aggregate_count == 2, "two sends inside the window must aggregate onto one notification"

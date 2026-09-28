@@ -24,6 +24,13 @@ gunicorn>=23.0
 # config/__init__.py on hosts that cannot build it (e.g. a managed Python
 # runtime without libmysqlclient-dev). Same Django backend either way.
 PyMySQL>=1.1
+# Process-wide DB connection pool: Django's CONN_MAX_AGE is thread-local and
+# ASGI destroys the request thread (ThreadSensitiveContext), so without a pool
+# every request pays a full TCP+TLS+MySQL handshake to the remote database.
+django-db-connection-pool>=1.2.6
+SQLAlchemy>=2.0
+# Argon2id PIN hashing (OWASP parameters) — see config/hashers.py.
+argon2-cffi>=23.1
 # Optional speed-up where libmysqlclient-dev IS available (self-hosted/CI):
 #   pip install "mysqlclient>=2.2"
 # config/__init__.py prefers it automatically whenever it is importable.

@@ -4,8 +4,13 @@ from .models import Notification, PushSubscription
 
 
 class NotificationSerializer(serializers.ModelSerializer):
-    conversation_id = serializers.CharField(source="conversation.id", read_only=True, default=None)
+    # The FK id column is already on the notification row; reading
+    # ``conversation.id`` forced one SELECT per notification (N+1).
+    conversation_id = serializers.SerializerMethodField()
     body = serializers.CharField(source="message", read_only=True)
+
+    def get_conversation_id(self, obj):
+        return str(obj.conversation_id) if obj.conversation_id else None
 
     class Meta:
         model = Notification

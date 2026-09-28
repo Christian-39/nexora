@@ -309,29 +309,37 @@ export function clearAllStores() {
  */
 export async function loadLatest(conversationId, { signal, force = false } = {}) {
   const store = getStore(conversationId);
-  if (store.loading) return { items: store.items, hasMore: store.hasMore };
+  // Concurrent callers JOIN the in-flight request instead of receiving a
+  // premature empty snapshot. This makes prefetching the initial thread
+  // (chat boot) safe: ChatController.open() awaits the same promise the
+  // prefetch started and renders the real history.
+  if (store.loadingPromise) return store.loadingPromise;
   if (store.loadedOnce && !force) return { items: store.items, hasMore: store.hasMore };
 
   store.loading = true;
   store.error = null;
   messageEvents.emit('loading', store.id, true);
-  try {
-    const response = await api.conversations.messages(conversationId, { limit: PAGE_SIZE }, { signal });
-    const page = normalizePage(response.data ?? response);
-    ingestPage(store, page, { replace: force });
-    store.loadedOnce = true;
-    store.cursor = page.next;
-    store.hasMore = !!page.next;
-    messageEvents.emit('loaded', store.id, store.items);
-    return { items: store.items, hasMore: store.hasMore };
-  } catch (error) {
-    store.error = error instanceof ApiError ? error : new ApiError({ message: 'Unable to load messages.' });
-    messageEvents.emit('error', store.id, store.error);
-    throw store.error;
-  } finally {
-    store.loading = false;
-    messageEvents.emit('loading', store.id, false);
-  }
+  store.loadingPromise = (async () => {
+    try {
+      const response = await api.conversations.messages(conversationId, { limit: PAGE_SIZE }, { signal });
+      const page = normalizePage(response.data ?? response);
+      ingestPage(store, page, { replace: force });
+      store.loadedOnce = true;
+      store.cursor = page.next;
+      store.hasMore = !!page.next;
+      messageEvents.emit('loaded', store.id, store.items);
+      return { items: store.items, hasMore: store.hasMore };
+    } catch (error) {
+      store.error = error instanceof ApiError ? error : new ApiError({ message: 'Unable to load messages.' });
+      messageEvents.emit('error', store.id, store.error);
+      throw store.error;
+    } finally {
+      store.loading = false;
+      store.loadingPromise = null;
+      messageEvents.emit('loading', store.id, false);
+    }
+  })();
+  return store.loadingPromise;
 }
 
 /**

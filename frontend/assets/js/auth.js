@@ -128,8 +128,8 @@ export function patchUser(partial) {
  * @returns {Promise<object|null>} the authenticated user or null
  */
 export function bootstrap(options = {}) {
-  if (bootstrapPromise) return bootstrapPromise;
-  bootstrapPromise = (async () => {
+  // One network revalidation at a time, shared by every caller.
+  const network = bootstrapPromise || (bootstrapPromise = (async () => {
     try {
       const me = await api.me.get({ retries: 1, timeout: 12000 });
       sessionUnverified = false;
@@ -138,8 +138,12 @@ export function bootstrap(options = {}) {
       if (error instanceof ApiError && error.isAuth) {
         // The backend positively rejected the credential: this is a real logout.
         sessionUnverified = false;
+        const hadUser = !!currentUser;
         clearLocalSessionArtifacts();
         setUser(null);
+        // Pages that already proceeded from the cached snapshot must still be
+        // bounced to login when the backend rejects the session.
+        if (hadUser) authEvents.emit('session-expired');
         return null;
       }
       // Network/server issues must not silently log the user out. Flag the
@@ -156,8 +160,16 @@ export function bootstrap(options = {}) {
     } finally {
       bootstrapPromise = null;
     }
-  })();
-  return bootstrapPromise;
+  })());
+  // Cached-session fast path: the tab-scoped snapshot (written only after a
+  // verified /api/me/) lets the page proceed immediately while the network
+  // revalidation above reconciles in the background. The HttpOnly cookie and
+  // the backend remain authoritative: every API request is still individually
+  // authenticated server-side, and a background 401 clears the snapshot and
+  // redirects. Callers that need an authoritative answer (e.g. the login
+  // page's redirect-if-authenticated) pass { fresh: true }.
+  if (options.fresh || !currentUser) return network;
+  return Promise.resolve(currentUser);
 }
 
 /**
@@ -193,7 +205,9 @@ export async function requireSession(options = {}) {
 
 /** Redirect an already-authenticated user away from the login page. */
 export async function redirectIfAuthenticated() {
-  const user = await bootstrap();
+  // The login page must not bounce a signed-out user away on the basis of a
+  // stale snapshot — require the authoritative network answer here.
+  const user = await bootstrap({ fresh: true });
   if (user && !mustChangeCredential()) {
     window.location.replace(landingPage());
     return true;
