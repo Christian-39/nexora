@@ -126,12 +126,15 @@ PASSWORD_HASHERS = [
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
-# Preferred: DATABASE_URL. Alternative: discrete DATABASE_* values (MySQL 8+).
-# SQLite is permitted for local development and the test-suite only; it is
-# rejected outright when DEBUG is off.
+# MySQL 8+ ONLY, in every environment (local, test, production). There is no
+# SQLite fallback: if the database is not configured, startup fails loudly
+# instead of silently creating db.sqlite3.
+#
+# Preferred: DATABASE_URL (mysql://user:pass@host:3306/name).
+# Alternative: discrete DATABASE_* (or DB_*) values.
 
 DATABASE_URL = config("DATABASE_URL", default="")
-DATABASE_ENGINE = config("DATABASE_ENGINE", default="django.db.backends.mysql")
+MYSQL_ENGINE = "django.db.backends.mysql"
 DATABASE_NAME = config("DATABASE_NAME", default=config("DB_NAME", default=""))
 DATABASE_USER = config("DATABASE_USER", default=config("DB_USER", default=""))
 DATABASE_PASSWORD = config("DATABASE_PASSWORD", default=config("DB_PASSWORD", default=""))
@@ -143,43 +146,42 @@ DATABASE_PORT = config("DATABASE_PORT", default=config("DB_PORT", default=3306),
 #: (MySQL's default wait_timeout is 28800s).
 DATABASE_CONN_MAX_AGE = config("DATABASE_CONN_MAX_AGE", default=300, cast=int)
 
-if TESTING:
+if DATABASE_URL:
     DATABASES = {
-        "default": {
-            "ENGINE": "django.db.backends.sqlite3",
-            "NAME": ":memory:",
-            "TEST": {"NAME": ":memory:"},
-        }
+        "default": dj_database_url.parse(
+            DATABASE_URL, conn_max_age=DATABASE_CONN_MAX_AGE, engine=MYSQL_ENGINE
+        )
     }
-elif DATABASE_URL:
-    DATABASES = {"default": dj_database_url.parse(DATABASE_URL, conn_max_age=DATABASE_CONN_MAX_AGE)}
 elif DATABASE_NAME:
     DATABASES = {
         "default": {
-            "ENGINE": DATABASE_ENGINE,
+            "ENGINE": MYSQL_ENGINE,
             "NAME": DATABASE_NAME,
             "USER": DATABASE_USER,
             "PASSWORD": DATABASE_PASSWORD,
             "HOST": DATABASE_HOST,
             "PORT": str(DATABASE_PORT),
             "CONN_MAX_AGE": DATABASE_CONN_MAX_AGE,
-            "OPTIONS": {"charset": "utf8mb4"} if "mysql" in DATABASE_ENGINE else {},
         }
     }
 else:
-    DATABASES = {
-        "default": {
-            "ENGINE": "django.db.backends.sqlite3",
-            "NAME": str(BASE_DIR / "db.sqlite3"),
-        }
-    }
-
-if "mysql" in DATABASES["default"].get("ENGINE", ""):
-    DATABASES["default"].setdefault("OPTIONS", {})
-    DATABASES["default"]["OPTIONS"].setdefault("charset", "utf8mb4")
-    DATABASES["default"]["OPTIONS"].setdefault(
-        "init_command", "SET sql_mode='STRICT_TRANS_TABLES'"
+    raise ImproperlyConfigured(
+        "MySQL is not configured. Set DATABASE_URL (mysql://user:pass@host:3306/name) "
+        "or DATABASE_NAME/DATABASE_USER/DATABASE_PASSWORD/DATABASE_HOST/DATABASE_PORT."
     )
+
+if DATABASES["default"]["ENGINE"] != MYSQL_ENGINE:
+    raise ImproperlyConfigured(
+        "Only MySQL is supported (use a mysql:// DATABASE_URL); SQLite and other engines are not allowed."
+    )
+
+# The test runner creates/drops a separate ``test_<NAME>`` database on the same
+# MySQL server, so the DB user needs CREATE/DROP privileges on ``test_%``.
+DATABASES["default"]["TEST"] = {"CHARSET": "utf8mb4", "COLLATION": "utf8mb4_unicode_ci"}
+
+DATABASES["default"].setdefault("OPTIONS", {})
+DATABASES["default"]["OPTIONS"].setdefault("charset", "utf8mb4")
+DATABASES["default"]["OPTIONS"].setdefault("init_command", "SET sql_mode='STRICT_TRANS_TABLES'")
 
 # ---------------------------------------------------------------------------
 # Database connection pooling (MySQL).
@@ -223,7 +225,7 @@ if (
     # health checks must not fight it.
     DATABASES["default"]["CONN_MAX_AGE"] = 0
 else:
-    # Without the pool (e.g. non-MySQL engines), keep Django persistent
+    # Without the pool (DATABASE_POOL=false, or under test), keep Django persistent
     # connections and guard reuse with a health check so a connection killed
     # by the provider's idle timeout cannot surface as a mid-request error.
     DATABASES["default"]["CONN_HEALTH_CHECKS"] = config(
@@ -608,8 +610,6 @@ if not DEBUG and not TESTING:
         raise ImproperlyConfigured("ALLOWED_HOSTS must be configured in production.")
     if not REDIS_URL:
         raise ImproperlyConfigured("REDIS_URL is mandatory in production (channels, cache, presence).")
-    if DATABASES["default"]["ENGINE"].endswith("sqlite3"):
-        raise ImproperlyConfigured("SQLite is not supported in production; configure MySQL 8+.")
     if not STORAGE_BUCKET:
         raise ImproperlyConfigured("Private object storage (STORAGE_BUCKET) is mandatory in production.")
     if not CORS_ALLOWED_ORIGINS and not CSRF_TRUSTED_ORIGINS:
