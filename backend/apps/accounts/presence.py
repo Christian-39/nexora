@@ -1,7 +1,7 @@
 import asyncio,time
 from channels.generic.websocket import AsyncJsonWebsocketConsumer
 from channels.db import database_sync_to_async
-from django.core.cache import cache
+from apps.core import cache as safe_cache
 from django.utils import timezone
 class PresenceConsumer(AsyncJsonWebsocketConsumer):
  async def connect(self):
@@ -34,18 +34,19 @@ class PresenceConsumer(AsyncJsonWebsocketConsumer):
  def snapshot(self):
   result=[]
   for group in self.watched:
-   uid=group.removeprefix('presence_user_');result.append({'user':uid,'online':bool(cache.get(f'presence:{uid}',0))})
+   uid=group.removeprefix('presence_user_');result.append({'user':uid,'online':bool(safe_cache.safe_get(f'presence:{uid}',0,operation='presence'))})
   return result
  @database_sync_to_async
  def increment(self):
-  key=f'presence:{self.scope["user"].id}';cache.add(key,0,timeout=120);value=cache.incr(key);cache.touch(key,120);return value==1
+  key=f'presence:{self.scope["user"].id}';safe_cache.safe_add(key,0,120,operation='presence');value=safe_cache.safe_incr(key,operation='presence');
+  if value is None:safe_cache.safe_set(key,1,120,operation='presence');value=1
+  safe_cache.safe_touch(key,120,operation='presence');return value==1
  @database_sync_to_async
  def decrement(self):
   key=f'presence:{self.scope["user"].id}'
-  try:value=cache.decr(key)
-  except ValueError:value=0
-  if value<=0:cache.delete(key);return True
-  cache.touch(key,120);return False
+  value=safe_cache.safe_decr(key,operation='presence') or 0
+  if value<=0:safe_cache.safe_delete(key,operation='presence');return True
+  safe_cache.safe_touch(key,120,operation='presence');return False
  @database_sync_to_async
  def set_last_seen(self):
   from .models import User

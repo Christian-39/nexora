@@ -11,7 +11,7 @@ The payload is assembled from an explicit allow-list for exactly that reason.
 """
 
 from django.conf import settings
-from django.core.cache import cache
+from apps.core.cache import safe_get, safe_set
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
@@ -118,10 +118,12 @@ def build_public_config(request) -> dict:
 @api_view(["GET"])
 @permission_classes([AllowAny])
 def public_config(request):
-    cached = cache.get(CACHE_KEY)
+    # Public, low-churn branding/limits. A cache outage must not stop the
+    # login page from rendering, so fall through to the database.
+    cached = safe_get(CACHE_KEY, operation="public_config")
     if cached is None:
         cached = build_public_config(request)
-        cache.set(CACHE_KEY, cached, 60)
+        safe_set(CACHE_KEY, cached, 60, operation="public_config")
     response = Response({"success": True, "message": "Configuration retrieved", "data": cached})
     # Public, non-sensitive configuration (branding, limits, feature flags).
     # A one-minute shared cache means a multi-page app does not re-download it

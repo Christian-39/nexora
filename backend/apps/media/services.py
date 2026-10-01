@@ -8,11 +8,17 @@ that owns its message. Guessing an attachment UUID therefore yields 404.
 
 from __future__ import annotations
 
+import logging
+from dataclasses import dataclass
+
 from django.conf import settings
 from django.core.files.storage import default_storage
 from django.db import transaction
 
 from .validators import storage_key
+
+
+logger = logging.getLogger("nexora.upload")
 
 
 def store_upload(fileobj, validated, *, prefix: str = "media/originals") -> str:
@@ -21,20 +27,59 @@ def store_upload(fileobj, validated, *, prefix: str = "media/originals") -> str:
     return default_storage.save(key, fileobj)
 
 
-@transaction.atomic
-def create_attachment(*, message, fileobj, validated, poster=None):
-    """Persist an ``Attachment`` row for a freshly stored upload."""
-    from apps.conversations.models import Attachment
+@dataclass
+class StagedUpload:
+    """Objects already written to storage, not yet referenced by any row.
 
-    saved_key = store_upload(fileobj, validated)
-    thumbnail_key = ""
+    Staging is deliberately performed *outside* the database transaction: an
+    object-storage PUT can take tens of seconds for a large file, and holding
+    a pooled MySQL connection (plus its row locks) open for that long is what
+    let two concurrent uploads stall the whole web service.
+
+    The trade-off is that a failure after staging would leak the object, so
+    the caller MUST invoke :meth:`discard` on any error path. ``manage.py
+    finalize_uploads`` sweeps anything that still slips through.
+    """
+
+    storage_key: str
+    thumbnail_key: str = ""
+
+    def discard(self) -> None:
+        """Best-effort cleanup of staged objects after a failed commit."""
+        for key in (self.storage_key, self.thumbnail_key):
+            if not key:
+                continue
+            try:
+                default_storage.delete(key)
+            except Exception as exc:  # noqa: BLE001 - cleanup must never mask the original error
+                logger.warning(
+                    "could not remove staged object after a failed upload (%s: %s); "
+                    "finalize_uploads will sweep it",
+                    exc.__class__.__name__,
+                    exc,
+                )
+
+
+def stage_upload(fileobj, validated, *, poster=None) -> StagedUpload:
+    """Write the original (and optional poster) to storage. No DB work."""
+    staged = StagedUpload(storage_key=store_upload(fileobj, validated))
     if poster is not None:
         from .validators import signature_mime
 
         head = poster.read(512)
         poster.seek(0)
         if signature_mime(head) in ("image/jpeg", "image/png", "image/webp"):
-            thumbnail_key = default_storage.save(storage_key("media/posters", ".jpg"), poster)
+            staged.thumbnail_key = default_storage.save(storage_key("media/posters", ".jpg"), poster)
+    return staged
+
+
+@transaction.atomic
+def create_attachment(*, message, validated, staged: StagedUpload):
+    """Persist an ``Attachment`` row for an already-staged upload."""
+    from apps.conversations.models import Attachment
+
+    saved_key = staged.storage_key
+    thumbnail_key = staged.thumbnail_key
 
     attachment = Attachment.objects.create(
         message=message,

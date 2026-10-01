@@ -8,7 +8,7 @@ invents them.
 
 from __future__ import annotations
 
-from django.core.cache import cache
+from apps.core.cache import safe_get, safe_get_many
 from django.utils import timezone
 from rest_framework import serializers
 
@@ -47,7 +47,7 @@ def participant_payload(user, *, viewer=None, request=None, presence=None) -> di
     if presence is not None:
         online = bool(presence.get(str(user.id), False)) if presence_visible else None
     else:
-        online = bool(cache.get(f"presence:{user.id}", 0)) if presence_visible else None
+        online = bool(safe_get(f"presence:{user.id}", 0, operation="presence")) if presence_visible else None
     return {
         "id": str(user.id),
         "display_name": user.full_name,

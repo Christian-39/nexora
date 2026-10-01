@@ -28,12 +28,16 @@ def presence_online_map(user_ids) -> dict:
     25-member page into 25 sequential network round trips. Returns
     ``{user_id: bool}``.
     """
-    from django.core.cache import cache
+    from apps.core.cache import safe_get_many
 
     ids = [str(x) for x in {str(i) for i in user_ids if i}]
     if not ids:
         return {}
-    raw = cache.get_many([f"presence:{i}" for i in ids])
+    # Presence is a decoration. Before this guard a Redis hiccup raised out of
+    # the serializer and turned GET /api/members/ into a 500 ("Unable to load
+    # members. The server encountered a problem."). Everyone simply shows as
+    # offline while the cache is unavailable; the outage is logged once.
+    raw = safe_get_many([f"presence:{i}" for i in ids], operation="presence_online_map")
     return {i: bool(raw.get(f"presence:{i}", 0)) for i in ids}
 
 

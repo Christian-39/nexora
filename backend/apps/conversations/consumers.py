@@ -24,7 +24,7 @@ import time
 from channels.db import database_sync_to_async
 from channels.generic.websocket import AsyncJsonWebsocketConsumer
 from django.conf import settings
-from django.core.cache import cache
+from apps.core import cache as safe_cache
 from django.core.serializers.json import DjangoJSONEncoder
 from django.utils import timezone
 
@@ -353,7 +353,7 @@ class AppConsumer(BaseAuthenticatedConsumer):
         if not messaging_policy()["presence_enabled"]:
             return None
         peers = _presence_peers(self.user)
-        online_map = cache.get_many([f"presence:{x}" for x in peers]) if peers else {}
+        online_map = safe_cache.safe_get_many([f"presence:{x}" for x in peers], operation="ws_presence") if peers else {}
         audience_groups = [realtime.user_group(x) for x in peers]
         return peers, online_map, audience_groups
 
@@ -374,32 +374,30 @@ class AppConsumer(BaseAuthenticatedConsumer):
     @database_sync_to_async
     def _presence_increment(self) -> bool:
         key = f"presence:{self.user.id}"
-        cache.add(key, 0, timeout=settings.PRESENCE_TTL_SECONDS)
-        try:
-            value = cache.incr(key)
-        except ValueError:
-            cache.set(key, 1, timeout=settings.PRESENCE_TTL_SECONDS)
+        safe_cache.safe_add(key, 0, settings.PRESENCE_TTL_SECONDS, operation="ws_presence_incr")
+        value = safe_cache.safe_incr(key, operation="ws_presence_incr")
+        if value is None:
+            # Key absent (or the cache is down) — treat this socket as the
+            # first one; presence simply degrades while Redis is unavailable.
+            safe_cache.safe_set(key, 1, settings.PRESENCE_TTL_SECONDS, operation="ws_presence_incr")
             value = 1
-        cache.touch(key, settings.PRESENCE_TTL_SECONDS)
+        safe_cache.safe_touch(key, settings.PRESENCE_TTL_SECONDS, operation="ws_presence_incr")
         return value == 1
 
     @database_sync_to_async
     def _presence_decrement(self) -> bool:
         key = f"presence:{self.user.id}"
-        try:
-            value = cache.decr(key)
-        except ValueError:
-            value = 0
+        value = safe_cache.safe_decr(key, operation="ws_presence_decr") or 0
         if value <= 0:
-            cache.delete(key)
+            safe_cache.safe_delete(key, operation="ws_presence_decr")
             return True
-        cache.touch(key, settings.PRESENCE_TTL_SECONDS)
+        safe_cache.safe_touch(key, settings.PRESENCE_TTL_SECONDS, operation="ws_presence_decr")
         return False
 
     @database_sync_to_async
     def _presence_touch(self):
         # Refresh the TTL only — no database write per heartbeat.
-        cache.touch(f"presence:{self.user.id}", settings.PRESENCE_TTL_SECONDS)
+        safe_cache.safe_touch(f"presence:{self.user.id}", settings.PRESENCE_TTL_SECONDS, operation="ws_presence_touch")
 
 
 class ValidationError_(Exception):

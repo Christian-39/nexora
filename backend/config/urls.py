@@ -24,6 +24,7 @@ file wins.
                 /api/audit/  /api/security/  /api/security/events/
                 /api/dashboard/
     PUBLIC      /api/public/config/  /api/public/branding/{kind}/
+    OBSERVE     /api/client-errors/   (frontend error reporting → Render logs)
 """
 
 from django.urls import include, path
@@ -53,6 +54,7 @@ from apps.conversations.views import (
     search_messages,
     unread_counts,
 )
+from apps.core.client_errors import report as client_error_report
 from apps.core.health import live, ready
 from apps.groups.views import GroupViewSet
 from apps.media.multipart import complete as upload_complete
@@ -117,6 +119,9 @@ urlpatterns = [
     path("api/audit/", AuditListView.as_view()),
     path("api/security/", SecuritySettingsView.as_view()),
     path("api/security/events/", SecurityEventListView.as_view()),
+    # --- observability ----------------------------------------------------
+    # Frontend crash/API-failure reports land in the Render service log.
+    path("api/client-errors/", client_error_report),
     # --- public -----------------------------------------------------------
     path("api/public/config/", public_config),
     path("api/public/branding/<str:kind>/", public_branding),

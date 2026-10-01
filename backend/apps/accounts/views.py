@@ -29,12 +29,11 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
-from rest_framework.throttling import AnonRateThrottle
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from apps.audit.services import record
-from apps.core.throttles import CredentialThrottle
+from apps.core.throttles import CredentialThrottle, LoginThrottle
 from apps.security.services import event, ip_hash
 
 from .models import DeviceSession, User
@@ -59,10 +58,6 @@ def failure(message, code, status=400, errors=None):
     return Response(
         {"success": False, "message": message, "code": code, "errors": errors or {}}, status=status
     )
-
-
-class LoginThrottle(AnonRateThrottle):
-    scope = "login"
 
 
 def _set_cookies(response, refresh) -> None:

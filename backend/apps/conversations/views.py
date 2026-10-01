@@ -9,13 +9,15 @@ never reach a client.
 
 from __future__ import annotations
 
+import logging
+
 from django.db import models, transaction
 from django.db.models import Count, OuterRef, Prefetch, Q, Subquery
 from django.utils import timezone
 from django.utils.dateparse import parse_date
 from rest_framework import viewsets
 from rest_framework.decorators import action, api_view, parser_classes, throttle_classes
-from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.exceptions import PermissionDenied, Throttled, ValidationError
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 
@@ -34,6 +36,9 @@ from .models import (
 )
 from .serializers import ConversationSerializer, MessageCreateSerializer, MessageSerializer, ReactionSerializer
 from .services import can_access, caption_for, private_conversation, recipients_of, send_message, unread_map
+
+#: Full upload lifecycle, so a failure is traceable in the Render log.
+upload_log = logging.getLogger("nexora.upload")
 
 MESSAGE_PREFETCH = ("receipts", "reactions")
 MESSAGE_SELECT = ("sender", "reply_to", "reply_to__sender", "attachment", "conversation")
@@ -235,11 +240,25 @@ class ConversationViewSet(viewsets.ReadOnlyModelViewSet):
 # ---------------------------------------------------------------------------
 
 
+def enforce_throttle(throttle, request) -> None:
+    """Apply a hand-invoked throttle and actually reject when it trips.
+
+    ``SimpleRateThrottle.allow_request`` only *reports* the verdict; it is
+    ``APIView.check_throttles`` that turns a ``False`` into HTTP 429. These
+    two endpoints are dispatched from a shared router action rather than
+    their own APIView, so the conversion has to happen here. Previously the
+    boolean was discarded, which left message and upload rate limiting
+    completely unenforced.
+    """
+    if not throttle.allow_request(request, None):
+        raise Throttled(wait=throttle.wait())
+
+
 @transaction.atomic
 def create_text_message(request, conversation):
     serializer = MessageCreateSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
-    MessageThrottle().allow_request(request, None)
+    enforce_throttle(MessageThrottle(), request)
 
     message, created = send_message(user=request.user, conversation=conversation, **serializer.validated_data)
     message = _reload(message)
@@ -253,7 +272,7 @@ def create_media_message(request, conversation):
     """Multipart send: validate → store → message + attachment → broadcast."""
     if not can_access(request.user, conversation):
         raise PermissionDenied()
-    UploadThrottle().allow_request(request, None)
+    enforce_throttle(UploadThrottle(), request)
 
     fileobj = request.FILES.get("file")
     if fileobj is None:
@@ -290,7 +309,7 @@ def create_message_from_stored_upload(
     poster=None,
     declared_duration=None,
 ):
-    from apps.media.services import create_attachment
+    from apps.media.services import create_attachment, stage_upload
     from apps.media.validators import validate_upload
 
     client_id = str(client_id or "").strip()
@@ -317,20 +336,50 @@ def create_message_from_stored_upload(
         if reply_to is None:
             raise ValidationError({"reply_to": "The reply target must belong to this conversation."})
 
-    with transaction.atomic():
-        message, created = send_message(
-            user=request.user,
-            conversation=conversation,
-            client_id=client_id,
-            text="",
-            type=kind,
-            reply_to=reply_to,
+    # Stage the bytes to object storage BEFORE opening the transaction. A
+    # large PUT can take tens of seconds; doing it inside the transaction
+    # pinned a pooled MySQL connection and its locks for the whole transfer.
+    upload_log.info(
+        "upload staging kind=%s size=%s mime=%s conversation=%s",
+        kind,
+        validated.size,
+        validated.mime_type,
+        conversation.id,
+    )
+    staged = stage_upload(fileobj, validated, poster=poster)
+
+    try:
+        with transaction.atomic():
+            message, created = send_message(
+                user=request.user,
+                conversation=conversation,
+                client_id=client_id,
+                text="",
+                type=kind,
+                reply_to=reply_to,
+            )
+            if created:
+                create_attachment(message=message, validated=validated, staged=staged)
+                caption_for(message, caption)
+        if not created:
+            # Lost an idempotency race: the staged object is unreferenced.
+            staged.discard()
+    except Exception as exc:
+        # Never leave an object behind that no row points at, and never let
+        # the client believe a failed send succeeded.
+        staged.discard()
+        upload_log.error(
+            "upload failed after staging kind=%s size=%s conversation=%s (%s: %s)",
+            kind,
+            validated.size,
+            conversation.id,
+            exc.__class__.__name__,
+            exc,
         )
-        if created:
-            create_attachment(message=message, fileobj=fileobj, validated=validated, poster=poster)
-            caption_for(message, caption)
+        raise
 
     message = _reload(message)
+    upload_log.info("upload committed message=%s kind=%s size=%s", message.id, kind, validated.size)
     if created:
         realtime.broadcast_new_message(message, request=request, recipient_ids=recipients_of(message))
     return envelope(

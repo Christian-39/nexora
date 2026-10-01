@@ -16,7 +16,7 @@ seconds everywhere else. Nothing here ever caches private/user data.
 
 import time
 
-from django.core.cache import cache
+from apps.core.cache import safe_delete, safe_get, safe_set
 
 from .models import PlatformConfiguration
 
@@ -72,18 +72,20 @@ def messaging_policy() -> dict:
     now = time.monotonic()
     if _local["value"] is not None and now - _local["at"] < LOCAL_CACHE_TTL:
         return _local["value"]
-    cached = cache.get(CACHE_KEY)
+    # A Redis outage must degrade to "read the row", never to HTTP 500:
+    # messaging_policy() is on the login path and on every media upload.
+    cached = safe_get(CACHE_KEY, operation="messaging_policy")
     if cached is not None:
         _local["at"], _local["value"] = now, cached
         return cached
     row = configuration()
     value = {key: getattr(row, key, default) if row else default for key, default in DEFAULTS.items()}
-    cache.set(CACHE_KEY, value, CACHE_TTL)
+    safe_set(CACHE_KEY, value, CACHE_TTL, operation="messaging_policy")
     _local["at"], _local["value"] = now, value
     return value
 
 
 def invalidate() -> None:
     _local["at"], _local["value"] = 0.0, None
-    cache.delete(CACHE_KEY)
-    cache.delete("platform:public_config")
+    safe_delete(CACHE_KEY, operation="policy_invalidate")
+    safe_delete("platform:public_config", operation="policy_invalidate")

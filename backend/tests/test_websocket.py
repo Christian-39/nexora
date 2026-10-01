@@ -254,7 +254,7 @@ async def test_media_ready_is_broadcast(admin, member_a, private_thread, setting
     settings.MEDIA_ROOT = tmp_path
     from apps.conversations.realtime import broadcast_media_ready
     from apps.conversations.services import send_message
-    from apps.media.services import create_attachment
+    from apps.media.services import create_attachment, stage_upload
     from apps.media.validators import validate_upload
     from tests.conftest import jpeg_bytes
 
@@ -270,8 +270,10 @@ async def test_media_ready_is_broadcast(admin, member_a, private_thread, setting
             user=admin, conversation=private_thread, client_id=client_id(), type="IMAGE"
         )
         image = jpeg_bytes()
+        validated = validate_upload(image, kind="IMAGE", declared_name="p.jpg")
+        # Storage is staged outside the transaction, then referenced by the row.
         attachment = create_attachment(
-            message=message, fileobj=image, validated=validate_upload(image, kind="IMAGE", declared_name="p.jpg")
+            message=message, validated=validated, staged=stage_upload(image, validated)
         )
         attachment.processing_state = "READY"
         attachment.save(update_fields=["processing_state"])

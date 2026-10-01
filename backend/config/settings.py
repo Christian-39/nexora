@@ -68,13 +68,18 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    # RequestIDMiddleware is FIRST so that every log record produced while the
+    # request is handled — including ones emitted by middleware below it —
+    # carries the correlation id that is echoed in X-Request-ID.
+    "apps.core.middleware.RequestIDMiddleware",
+    "apps.core.middleware.RequestLogMiddleware",
+    "apps.core.middleware.ExceptionLogMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
-    "apps.core.middleware.RequestIDMiddleware",
     "apps.core.security_headers.SecurityHeadersMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
@@ -348,9 +353,13 @@ REST_FRAMEWORK = {
     "DEFAULT_PAGINATION_CLASS": "apps.core.pagination.StandardCursorPagination",
     "PAGE_SIZE": config("API_PAGE_SIZE", default=30, cast=int),
     "EXCEPTION_HANDLER": "apps.core.exceptions.api_exception_handler",
+    # The resilient variants fail OPEN (and log) when the Redis-backed counter
+    # store is unavailable. The stock DRF classes raised straight out of
+    # APIView.initial(), which turned a Redis blip into HTTP 500 on every
+    # endpoint — including /api/auth/csrf/ and /api/auth/login/.
     "DEFAULT_THROTTLE_CLASSES": [
-        "rest_framework.throttling.AnonRateThrottle",
-        "rest_framework.throttling.UserRateThrottle",
+        "apps.core.throttles.SafeAnonRateThrottle",
+        "apps.core.throttles.SafeUserRateThrottle",
     ],
     "DEFAULT_THROTTLE_RATES": {
         "anon": config("THROTTLE_ANON", default="60/min"),
@@ -361,6 +370,9 @@ REST_FRAMEWORK = {
         "uploads": config("THROTTLE_UPLOADS", default="60/hour"),
         "push": config("THROTTLE_PUSH", default="30/hour"),
         "credentials": config("THROTTLE_CREDENTIALS", default="10/hour"),
+        # Frontend crash reports (apps/core/client_errors.py). Deliberately
+        # tight: an anonymous visitor must not be able to flood Render logs.
+        "client_errors": config("THROTTLE_CLIENT_ERRORS", default="30/hour"),
     },
     "UNAUTHENTICATED_USER": "django.contrib.auth.models.AnonymousUser",
 }
@@ -584,18 +596,103 @@ PERMISSIONS_POLICY = config(
 CROSS_ORIGIN_RESOURCE_POLICY = config("CROSS_ORIGIN_RESOURCE_POLICY", default="cross-origin")
 
 # ---------------------------------------------------------------------------
-# Logging — never emits credentials, PINs or tokens.
+# Logging — centralized production observability.
+#
+# Everything goes to stdout/stderr, unbuffered, because that is the ONLY
+# transport Render ingests (Dashboard → nexora-backend → Logs). No file
+# handlers: a file inside an ephemeral Render instance is unreadable and is
+# lost on every deploy.
+#
+# Every record carries the request correlation id, so a failed browser request
+# (which receives the same value in the X-Request-ID response header, and
+# inside the JSON error body as "request_id") can be found by pasting that id
+# into the Render log search.
+#
+# Secrets are never logged: apps/core/observability.scrub() redacts
+# PIN/password/token/cookie/authorization/credential-shaped keys, and
+# sanitize() neutralises log injection in user-controlled values.
 # ---------------------------------------------------------------------------
+
+# Level for our own `nexora.*` loggers. Overridable per environment via the
+# LOG_LEVEL env var on Render (e.g. temporarily set DEBUG while diagnosing an
+# incident, then put it back to INFO).
+LOG_LEVEL = config("LOG_LEVEL", default="INFO").upper()
+# Third-party libraries stay at INFO even when DEBUG=True, otherwise the
+# connection pool and S3 client drown out the records we actually need.
+ROOT_LOG_LEVEL = config("ROOT_LOG_LEVEL", default="INFO").upper()
+#: Requests slower than this are reported at WARNING by RequestLogMiddleware.
+SLOW_REQUEST_MS = config("SLOW_REQUEST_MS", default=2000, cast=int)
+#: Database queries slower than this are reported by the slow-query logger.
+SLOW_QUERY_MS = config("SLOW_QUERY_MS", default=500, cast=int)
 
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
-    "formatters": {"standard": {"format": "%(asctime)s %(levelname)s %(name)s %(message)s"}},
-    "handlers": {"console": {"class": "logging.StreamHandler", "formatter": "standard"}},
-    "root": {"handlers": ["console"], "level": config("LOG_LEVEL", default="INFO")},
+    "filters": {
+        "request_context": {"()": "apps.core.observability.RequestContextFilter"},
+        # Keeps stdout and stderr disjoint so nothing is logged twice.
+        "below_error": {"()": "apps.core.observability.BelowErrorFilter"},
+    },
+    "formatters": {
+        "production": {
+            "()": "apps.core.observability.ProductionFormatter",
+            "format": (
+                "%(asctime)s %(levelname)-8s %(name)s "
+                "[req=%(request_id)s user=%(user_id)s op=%(operation)s] %(message)s"
+            ),
+        },
+        "simple": {"format": "%(asctime)s %(levelname)s %(name)s %(message)s"},
+    },
+    "handlers": {
+        # stdout for ordinary records…
+        "console": {
+            "class": "logging.StreamHandler",
+            "stream": "ext://sys.stdout",
+            "formatter": "production",
+            "filters": ["request_context", "below_error"],
+            "level": "DEBUG",
+        },
+        # …stderr for ERROR and above, so Render highlights them.
+        "console_error": {
+            "class": "logging.StreamHandler",
+            "stream": "ext://sys.stderr",
+            "formatter": "production",
+            "filters": ["request_context"],
+            "level": "ERROR",
+        },
+    },
+    "root": {"handlers": ["console", "console_error"], "level": ROOT_LOG_LEVEL},
     "loggers": {
-        "django.request": {"handlers": ["console"], "level": "ERROR", "propagate": False},
-        "nexora": {"handlers": ["console"], "level": config("LOG_LEVEL", default="INFO"), "propagate": False},
+        # ---- application ------------------------------------------------
+        # One tree: nexora.api, nexora.auth, nexora.request, nexora.exception,
+        # nexora.cache, nexora.throttle, nexora.media, nexora.upload,
+        # nexora.realtime, nexora.client, nexora.db, nexora.health.
+        "nexora": {"handlers": ["console", "console_error"], "level": LOG_LEVEL, "propagate": False},
+        # ---- Django -------------------------------------------------------
+        # django.request still logs 4xx/5xx; our handlers mark exceptions as
+        # already-reported so the traceback is not duplicated.
+        "django.request": {"handlers": ["console", "console_error"], "level": "ERROR", "propagate": False},
+        "django.server": {"handlers": ["console", "console_error"], "level": "WARNING", "propagate": False},
+        "django.security": {"handlers": ["console", "console_error"], "level": "WARNING", "propagate": False},
+        # NEVER DEBUG in production: django.db.backends at DEBUG logs every SQL
+        # statement *with its parameters*, which would leak message contents
+        # and hashed credentials into Render. Errors only.
+        "django.db.backends": {"handlers": ["console", "console_error"], "level": "ERROR", "propagate": False},
+        # ---- infrastructure ------------------------------------------------
+        "channels": {"handlers": ["console", "console_error"], "level": "WARNING", "propagate": False},
+        "daphne": {"handlers": ["console", "console_error"], "level": "WARNING", "propagate": False},
+        "redis": {"handlers": ["console", "console_error"], "level": "WARNING", "propagate": False},
+        "botocore": {"handlers": ["console", "console_error"], "level": "WARNING", "propagate": False},
+        "boto3": {"handlers": ["console", "console_error"], "level": "WARNING", "propagate": False},
+        "s3transfer": {"handlers": ["console", "console_error"], "level": "WARNING", "propagate": False},
+        "urllib3": {"handlers": ["console", "console_error"], "level": "WARNING", "propagate": False},
+        "PIL": {"handlers": ["console", "console_error"], "level": "WARNING", "propagate": False},
+        # Gunicorn writes its own access/error log to stdout/stderr (see
+        # gunicorn.conf.py); keep its records flowing through our formatter.
+        "gunicorn.error": {"handlers": ["console", "console_error"], "level": "INFO", "propagate": False},
+        "gunicorn.access": {"handlers": ["console", "console_error"], "level": "WARNING", "propagate": False},
+        "uvicorn.error": {"handlers": ["console", "console_error"], "level": "INFO", "propagate": False},
+        "uvicorn.access": {"handlers": ["console", "console_error"], "level": "WARNING", "propagate": False},
     },
 }
 
