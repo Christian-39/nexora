@@ -494,7 +494,7 @@
 
 /* ======================= Dropdown menu ======================= */
 .menu {
-  position: absolute;
+  position: fixed;
   min-width: 190px;
   max-width: calc(100vw - var(--sp-4) * 2);
   background: var(--surface-elevated);

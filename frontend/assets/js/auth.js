@@ -273,9 +273,12 @@ export async function login(identifier, pin) {
 
 /**
  * Change the six-digit credential.
- * @param {{currentPin?:string,newPin:string,confirmPin:string}} input
+ * @param {{currentPin?:string,newPin?:string,confirmPin?:string,current_pin?:string,new_pin?:string,confirm_pin?:string}} input
  */
-export async function changePin({ currentPin, newPin, confirmPin }) {
+export async function changePin(input = {}) {
+  const currentPin = input.currentPin ?? input.current_pin ?? null;
+  const newPin = input.newPin ?? input.new_pin ?? '';
+  const confirmPin = input.confirmPin ?? input.confirm_pin ?? '';
   const body = { new_pin: String(newPin), confirm_pin: String(confirmPin) };
   if (currentPin) body.current_pin = String(currentPin);
   const result = await api.auth.changePin(body);
@@ -284,7 +287,7 @@ export async function changePin({ currentPin, newPin, confirmPin }) {
     const token = result?.access || result?.access_token;
     if (token) tokenStore.set(token);
   }
-  const user = result?.user || (await api.me.get());
+  const user = result?.user || result?.me || (result?.id ? result : null) || (await api.me.get());
   setUser(user);
   authEvents.emit('pin-changed');
   return currentUser;
@@ -360,18 +363,39 @@ export function validatePin(value, label = 'PIN') {
   return null;
 }
 
+const WEAK_PINS = new Set([
+  '000000',
+  '111111',
+  '123456',
+  '654321',
+  '999999',
+  '112233',
+  '121212',
+  '123123',
+  '000123',
+]);
+
 export function validateNewPin(newPin, confirmPin, currentPin = null) {
   const base = validatePin(newPin, 'new PIN');
   if (base) return { field: 'new', message: base };
   if (/^(\d)\1{5}$/.test(newPin)) {
     return { field: 'new', message: 'Choose a PIN that is not a single repeated digit.' };
   }
-  if (/^(012345|123456|234567|345678|456789|567890|987654|654321)$/.test(newPin)) {
+  if ('01234567890'.includes(newPin) || '09876543210'.includes(newPin)) {
     return { field: 'new', message: 'Choose a PIN that is not a simple sequence.' };
+  }
+  if (WEAK_PINS.has(newPin)) {
+    return { field: 'new', message: 'Choose a less predictable PIN.' };
   }
   if (currentPin && newPin === currentPin) {
     return { field: 'new', message: 'Your new PIN must be different from your current PIN.' };
   }
+  const phoneDigits = String(currentUser?.phone || '').replace(/\D+/g, '');
+  if (phoneDigits.length >= 6 && newPin === phoneDigits.slice(0, 6)) {
+    return { field: 'new', message: 'Your new PIN cannot match your initial phone-derived PIN.' };
+  }
+  const confirmBase = validatePin(confirmPin, 'confirmation PIN');
+  if (confirmBase) return { field: 'confirm', message: confirmBase };
   if (newPin !== confirmPin) {
     return { field: 'confirm', message: 'The two PINs do not match.' };
   }

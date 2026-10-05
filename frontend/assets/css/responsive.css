@@ -211,6 +211,12 @@
   .bubble { max-width: 88%; }
   .media-frame { width: min(230px, 72vw); }
   .preview-tray__thumb { width: 60px; height: 60px; }
+  .thread__jump {
+    width: 32px;
+    height: 32px;
+    right: var(--sp-2);
+    bottom: calc(var(--composer-min-h) + var(--sp-3) + var(--safe-bottom));
+  }
 }
 
 /* ============================================================

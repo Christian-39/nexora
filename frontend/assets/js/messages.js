@@ -406,10 +406,13 @@ function ingestPage(store, page, { replace = false, prepend = false } = {}) {
 /* ---------------- Mutations ---------------- */
 
 /** Create an optimistic local message shown immediately as SENDING. */
-export function createOptimistic(conversationId, { kind = 'text', text = '', caption = '', media = null, replyTo = null, sender = null }) {
+export function createOptimistic(
+  conversationId,
+  { clientId = null, kind = 'text', text = '', caption = '', media = null, replyTo = null, sender = null } = {}
+) {
   const message = {
     id: null,
-    clientId: uid('msg'),
+    clientId: clientId || uid('msg'),
     conversationId: String(conversationId),
     kind,
     text,
@@ -479,6 +482,7 @@ export function markLocalUnconfirmed(conversationId, clientId) {
   if (!message) return null;
   message.status = STATUS.UNCONFIRMED;
   message.error = null;
+  message.progress = null;
   messageEvents.emit('updated', store.id, message);
   return message;
 }

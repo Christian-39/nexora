@@ -139,12 +139,28 @@ export function buildPinInput({ label = 'PIN', autocomplete = 'off', required = 
 
 /**
  * A complete credential-change field set.
- * @param {object} options { includeCurrent }
+ * @param {object} options { includeCurrent, onSubmit }
  */
-export function buildPinFields({ includeCurrent = true } = {}) {
-  const current = includeCurrent ? buildPinInput({ label: 'Current PIN', autocomplete: 'current-password' }) : null;
-  const next = buildPinInput({ label: 'New PIN', autocomplete: 'new-password' });
-  const confirm = buildPinInput({ label: 'Confirm new PIN', autocomplete: 'new-password' });
+export function buildPinFields({ includeCurrent = true, onSubmit = null } = {}) {
+  let next;
+  let confirm;
+  const current = includeCurrent
+    ? buildPinInput({
+        label: 'Current PIN',
+        autocomplete: 'current-password',
+        onComplete: () => next?.focus(),
+      })
+    : null;
+  next = buildPinInput({
+    label: 'New PIN',
+    autocomplete: 'new-password',
+    onComplete: () => confirm?.focus(),
+  });
+  confirm = buildPinInput({
+    label: 'Confirm new PIN',
+    autocomplete: 'new-password',
+    onComplete: () => onSubmit?.(),
+  });
 
   const root = el('div', { class: 'stack' }, [
     current
@@ -185,6 +201,11 @@ export function buildPinFields({ includeCurrent = true } = {}) {
       confirm.setError('');
     },
     reset() {
+      current?.reset();
+      next.reset();
+      confirm.reset();
+    },
+    clear() {
       current?.reset();
       next.reset();
       confirm.reset();

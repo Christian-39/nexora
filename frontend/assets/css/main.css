@@ -155,6 +155,7 @@ body.app-body {
   --app-header-h: 52px;
   display: flex;
   align-items: center;
+  flex-wrap: nowrap;
   gap: var(--sp-2);
   flex: none;
   min-height: var(--app-header-h);

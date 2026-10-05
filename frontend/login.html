@@ -113,10 +113,13 @@
       validatePin,
     } from './assets/js/auth.js';
     import { ApiError } from './assets/js/api.js';
+    import { installGlobalErrorHandlers } from './assets/js/errors.js';
     import { buildPinInput, buildPinFields } from './assets/js/pin.js';
     import { announce, setBusy, setFieldError, showAlert, hideAlert } from './assets/js/ui.js';
     import { registerServiceWorker } from './assets/js/push.js';
     import { $, el } from './assets/js/utils.js';
+
+    installGlobalErrorHandlers();
 
     // Installation/update work is independent of authentication and must start
     // on the login screen so the next launch has a complete local shell.
@@ -289,10 +292,13 @@
         announce('Your PIN has been updated.');
         window.location.replace(landingPage());
       } catch (error) {
+        changeFields.setDisabled(false);
         changeFields.reset();
         if (error instanceof ApiError && error.isValidation) {
           const fieldError = error.firstFieldError();
           if (fieldError?.field === 'new_pin') changeFields.setError('new', fieldError.message);
+          else if (fieldError?.field === 'confirm_pin') changeFields.setError('confirm', fieldError.message);
+          else if (fieldError?.field === 'current_pin') changeFields.setError('new', fieldError.message);
           else showAlert(alertEl, error.message, 'error');
         } else if (error instanceof ApiError && error.isRateLimited) {
           showAlert(alertEl, 'Too many attempts. Please wait before trying again.', 'error');

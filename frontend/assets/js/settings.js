@@ -379,28 +379,36 @@ export class SettingsController {
 
     submit.addEventListener('click', async () => {
       hideAlert(alertEl);
+      fields.clearErrors();
       const values = fields.values();
+      if (!values.currentPin || values.currentPin.length !== 6) {
+        fields.setError('current', 'Enter your current six-digit PIN.');
+        return;
+      }
       const problem = validateNewPin(values.newPin, values.confirmPin, values.currentPin);
       if (problem) {
         fields.setError(problem.field, problem.message);
         return;
       }
-      if (!values.currentPin || values.currentPin.length !== 6) {
-        fields.setError('current', 'Enter your current six-digit PIN.');
-        return;
-      }
 
       setBusy(submit, true);
+      fields.setDisabled(true);
       try {
-        await changePin(values);
+        await changePin({
+          currentPin: values.currentPin,
+          newPin: values.newPin,
+          confirmPin: values.confirmPin,
+        });
         fields.reset();
         showAlert(alertEl, 'Your PIN has been updated.', 'success');
         toast('PIN updated.', { type: 'success' });
       } catch (error) {
+        fields.setDisabled(false);
         if (error instanceof ApiError && error.isValidation) {
           const fieldError = error.firstFieldError();
           if (fieldError?.field === 'current_pin') fields.setError('current', fieldError.message);
           else if (fieldError?.field === 'new_pin') fields.setError('new', fieldError.message);
+          else if (fieldError?.field === 'confirm_pin') fields.setError('confirm', fieldError.message);
           else showAlert(alertEl, error.message, 'error');
         } else if (error instanceof ApiError && error.isRateLimited) {
           showAlert(alertEl, 'Too many attempts. Please wait before trying again.', 'error');
@@ -409,6 +417,7 @@ export class SettingsController {
         }
       } finally {
         setBusy(submit, false);
+        fields.setDisabled(false);
       }
     });
 

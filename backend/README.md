@@ -81,7 +81,9 @@ python manage.py finalize_uploads
 - `/api/notifications/`; `/api/notifications/read/`; `/api/push/`
 - `GET/PATCH /api/settings/`; `POST /api/settings/branding/`; `GET /api/audit/` (administrator only)
 - `GET /api/public/config/`; `GET /api/public/branding/logo/`; `/favicon/`
-- WebSockets: `/ws/conversations/{uuid}/` and `/ws/presence/`, authenticated by an active access-cookie device session.
+- `POST /api/client-errors/` for rate-limited, secret-redacted frontend error telemetry
+- `GET /health/live/` and `GET /health/ready/` checking `database`, `cache`, `channels`, and `storage`
+- WebSockets: `/ws/app/` (multiplexed), `/ws/conversations/{uuid}/`, and `/ws/presence/`, authenticated by an active access-cookie device session.
 
 Responses use `{success,message,data}` or `{success,message,code,errors}`. Access cookies are short lived. A frontend should call refresh with credentials included and keep tokens out of JavaScript storage.
 

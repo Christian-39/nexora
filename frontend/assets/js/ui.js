@@ -587,8 +587,13 @@ export function loadingRow(label = 'Loading…') {
    ============================================================ */
 
 let activeMenu = null;
+let activeMenuDismiss = null;
 
 export function closeMenu() {
+  if (activeMenuDismiss) {
+    document.removeEventListener('mousedown', activeMenuDismiss, true);
+    activeMenuDismiss = null;
+  }
   activeMenu?.remove();
   activeMenu = null;
 }
@@ -632,15 +637,17 @@ export function openMenu(anchor, items) {
   left = Math.max(8, left);
   let top = rect.bottom + 4;
   if (top + mh > window.innerHeight - 8) top = Math.max(8, rect.top - mh - 4);
-  menu.style.left = `${left + window.scrollX}px`;
-  menu.style.top = `${top + window.scrollY}px`;
+  menu.style.left = `${left}px`;
+  menu.style.top = `${top}px`;
 
   const dismiss = (event) => {
     if (menu.contains(event.target) || anchor.contains(event.target)) return;
     closeMenu();
-    document.removeEventListener('mousedown', dismiss, true);
   };
-  setTimeout(() => document.addEventListener('mousedown', dismiss, true), 0);
+  activeMenuDismiss = dismiss;
+  setTimeout(() => {
+    if (activeMenu === menu) document.addEventListener('mousedown', dismiss, true);
+  }, 0);
   menu.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') {
       closeMenu();

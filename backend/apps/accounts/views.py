@@ -227,22 +227,53 @@ def logout(request):
 @api_view(["POST"])
 @throttle_classes([CredentialThrottle])
 def change_pin(request):
-    serializer = PinSerializer(data=request.data)
+    serializer = PinSerializer(data=request.data, context={"request": request, "user": request.user})
     serializer.is_valid(raise_exception=True)
-    if not request.user.check_password(serializer.validated_data["current_pin"]):
+    current_pin = serializer.validated_data.get("current_pin") or ""
+    if (not request.user.must_change_pin or current_pin) and not request.user.check_password(current_pin):
         event("CREDENTIAL_CHANGE_FAILED", request, request.user)
         return failure("Current PIN is incorrect.", "INVALID_CREDENTIAL", 400, {"current_pin": ["Incorrect PIN."]})
+
+    old_refresh = request.COOKIES.get(settings.REFRESH_COOKIE)
+    if old_refresh:
+        try:
+            RefreshToken(old_refresh).blacklist()
+        except Exception:  # noqa: BLE001
+            pass
 
     with transaction.atomic():
         request.user.set_password(serializer.validated_data["new_pin"])
         request.user.credential_state = User.Credential.CHANGED
-        request.user.save(update_fields=["password", "credential_state", "updated_at"])
-        # Every other device must re-authenticate with the new PIN.
+        request.user.failed_login_count = 0
+        request.user.locked_until = None
+        request.user.save(
+            update_fields=[
+                "password",
+                "credential_state",
+                "failed_login_count",
+                "locked_until",
+                "updated_at",
+            ]
+        )
+        # Every prior session (including other devices and the pre-change
+        # session on this device) is revoked; a fresh session is issued below
+        # for the current caller so first-login PIN setup proceeds straight to
+        # the workspace without forcing a second login.
         request.user.device_sessions.filter(revoked_at__isnull=True).update(revoked_at=timezone.now())
+        refresh = RefreshToken.for_user(request.user)
+        session = DeviceSession.objects.create(
+            user=request.user,
+            jti=str(refresh["jti"]),
+            device_label=str(request.data.get("device_label", ""))[:120],
+            user_agent=str(request.headers.get("User-Agent", ""))[:200],
+            ip_hash=ip_hash(request),
+            expires_at=timezone.datetime.fromtimestamp(refresh["exp"], tz=datetime.timezone.utc),
+        )
+        refresh["sid"] = str(session.id)
 
     event("CREDENTIAL_CHANGE", request, request.user)
-    response = envelope("PIN changed; sign in again.")
-    _clear_cookies(response)
+    response = envelope("PIN updated.", ProfileSerializer(request.user, context={"request": request}).data)
+    _set_cookies(response, refresh)
     return response
 
 
@@ -404,9 +435,10 @@ class MemberViewSet(viewsets.ModelViewSet):
         if self.request.user.role == User.Role.ADMIN:
             queryset = User.objects.filter(role=User.Role.MEMBER)
             status = str(self.request.query_params.get("status", "")).lower()
-            if status == "active":
+            is_active_param = str(self.request.query_params.get("is_active", "")).lower()
+            if status == "active" or is_active_param in ("true", "1"):
                 queryset = queryset.filter(is_active=True)
-            elif status == "inactive":
+            elif status == "inactive" or is_active_param in ("false", "0"):
                 queryset = queryset.filter(is_active=False)
             if str(self.request.query_params.get("selectable", "")).lower() in ("1", "true"):
                 queryset = queryset.filter(is_active=True)
@@ -468,13 +500,26 @@ class MemberViewSet(viewsets.ModelViewSet):
         with transaction.atomic():
             member.set_password(initial_pin(member.phone))
             member.credential_state = User.Credential.RESET_REQUIRED
-            member.save(update_fields=["password", "credential_state", "updated_at"])
+            member.failed_login_count = 0
+            member.locked_until = None
+            member.save(
+                update_fields=[
+                    "password",
+                    "credential_state",
+                    "failed_login_count",
+                    "locked_until",
+                    "updated_at",
+                ]
+            )
             member.device_sessions.filter(revoked_at__isnull=True).update(revoked_at=timezone.now())
             record(request.user, "CREDENTIAL_RESET", member, request)
         event("CREDENTIAL_RESET", request, member)
         # The new PIN is never returned or logged: it is the documented
         # first-six-digits-of-the-phone-number rule.
-        return envelope("Credential reset to the documented initial-PIN rule.")
+        return envelope(
+            "Credential reset to the documented initial-PIN rule.",
+            UserSerializer(member, context={"request": request}).data,
+        )
 
     @action(detail=True, methods=["get"])
     def conversation(self, request, pk=None):

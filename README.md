@@ -130,13 +130,32 @@ the scheme (`http→ws`, `https→wss`), so TLS can never be mismatched.
 port 5500, mirroring the production reverse-proxy layout. It is a convenience
 for demos and same-origin testing; nothing in the application depends on it.
 
-### 3.4 First sign-in
+### 3.4 First sign-in and administrator PIN reset
 
 The administrator creates members; members never self-register. A new member's
 initial PIN is **the first six digits of their normalized phone number**
 (`+2348012345678` → `234801`). It is never returned by the API and never
-logged. The member must change it before any other endpoint will respond — the
-API returns `403 PERMISSION_DENIED` until they do.
+logged.
+
+* **First-login / forced PIN change (`must_change_pin = true`)** — when a member
+  signs in with their initial PIN (or after an administrator PIN reset), they
+  are routed to the forced PIN setup screen (`POST /api/auth/change-pin/` with
+  `{ new_pin, confirm_pin }`). `current_pin` is not required when
+  `must_change_pin` is `true`, and `confirm_pin` must match `new_pin`. Weak
+  PINs (repeated digits such as `000000`/`111111` or sequential digits such as
+  `123456`/`654321`), reusing the current PIN, or reusing the phone-derived
+  initial PIN are rejected both client-side and server-side. Upon updating the
+  PIN, `credential_state` becomes `CHANGED`, all prior sessions are revoked, and
+  a fresh rotated device session + HttpOnly cookies + profile payload are
+  returned immediately so the member proceeds straight to the chat workspace.
+* **Voluntary PIN change (`must_change_pin = false`)** — requires `current_pin`,
+  `new_pin`, and `confirm_pin`.
+* **Administrator PIN reset (`POST /api/members/<id>/reset-pin/`)** — only an
+  active administrator can reset a member's PIN. The reset sets the member's
+  PIN back to the first six digits of their normalized phone number, sets
+  `credential_state = RESET_REQUIRED` (`must_change_pin = true`), clears failed
+  login counters and temporary lockouts, revokes all active device sessions for
+  that member, and records `CREDENTIAL_RESET` audit and security events.
 
 ---
 
@@ -212,6 +231,17 @@ only for users who happened to land on the same worker.
 * `redis://` or `rediss://` (TLS). A value without a scheme is rejected at boot.
 * If a managed provider's TLS certificate cannot be verified by the host trust
   store, set `REDIS_SSL_CERT_REQS=none` — the transport stays encrypted.
+* Connection and blocking-pop resilience are configurable via environment
+  variables (`REDIS_SOCKET_CONNECT_TIMEOUT=5`, `REDIS_SOCKET_TIMEOUT=5`,
+  `REDIS_CHANNEL_SOCKET_TIMEOUT=15`, `REDIS_HEALTH_CHECK_INTERVAL=30`,
+  `REDIS_RETRY_ON_TIMEOUT=True`, `REDIS_CHANNEL_CAPACITY=1500`,
+  `REDIS_CHANNEL_EXPIRY=60`). The channel socket timeout is automatically kept
+  above `channels_redis`'s 5-second `BZPOPMIN` blocking window so idle WebSocket
+  consumers never crash with `redis.exceptions.TimeoutError`.
+* `/health/live/` reports process liveness; `/health/ready/` independently
+  verifies MySQL (`database`), Redis cache (`cache`), Redis Channels
+  (`channels`), and private object storage (`storage`) without exposing
+  connection URLs or secrets.
 * The in-memory layer remains available for local development only.
 
 ### 4.3 Background workers and FFmpeg
@@ -365,16 +395,17 @@ the original, and `media.ready` tells connected clients when they exist.
 
 ```bash
 cd backend
-DJANGO_ENV=test python -m pytest        # in-memory SQLite, no services needed
+pytest                                  # 174 backend tests
 
-cd ../frontend
-node --test tests/                      # no npm install, no test framework
+cd ..
+node --test frontend/tests/*.mjs        # 66 frontend tests (Node built-in runner)
 ```
 
-132 backend tests covering authentication and lockout, CSRF, authorization and IDOR,
-messaging idempotency/ordering/receipts, media validation and streaming,
-WebSocket authorization and every emitted event, push subscription and
-aggregation, database-driven settings, and — in
+174 backend tests covering authentication, first-login and voluntary PIN change,
+administrator PIN reset, lockout, CSRF, authorization and IDOR, messaging
+idempotency/ordering/receipts, media validation and streaming, WebSocket
+authorization, Redis channel/cache resilience, health checks, redacted error
+logging, push subscription and aggregation, database-driven settings, and — in
 `tests/test_frontend_contract.py` — the frontend↔backend contract itself:
 every endpoint `api.js` calls is asserted against the real URL map, every
 socket event the UI listens for is asserted against the backend source, and
@@ -388,14 +419,14 @@ cache actually selected, CORS restricted to the Vercel origin, CSRF trusted
 origins, cross-site cookies (`SameSite=None; Secure`), MySQL and private
 storage required, the ASGI entry point, and the absence of Docker artefacts.
 
-The 21 frontend tests (`frontend/tests/`, Node's built-in runner) cover API and
-WebSocket URL resolution for local *and* production, and the whole reconnection
-lifecycle: open, bounded backoff, one-shot session refresh, authentication
-failure, an unreachable backend, logout, sign-in again, offline/online and
-single-socket/single-timer invariants.
-
-`DJANGO_ENV=test` selects in-memory SQLite and disables global throttling;
-`backend/conftest.py` sets it automatically.
+The 66 frontend tests (`frontend/tests/`, Node's built-in runner) cover API and
+WebSocket URL resolution for local *and* production, PIN validation and
+first-login/voluntary payload shaping, centralized client error redaction,
+optimistic media/voice upload indexing and retry, mobile PWA chat layout and
+swipe-to-reply invariants across 320px–430px viewports, and the whole
+reconnection lifecycle: open, bounded backoff, one-shot session refresh,
+authentication failure, an unreachable backend, logout, sign-in again,
+offline/online and single-socket/single-timer invariants.
 
 ---
 

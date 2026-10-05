@@ -1,0 +1,25 @@
+# Python / Django
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+backend/media/
+backend/staticfiles/
+db.sqlite3
+
+# Environment & backup files (never commit secrets)
+.env
+.env.*
+!.env.example
+!backend/.env.example
+!frontend/.env.example
+*.bak
+*.orig
+*.swp
+
+# Node / OS
+node_modules/
+.DS_Store

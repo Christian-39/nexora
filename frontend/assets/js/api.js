@@ -766,6 +766,7 @@ export const api = {
     setActive: (id, isActive, options) =>
       post(`/api/members/${encodeURIComponent(id)}/${isActive ? 'activate' : 'deactivate'}/`, {}, options),
     resetCredential: (id, options) => post(`/api/members/${encodeURIComponent(id)}/reset-pin/`, {}, options),
+    resetPin: (id, options) => post(`/api/members/${encodeURIComponent(id)}/reset-pin/`, {}, options),
     activity: (id, params, options) => request(`/api/members/${encodeURIComponent(id)}/activity/`, { ...options, method: 'GET', params, raw: true }),
     conversation: (id, options) => get(`/api/members/${encodeURIComponent(id)}/conversation/`, null, options),
     selectable: (params, options) => request('/api/members/', { ...options, method: 'GET', params: { ...params, selectable: true }, raw: true }),
@@ -862,14 +863,28 @@ export const api = {
 
   /* ---- search ---- */
   search: (params, options) => get('/api/search/', params, options),
+
+  /* ---- observability (client error sink) ---- */
+  clientErrors: {
+    report: (payload, options) =>
+      post('/api/client-errors/', payload, {
+        timeout: 5000,
+        ...options,
+        auth: false,
+        allowRefresh: false,
+        retries: 0,
+      }),
+  },
 };
 
 /* ============================================================
    Connectivity signalling
    ============================================================ */
 
-window.addEventListener('online', () => apiEvents.emit('online'));
-window.addEventListener('offline', () => apiEvents.emit('offline'));
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+  window.addEventListener('online', () => apiEvents.emit('online'));
+  window.addEventListener('offline', () => apiEvents.emit('offline'));
+}
 
 export const apiConfig = {
   origin: API_ORIGIN,

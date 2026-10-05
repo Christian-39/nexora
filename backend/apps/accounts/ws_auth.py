@@ -18,11 +18,18 @@ Scope keys set here:
     ``auth_error``  None | 'NO_CREDENTIAL' | 'INVALID_CREDENTIAL' | 'SESSION_REVOKED'
 """
 
+import logging
+
 from channels.db import database_sync_to_async
 from django.conf import settings
 from django.contrib.auth.models import AnonymousUser
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import DatabaseError
 from django.utils import timezone
+from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import AccessToken
+
+logger = logging.getLogger("nexora.realtime")
 
 
 def _cookies_from(scope) -> dict[str, str]:
@@ -45,18 +52,44 @@ def auth_for(token: str):
         return AnonymousUser(), None, "NO_CREDENTIAL"
     try:
         parsed = AccessToken(token)
-        user = User.objects.get(id=parsed["user_id"], is_active=True)
-    except Exception:
+        user_id = parsed["user_id"]
+    except (TokenError, KeyError, TypeError, ValueError):
         return AnonymousUser(), None, "INVALID_CREDENTIAL"
 
-    # The device session must still exist and not have been revoked: signing
-    # out on one device must kill that device's sockets everywhere.
-    session_alive = DeviceSession.objects.filter(
-        id=parsed.get("sid"),
-        user=user,
-        revoked_at__isnull=True,
-        expires_at__gt=timezone.now(),
-    ).exists()
+    try:
+        user = User.objects.get(id=user_id, is_active=True)
+        # The device session must still exist and not have been revoked: signing
+        # out on one device must kill that device's sockets everywhere.
+        session_alive = DeviceSession.objects.filter(
+            id=parsed.get("sid"),
+            user=user,
+            revoked_at__isnull=True,
+            expires_at__gt=timezone.now(),
+        ).exists()
+    except (User.DoesNotExist, DjangoValidationError, ValueError, TypeError):
+        return AnonymousUser(), None, "INVALID_CREDENTIAL"
+    except DatabaseError as exc:
+        logger.error(
+            "ws.auth database error (%s)",
+            exc.__class__.__name__,
+            extra={
+                "event": "ws.auth.db_error",
+                "error_type": exc.__class__.__name__,
+            },
+            exc_info=exc,
+        )
+        return AnonymousUser(), None, "SERVICE_UNAVAILABLE"
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "ws.auth unexpected error (%s)",
+            exc.__class__.__name__,
+            extra={
+                "event": "ws.auth.error",
+                "error_type": exc.__class__.__name__,
+            },
+        )
+        return AnonymousUser(), None, "SERVICE_UNAVAILABLE"
+
     if not session_alive:
         return AnonymousUser(), None, "SESSION_REVOKED"
 

@@ -747,11 +747,15 @@ export class ChatController {
       bubble.append(this.renderReactions(message));
     }
 
-    bubble.append(this.bubbleFooter(message));
+    bubble.append(this.bubbleFooter(message, conv));
 
-    if (message.status === STATUS.FAILED) {
+    if ((message.status === STATUS.FAILED || message.status === STATUS.UNCONFIRMED) && message.outgoing) {
       const retry = el('div', { class: 'bubble__retry' });
-      retry.append(icon('alert-circle', { size: 14 }), el('span', { text: message.error || 'Not sent.' }));
+      const labelText =
+        message.status === STATUS.UNCONFIRMED
+          ? message.error || 'Delivery unconfirmed. Tap Retry to send again.'
+          : message.error || 'Not sent.';
+      retry.append(icon('alert-circle', { size: 14 }), el('span', { text: labelText }));
       const btn = el('button', { type: 'button', class: 'btn btn--sm btn--ghost', text: 'Retry' });
       btn.addEventListener('click', () => this.retryMessage(message));
       const discard = el('button', { type: 'button', class: 'btn btn--sm btn--ghost', text: 'Discard' });
@@ -762,9 +766,10 @@ export class ChatController {
       bubble.append(retry);
     }
 
-    if (!message.local) bubble.append(this.bubbleTools(message, conv));
-
     row.append(bubble);
+    if (!message.local && !message.isDeleted && getFeatures().replies) {
+      this.bindSwipeToReply(row, bubble, message);
+    }
     return row;
   }
 
@@ -784,7 +789,7 @@ export class ChatController {
     return wrap;
   }
 
-  bubbleFooter(message) {
+  bubbleFooter(message, conv) {
     const footer = el('div', { class: 'bubble__footer' });
     if (message.isEdited) footer.append(el('span', { class: 'bubble__edited', text: 'edited' }));
     footer.append(el('span', { class: 'bubble__time', text: formatTime(message.createdAt) }));
@@ -800,6 +805,10 @@ export class ChatController {
       });
       statusEl.append(icon(statusIconFor(message.status), { size: 14 }));
       footer.append(statusEl);
+    }
+    if (!message.local && !message.isDeleted) {
+      const tools = this.bubbleTools(message, conv);
+      if (tools.childNodes.length) footer.append(tools);
     }
     return footer;
   }
@@ -867,13 +876,20 @@ export class ChatController {
     if (features.replies) {
       tools.append(
         iconButton('reply', 'Reply to this message', {
-          className: 'icon-btn--sm',
+          className: 'icon-btn--sm bubble__reply-btn',
           onClick: () => this.startReply(message),
         })
       );
     }
 
     const menuItems = [];
+    if (features.replies) {
+      menuItems.push({
+        label: 'Reply',
+        icon: 'reply',
+        onClick: () => this.startReply(message),
+      });
+    }
     if (features.reactions && message.permissions.canReact) {
       menuItems.push({
         label: 'React',
@@ -902,13 +918,120 @@ export class ChatController {
     }
 
     if (menuItems.length) {
-      const more = iconButton('more-vertical', 'Message actions', { className: 'icon-btn--sm' });
+      const more = iconButton('more-vertical', 'Message actions', { className: 'icon-btn--sm bubble__more-btn' });
       more.addEventListener('click', () => openMenu(more, menuItems));
       tools.append(more);
     }
 
     void conv;
     return tools;
+  }
+
+  /**
+   * Bind touch swipe-to-reply on a message bubble.
+   * Requires a clear horizontal gesture (|dx| > |dy| * 1.5 and |dx| >= 12px)
+   * so vertical scrolling, text selection, and media playback are unaffected.
+   */
+  bindSwipeToReply(row, bubble, message) {
+    const SWIPE_THRESHOLD = 48;
+    const MAX_TRANSLATE = 64;
+    let startX = 0;
+    let startY = 0;
+    let currentOffset = 0;
+    let tracking = false;
+    let lockedHorizontal = false;
+    let hintEl = null;
+
+    const resetSwipe = () => {
+      if (lockedHorizontal || currentOffset !== 0) {
+        row.classList.remove('msg-row--swiping');
+        bubble.style.transform = '';
+        if (hintEl) {
+          hintEl.dataset.ready = 'false';
+          hintEl.style.opacity = '0';
+        }
+      }
+      tracking = false;
+      lockedHorizontal = false;
+      currentOffset = 0;
+    };
+
+    row.addEventListener(
+      'touchstart',
+      (event) => {
+        if (event.touches.length !== 1) return;
+        const target = event.target;
+        if (target?.closest?.('button, a, audio, video, input, textarea, [role="slider"], .voice__track')) {
+          return;
+        }
+        const touch = event.touches[0];
+        startX = touch.clientX;
+        startY = touch.clientY;
+        currentOffset = 0;
+        tracking = true;
+        lockedHorizontal = false;
+      },
+      { passive: true }
+    );
+
+    row.addEventListener(
+      'touchmove',
+      (event) => {
+        if (!tracking || event.touches.length !== 1) return;
+        const touch = event.touches[0];
+        const dx = touch.clientX - startX;
+        const dy = touch.clientY - startY;
+
+        if (!lockedHorizontal) {
+          if (Math.abs(dy) > 10 && Math.abs(dy) >= Math.abs(dx)) {
+            tracking = false;
+            return;
+          }
+          if (Math.abs(dx) < 12 || Math.abs(dx) < Math.abs(dy) * 1.5) {
+            return;
+          }
+          // Outgoing bubbles sit on the right (swipe left or right works, biased inward);
+          // incoming bubbles sit on the left (swipe right).
+          if (!message.outgoing && dx < 0) {
+            tracking = false;
+            return;
+          }
+          lockedHorizontal = true;
+          row.classList.add('msg-row--swiping');
+          if (!hintEl) {
+            hintEl = el('span', { class: 'msg-row__swipe-hint', 'aria-hidden': 'true' }, [
+              icon('reply', { size: 16 }),
+            ]);
+            row.append(hintEl);
+          }
+        }
+
+        const clamped = message.outgoing
+          ? Math.max(-MAX_TRANSLATE, Math.min(MAX_TRANSLATE, dx))
+          : Math.max(0, Math.min(MAX_TRANSLATE, dx));
+        currentOffset = clamped;
+        bubble.style.transform = `translate3d(${clamped}px, 0, 0)`;
+        if (hintEl) {
+          const progress = Math.min(1, Math.abs(clamped) / SWIPE_THRESHOLD);
+          hintEl.style.opacity = String(progress);
+          hintEl.dataset.ready = String(Math.abs(clamped) >= SWIPE_THRESHOLD);
+        }
+      },
+      { passive: true }
+    );
+
+    const onEnd = () => {
+      if (!tracking) return;
+      const triggered = lockedHorizontal && Math.abs(currentOffset) >= SWIPE_THRESHOLD;
+      resetSwipe();
+      if (triggered) {
+        try { navigator.vibrate?.(10); } catch { /* ignore */ }
+        this.startReply(message);
+      }
+    };
+
+    row.addEventListener('touchend', onEnd, { passive: true });
+    row.addEventListener('touchcancel', resetSwipe, { passive: true });
   }
 
   openReactionPicker(message) {
@@ -1141,6 +1264,18 @@ export class ChatController {
       toast('Maximum voice note length reached.', { type: 'warning' });
       this.stopRecording();
     });
+
+    // Keep the thread anchored to the bottom when the mobile virtual keyboard
+    // resizes the visualViewport while the user is already at the bottom.
+    window.visualViewport?.addEventListener(
+      'resize',
+      () => {
+        if (this.activeId && this.atBottom) {
+          window.requestAnimationFrame(() => this.scrollToBottom());
+        }
+      },
+      { passive: true }
+    );
   }
 
   openAttachMenu(anchor) {
@@ -1208,13 +1343,11 @@ export class ChatController {
         this.recording = null;
         this.renderPreviewTray();
       });
-      const send = el('button', { type: 'button', class: 'btn btn--sm btn--primary', text: 'Send voice note' });
-      send.addEventListener('click', () => this.submit());
-      actions.append(cancel, send);
+      actions.append(cancel);
       trayEl.append(
         el('div', { class: 'preview-tray' }, [
           el('div', { class: 'preview-tray__body' }, [
-            el('div', { class: 'preview-tray__name', text: 'Voice note ready to send' }),
+            el('div', { class: 'preview-tray__name', text: 'Voice note ready — tap Send below' }),
             preview,
             actions,
           ]),
@@ -1238,9 +1371,7 @@ export class ChatController {
     const actions = el('div', { class: 'preview-tray__actions' });
     const cancel = el('button', { type: 'button', class: 'btn btn--sm', text: 'Cancel' });
     cancel.addEventListener('click', () => this.clearDraft());
-    const send = el('button', { type: 'button', class: 'btn btn--sm btn--primary', text: 'Send' });
-    send.addEventListener('click', () => this.submit());
-    actions.append(cancel, send);
+    actions.append(cancel);
 
     trayEl.append(
       el('div', { class: 'preview-tray' }, [
@@ -1248,7 +1379,7 @@ export class ChatController {
         el('div', { class: 'preview-tray__body' }, [
           el('div', { class: 'preview-tray__name', text: this.draft.name }),
           el('div', { class: 'preview-tray__meta', text: draftMeta(this.draft) }),
-          el('div', { class: 'text-xs text-muted', text: 'Add an optional caption in the message box, then send.' }),
+          el('div', { class: 'text-xs text-muted', text: 'Add an optional caption in the message box, then tap Send.' }),
           actions,
         ]),
       ])
@@ -1473,7 +1604,10 @@ export class ChatController {
     this.cancelContext();
 
     const posterUrl = draft.kind === 'video' && draft.poster ? URL.createObjectURL(draft.poster) : null;
+    // Reuse the attachment client id from the start so store.byClientId is
+    // indexed consistently and a retry can never duplicate.
     const optimistic = createOptimistic(id, {
+      clientId: draft.clientId,
       kind: draft.kind,
       caption,
       media: {
@@ -1491,9 +1625,7 @@ export class ChatController {
       replyTo: replyTo ? { id: replyTo.id, available: true, authorName: replyTo.authorName, preview: replyTo.preview, kind: replyTo.kind } : null,
       sender: this.user,
     });
-    // Reuse the attachment client id so a retry can never duplicate.
-    optimistic.clientId = draft.clientId;
-    getStore(id).byClientId.set(draft.clientId, optimistic);
+    void optimistic;
 
     if (this.refs.inputEl) this.refs.inputEl.value = '';
     // Hand the draft to the pending-upload lifecycle: clear the composer tray
@@ -1720,6 +1852,22 @@ export class ChatController {
     });
 
     socketEvents.on('conversation.updated', (payload) => {
+      if (payload?.conversation_id && payload?.last_message && !payload?.id && !payload?.conversation) {
+        const convId = String(payload.conversation_id);
+        const conv = this.conversations.get(convId);
+        if (!conv) {
+          this.hydrateConversation(convId);
+          return;
+        }
+        const message = normalizeMessage(payload.last_message, { currentUserId: this.user?.id });
+        if (message) {
+          conv.lastMessage = message;
+          conv.previewText = messagePreview(message);
+          conv.lastActivity = message.createdAt || conv.lastActivity;
+          this.renderList();
+        }
+        return;
+      }
       const raw = payload?.conversation || payload;
       if (!raw?.id) return;
       const conv = normalizeConversation(raw, this.user);

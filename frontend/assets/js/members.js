@@ -196,6 +196,10 @@ export class MembersController {
       className: 'icon-btn--sm',
       onClick: () => this.openConversation(member),
     });
+    const resetBtn = iconButton('key', `Reset PIN for ${member.display_name || 'member'}`, {
+      className: 'icon-btn--sm',
+      onClick: () => this.resetCredential(member),
+    });
     const moreBtn = iconButton('more-vertical', `More actions for ${member.display_name || 'member'}`, { className: 'icon-btn--sm' });
     moreBtn.addEventListener('click', () =>
       openMenu(moreBtn, [
@@ -211,7 +215,7 @@ export class MembersController {
         },
       ])
     );
-    actions.append(viewBtn, chatBtn, moreBtn);
+    actions.append(viewBtn, chatBtn, resetBtn, moreBtn);
     actionsCell.append(actions);
 
     return el('tr', { dataset: { id: String(member.id) } }, [
@@ -286,14 +290,21 @@ export class MembersController {
   async resetCredential(member) {
     const ok = await confirmDialog({
       title: 'Reset this member’s PIN?',
-      message: 'A new initial PIN will be issued by the backend. The member must change it at next sign-in.',
-      detail: 'The PIN is generated and delivered by the backend according to your deployment policy. It is never displayed here in plain text unless the backend explicitly returns it for one-time handover.',
+      message: `${member.display_name || 'This member'}’s PIN will be reset to the initial six-digit PIN (first 6 digits of their phone number). They will be required to set a new PIN at next sign-in.`,
+      detail: 'All active sessions for this member will be signed out immediately.',
       confirmLabel: 'Reset PIN',
       danger: true,
     });
     if (!ok) return;
     try {
       const result = await api.members.resetCredential(member.id);
+      if (result && result.id) {
+        const index = this.items.findIndex((m) => String(m.id) === String(member.id));
+        if (index >= 0) {
+          this.items[index] = { ...this.items[index], ...result, must_change_pin: true };
+          this.render();
+        }
+      }
       // Some deployments return a one-time PIN for offline handover.
       if (result?.initial_pin) {
         openModal({
@@ -316,6 +327,10 @@ export class MembersController {
     } catch (error) {
       toastApiError(error);
     }
+  }
+
+  resetPin(member) {
+    return this.resetCredential(member);
   }
 
   /* ============================================================
@@ -446,17 +461,20 @@ export class MembersController {
           el('dl', { class: 'dl' }, [
             el('dt', { text: 'Status' }),
             el('dd', {}, [
-              el('span', {
-                class: `tag tag--dot ${member.is_active !== false ? 'tag--success' : 'tag--danger'}`,
-                text: member.is_active !== false ? 'Active' : 'Inactive',
-              }),
+              el('div', { class: 'row row-wrap', style: { gap: '6px' } }, [
+                el('span', {
+                  class: `tag tag--dot ${member.is_active !== false ? 'tag--success' : 'tag--danger'}`,
+                  text: member.is_active !== false ? 'Active' : 'Inactive',
+                }),
+                member.must_change_pin ? el('span', { class: 'tag tag--warning', text: 'PIN reset pending' }) : null,
+              ]),
             ]),
             el('dt', { text: 'Role' }),
             el('dd', { text: member.is_admin ? 'Administrator' : 'Member' }),
             el('dt', { text: 'Login identifier' }),
             el('dd', { text: member.login_identifier || member.phone || '—' }),
             el('dt', { text: 'Created' }),
-            el('dd', { text: member.date_joined ? formatDate(member.date_joined) : '—' }),
+            el('dd', { text: (member.created_at || member.date_joined) ? formatDate(member.created_at || member.date_joined) : '—' }),
             el('dt', { text: 'Last seen' }),
             el('dd', { text: presence.status === 'online' ? 'Online now' : member.last_seen ? formatRelative(member.last_seen) : 'Never' }),
             el('dt', { text: 'Groups' }),
@@ -470,6 +488,10 @@ export class MembersController {
             buttonLink('Edit', 'pencil', () => {
               close();
               this.openEditDialog(member);
+            }),
+            buttonLink('Reset PIN', 'key', () => {
+              close();
+              this.resetCredential(member);
             }),
             buttonLink('Activity', 'activity', () => {
               close();

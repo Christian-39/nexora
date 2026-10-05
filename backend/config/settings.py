@@ -169,6 +169,18 @@ elif DATABASE_NAME:
             "CONN_MAX_AGE": DATABASE_CONN_MAX_AGE,
         }
     }
+elif DEBUG and DJANGO_ENV != "production":
+    DATABASES = {
+        "default": {
+            "ENGINE": MYSQL_ENGINE,
+            "NAME": "nexora",
+            "USER": DATABASE_USER or "nexora",
+            "PASSWORD": DATABASE_PASSWORD,
+            "HOST": DATABASE_HOST,
+            "PORT": str(DATABASE_PORT),
+            "CONN_MAX_AGE": DATABASE_CONN_MAX_AGE,
+        }
+    }
 else:
     raise ImproperlyConfigured(
         "MySQL is not configured. Set DATABASE_URL (mysql://user:pass@host:3306/name) "
@@ -433,6 +445,18 @@ REDIS_URL = config("REDIS_URL", default="")
 #: Render) present a certificate uvicorn's default verification rejects; the
 #: deployment must explicitly opt out, never silently.
 REDIS_SSL_CERT_REQS = config("REDIS_SSL_CERT_REQS", default="")
+REDIS_SOCKET_CONNECT_TIMEOUT = config("REDIS_SOCKET_CONNECT_TIMEOUT", default=5.0, cast=float)
+REDIS_SOCKET_TIMEOUT = config("REDIS_SOCKET_TIMEOUT", default=5.0, cast=float)
+#: Channels' RedisChannelLayer issues blocking ``BZPOPMIN`` reads with a
+#: 5-second server-side block (`brpop_timeout = 5`). The client socket read
+#: timeout MUST exceed ``brpop_timeout`` with headroom so an idle wait or brief
+#: cloud network jitter never raises ``redis.exceptions.TimeoutError``.
+REDIS_CHANNEL_SOCKET_TIMEOUT = config("REDIS_CHANNEL_SOCKET_TIMEOUT", default=15.0, cast=float)
+REDIS_RETRY_ON_TIMEOUT = config("REDIS_RETRY_ON_TIMEOUT", default=True, cast=boolean)
+REDIS_HEALTH_CHECK_INTERVAL = config("REDIS_HEALTH_CHECK_INTERVAL", default=30, cast=int)
+REDIS_CHANNEL_CAPACITY = config("REDIS_CHANNEL_CAPACITY", default=1500, cast=int)
+REDIS_CHANNEL_EXPIRY = config("REDIS_CHANNEL_EXPIRY", default=20, cast=int)
+REDIS_CHANNEL_GROUP_EXPIRY = config("REDIS_CHANNEL_GROUP_EXPIRY", default=86400, cast=int)
 
 
 def _redis_host(value: str):
@@ -467,14 +491,111 @@ def _redis_channel_hosts(url: str):
     return [url]
 
 
+def _redis_cache_options(url: str) -> dict:
+    """Connection-pool options for Django's RedisCache."""
+    opts: dict = {
+        "socket_connect_timeout": REDIS_SOCKET_CONNECT_TIMEOUT,
+        "socket_timeout": REDIS_SOCKET_TIMEOUT,
+        "retry_on_timeout": REDIS_RETRY_ON_TIMEOUT,
+        "health_check_interval": REDIS_HEALTH_CHECK_INTERVAL,
+        "socket_keepalive": True,
+    }
+    if url.startswith("rediss://") and REDIS_SSL_CERT_REQS.strip().lower() == "none":
+        opts["ssl_cert_reqs"] = None
+    return opts
+
+
+def _install_resilient_redis_channel_layer() -> None:
+    """Ensure ``channels_redis.core.RedisChannelLayer`` uses resilient sockets.
+
+    1. Injects ``socket_connect_timeout``, ``socket_timeout`` (always greater
+       than ``brpop_timeout``), ``retry_on_timeout``, ``health_check_interval``
+       and ``socket_keepalive`` into every connection pool created by
+       ``RedisChannelLayer.create_pool`` while keeping ``CONFIG['hosts']`` in
+       its canonical format.
+    2. Wraps ``RedisChannelLayer._brpop_with_clean`` so a transient
+       ``redis.exceptions.TimeoutError`` / ``ConnectionError`` during blocking
+       ``BZPOPMIN`` logs a throttled structured warning and backs off briefly
+       instead of crashing ``await_many_dispatch`` and terminating active
+       WebSocket consumers.
+    """
+    import asyncio
+    import logging
+    import time
+
+    import redis.asyncio as aioredis
+    import redis.exceptions
+    from channels_redis.core import RedisChannelLayer
+    from django.conf import settings as django_settings
+
+    if getattr(RedisChannelLayer, "_nexora_resilient_patched", False):
+        return
+
+    orig_create_pool = RedisChannelLayer.create_pool
+    orig_brpop_with_clean = RedisChannelLayer._brpop_with_clean
+    rt_log = logging.getLogger("nexora.realtime")
+    last_warn_at = 0.0
+
+    def create_pool(self, index):
+        host = dict(self.hosts[index])
+        brpop_timeout = float(getattr(self, "brpop_timeout", 5) or 5)
+        connect_timeout = float(getattr(django_settings, "REDIS_SOCKET_CONNECT_TIMEOUT", 5.0))
+        configured_timeout = float(getattr(django_settings, "REDIS_CHANNEL_SOCKET_TIMEOUT", 15.0))
+        read_timeout = max(configured_timeout, brpop_timeout + 10.0)
+        host.setdefault("socket_connect_timeout", connect_timeout)
+        host.setdefault("socket_timeout", read_timeout)
+        host.setdefault("retry_on_timeout", bool(getattr(django_settings, "REDIS_RETRY_ON_TIMEOUT", True)))
+        host.setdefault("health_check_interval", int(getattr(django_settings, "REDIS_HEALTH_CHECK_INTERVAL", 30)))
+        host.setdefault("socket_keepalive", True)
+        return aioredis.ConnectionPool.from_url(host.pop("address"), **host)
+
+    async def _brpop_with_clean(self, index, channel, timeout):
+        nonlocal last_warn_at
+        try:
+            return await orig_brpop_with_clean(self, index, channel, timeout)
+        except asyncio.CancelledError:
+            raise
+        except (
+            redis.exceptions.TimeoutError,
+            redis.exceptions.ConnectionError,
+            TimeoutError,
+            OSError,
+        ) as exc:
+            now = time.monotonic()
+            if now - last_warn_at >= 30.0:
+                last_warn_at = now
+                rt_log.warning(
+                    "Redis channel layer receive degraded (%s); backing off without dropping consumer",
+                    exc.__class__.__name__,
+                    extra={
+                        "event": "ws.channel_layer_degraded",
+                        "operation": "receive_single",
+                        "channel": str(channel)[:48],
+                        "error_type": exc.__class__.__name__,
+                    },
+                )
+            await asyncio.sleep(0.5)
+            return None
+
+    RedisChannelLayer._orig_create_pool = orig_create_pool
+    RedisChannelLayer._orig_brpop_with_clean = orig_brpop_with_clean
+    RedisChannelLayer.create_pool = create_pool
+    RedisChannelLayer._brpop_with_clean = _brpop_with_clean
+    RedisChannelLayer._nexora_resilient_patched = True
+
+
+_install_resilient_redis_channel_layer()
+
+
 if REDIS_URL and not TESTING:
     CHANNEL_LAYERS = {
         "default": {
             "BACKEND": "channels_redis.core.RedisChannelLayer",
             "CONFIG": {
                 "hosts": _redis_channel_hosts(REDIS_URL),
-                "capacity": 1500,
-                "expiry": 20,
+                "capacity": REDIS_CHANNEL_CAPACITY,
+                "expiry": REDIS_CHANNEL_EXPIRY,
+                "group_expiry": REDIS_CHANNEL_GROUP_EXPIRY,
             },
         }
     }
@@ -483,6 +604,7 @@ if REDIS_URL and not TESTING:
             "BACKEND": "django.core.cache.backends.redis.RedisCache",
             "LOCATION": REDIS_URL,
             "KEY_PREFIX": config("CACHE_KEY_PREFIX", default="nexora"),
+            "OPTIONS": _redis_cache_options(REDIS_URL),
         }
     }
 else:

@@ -18,6 +18,7 @@
 
 import { authEvents, getUser, isAdmin, logout } from './auth.js';
 import { apiEvents, resolveMediaUrl } from './api.js';
+import { installGlobalErrorHandlers } from './errors.js';
 import { getThemePreference, setTheme, applyBranding, getConfig } from './theme.js';
 import { createConnectionUX } from './connection-ux.js';
 import { avatar, icon, iconButton, openMenu, toast } from './ui.js';
@@ -89,6 +90,7 @@ function mountViewportSizing() {
  * @param {object} options { active: string, container?: HTMLElement }
  */
 export function mountNavigation(options = {}) {
+  installGlobalErrorHandlers();
   mountViewportSizing();
   activeKey = options.active || document.body.dataset.page || null;
   navRoot = options.container || document.getElementById('app-nav');

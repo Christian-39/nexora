@@ -100,6 +100,13 @@ SECRET_MARKERS = (
 REDACTED = "[redacted]"
 
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_URL_CREDENTIALS = re.compile(r"\b(redis|rediss|mysql)://[^@\s]+@", re.IGNORECASE)
+_KV_SECRET = re.compile(
+    r"\b(pin|current_pin|new_pin|confirm_pin|old_pin|password|passwd|secret|token|access_token|refresh_token|cookie|csrftoken|authorization)\b(\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,&;}\]]+)",
+    re.IGNORECASE,
+)
+_BEARER_TOKEN = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]+", re.IGNORECASE)
+_JWT_TOKEN = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
 
 
 def is_secret_key(key) -> bool:
@@ -112,7 +119,8 @@ def sanitize(value, *, limit: int = 500) -> str:
 
     Newlines and carriage returns become ``\\n``/``\\r`` escapes so a crafted
     value cannot forge additional log entries (log injection), control
-    characters are stripped, and the result is length-bounded.
+    characters and embedded credentials/tokens/PINs are stripped, and the
+    result is length-bounded.
     """
     try:
         text = str(value)
@@ -120,6 +128,10 @@ def sanitize(value, *, limit: int = 500) -> str:
         return "[unprintable]"
     text = text.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
     text = _CONTROL.sub("", text)
+    text = _URL_CREDENTIALS.sub(r"\1://[redacted]@", text)
+    text = _KV_SECRET.sub(rf"\1\2{REDACTED}", text)
+    text = _BEARER_TOKEN.sub(f"Bearer {REDACTED}", text)
+    text = _JWT_TOKEN.sub(REDACTED, text)
     if len(text) > limit:
         text = f"{text[:limit]}…(+{len(text) - limit} chars)"
     return text

@@ -83,8 +83,21 @@ export function toHttpOrigin(wsOrigin) {
    Resolution — J1-style: same machine (dev) vs sandbox preview vs prod
    ============================================================ */
 
-export function resolveApiOrigin(location = globalThis.location) {
-  const explicit = trimSlashes(RUNTIME.apiBase || RUNTIME.apiOrigin || readMeta('nexora-api-base'));
+const ENV_API_BASE_URL =
+  typeof process !== 'undefined' && process?.env?.API_BASE_URL ? String(process.env.API_BASE_URL) : '';
+
+export function resolveApiOrigin(location = globalThis.location, runtimeOverride = null) {
+  const rt = runtimeOverride || { ...readInlineConfig(), ...(globalThis.NEXORA_RUNTIME || {}) };
+  const explicit = trimSlashes(
+    rt.API_BASE_URL ||
+      rt.apiBaseUrl ||
+      rt.apiBase ||
+      rt.apiOrigin ||
+      globalThis.API_BASE_URL ||
+      ENV_API_BASE_URL ||
+      readMeta('nexora-api-base') ||
+      readMeta('api-base-url')
+  );
   if (explicit) {
     // An explicit "same-origin" marker is how a reverse-proxy deployment opts
     // out of the hosted default below.
@@ -158,6 +171,7 @@ export function resolveMediaUrl(value) {
 
 export const config = Object.freeze({
   /** '' means "same origin". */
+  API_BASE_URL: API_ORIGIN,
   API_ORIGIN,
   API_PREFIX,
   WS_ORIGIN,

@@ -51,6 +51,58 @@ class BaseAuthenticatedConsumer(AsyncJsonWebsocketConsumer):
     #: It is deliberately in the 4400 range so the client can tell an
     #: authentication failure apart from a network failure and stop retrying.
     AUTH_CLOSE_CODE = 4401
+    TRANSIENT_CLOSE_CODE = 1013
+
+    async def _safe_group_add(self, group: str) -> bool:
+        if not self.channel_layer or not getattr(self, "channel_name", None):
+            return False
+        try:
+            await self.channel_layer.group_add(group, self.channel_name)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "ws.group_add_failed group=%s error=%s",
+                group,
+                exc.__class__.__name__,
+                extra={
+                    "event": "ws.group_add_failed",
+                    "group": group,
+                    "user_id": str(getattr(getattr(self, "user", None), "id", "")) or None,
+                    "error_type": exc.__class__.__name__,
+                },
+            )
+            return False
+
+    async def _safe_group_discard(self, group: str) -> None:
+        if not self.channel_layer or not getattr(self, "channel_name", None):
+            return
+        try:
+            await self.channel_layer.group_discard(group, self.channel_name)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "ws.group_discard_failed group=%s error=%s",
+                group,
+                exc.__class__.__name__,
+                extra={
+                    "event": "ws.group_discard_failed",
+                    "group": group,
+                    "user_id": str(getattr(getattr(self, "user", None), "id", "")) or None,
+                    "error_type": exc.__class__.__name__,
+                },
+            )
+
+    async def _safe_send_json(self, content) -> bool:
+        try:
+            await self.send_json(content)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            return False
 
     async def _authenticate(self) -> bool:
         """Authenticate the handshake, telling the client *why* it failed.
@@ -69,7 +121,11 @@ class BaseAuthenticatedConsumer(AsyncJsonWebsocketConsumer):
 
         code = self.scope.get("auth_error") or "UNAUTHENTICATED"
         await self.accept()
-        await self.send_json({"type": "auth.error", "code": code})
+        if code == "SERVICE_UNAVAILABLE":
+            await self._safe_send_json({"type": "error", "code": code})
+            await self.close(code=self.TRANSIENT_CLOSE_CODE)
+            return False
+        await self._safe_send_json({"type": "auth.error", "code": code})
         await self.close(code=self.AUTH_CLOSE_CODE)
         return False
 
@@ -84,11 +140,11 @@ class BaseAuthenticatedConsumer(AsyncJsonWebsocketConsumer):
         """
         expiry = self.scope.get("token_exp") or int(time.time())
         await asyncio.sleep(max(0, expiry - int(time.time())))
-        await self.send_json({"type": "auth.error", "code": "TOKEN_EXPIRED"})
-        await self.close(code=4401)
+        await self._safe_send_json({"type": "auth.error", "code": "TOKEN_EXPIRED"})
+        await self.close(code=self.AUTH_CLOSE_CODE)
 
     async def fanout(self, event) -> None:
-        await self.send_json({"type": event["event"], "data": event["payload"]})
+        await self._safe_send_json({"type": event["event"], "data": event["payload"]})
 
 
 class AppConsumer(BaseAuthenticatedConsumer):
@@ -101,31 +157,33 @@ class AppConsumer(BaseAuthenticatedConsumer):
         started = time.monotonic()
         self.joined: set[str] = set()
         self.typing_tasks: dict[str, asyncio.Task] = {}
-        self.presence_audience: list[str] = []
+        self.presence_peers: list[str] = []
 
-        await self.channel_layer.group_add(realtime.user_group(self.user.id), self.channel_name)
+        await self._safe_group_add(realtime.user_group(self.user.id))
         await self.accept()
         self._start_expiry_watch()
 
         # ONE database query + ONE cache read replaces the previous three
-        # full peer scans and N per-peer cache lookups, so the handshake (and
-        # therefore every page navigation, which opens a fresh socket) stops
-        # paying a presence tax proportional to the member count.
+        # full peer scans and N per-peer cache lookups, and the socket only
+        # subscribes to its own personal ``user_<id>`` group (presence fanout
+        # already publishes directly to each peer's ``user_<peer_id>`` group).
         presence = await self._presence_bootstrap()
         self.presence_active = presence is not None
         if presence is not None:
-            peers, online_map, audience_groups = presence
-            self.presence_audience = audience_groups
-            for group in audience_groups:
-                await self.channel_layer.group_add(group, self.channel_name)
+            peers, online_map = presence
+            self.presence_peers = [str(x) for x in peers]
             first = await self._presence_increment()
             if first:
-                realtime.broadcast_presence(self.user.id, online=True, audience=[*peers, str(self.user.id)])
+                realtime.broadcast_presence(
+                    self.user.id,
+                    online=True,
+                    audience=[*self.presence_peers, str(self.user.id)],
+                )
             snapshot = [{"user_id": str(x), "online": bool(online_map.get(f"presence:{x}", 0))} for x in peers]
         else:
             snapshot = []
 
-        await self.send_json(
+        await self._safe_send_json(
             {
                 "type": "connection.ready",
                 "data": {
@@ -149,14 +207,8 @@ class AppConsumer(BaseAuthenticatedConsumer):
         if not hasattr(self, "user"):
             return
         for conversation_id in list(getattr(self, "joined", ())):
-            await self.channel_layer.group_discard(realtime.conversation_group(conversation_id), self.channel_name)
-        # The audience groups are remembered from the handshake: disconnect must
-        # not re-run the peer query (it ran on connect; membership churn since
-        # then is irrelevant to leaving groups).
-        audience_groups = getattr(self, "presence_audience", ())
-        for group in audience_groups:
-            await self.channel_layer.group_discard(group, self.channel_name)
-        await self.channel_layer.group_discard(realtime.user_group(self.user.id), self.channel_name)
+            await self._safe_group_discard(realtime.conversation_group(conversation_id))
+        await self._safe_group_discard(realtime.user_group(self.user.id))
 
         # presence_active (not the audience length) decides the decrement: a
         # user with zero observable peers still has a presence counter to clear.
@@ -164,9 +216,7 @@ class AppConsumer(BaseAuthenticatedConsumer):
             last = await self._presence_decrement()
             if last:
                 last_seen = await self._touch_last_seen()
-                # Broadcast to the same audience the connect used; the peer ids
-                # are derivable from the group names without another query.
-                peers = [group.removeprefix("user_") for group in audience_groups]
+                peers = list(getattr(self, "presence_peers", ()))
                 realtime.broadcast_presence(
                     self.user.id,
                     online=False,
@@ -206,11 +256,11 @@ class AppConsumer(BaseAuthenticatedConsumer):
             oldest = next(iter(self.joined))
             await self._leave(oldest)
         if not await self._may_access(conversation_id):
-            await self.send_json(
+            await self._safe_send_json(
                 {"type": "conversation.denied", "data": {"conversation_id": conversation_id}}
             )
             return
-        await self.channel_layer.group_add(realtime.conversation_group(conversation_id), self.channel_name)
+        await self._safe_group_add(realtime.conversation_group(conversation_id))
         self.joined.add(conversation_id)
         delivered = await self._mark_delivered(conversation_id)
         if delivered:
@@ -218,7 +268,7 @@ class AppConsumer(BaseAuthenticatedConsumer):
                 conversation_id, user_id=self.user.id, state="delivered", message_ids=delivered,
                 timestamp=timezone.now(),
             )
-        await self.send_json({"type": "conversation.joined", "data": {"conversation_id": conversation_id}})
+        await self._safe_send_json({"type": "conversation.joined", "data": {"conversation_id": conversation_id}})
 
     async def _on_leave(self, content):
         await self._leave(str(content.get("conversation_id") or ""))
@@ -226,7 +276,7 @@ class AppConsumer(BaseAuthenticatedConsumer):
     async def _leave(self, conversation_id):
         if conversation_id not in self.joined:
             return
-        await self.channel_layer.group_discard(realtime.conversation_group(conversation_id), self.channel_name)
+        await self._safe_group_discard(realtime.conversation_group(conversation_id))
         self.joined.discard(conversation_id)
 
     async def _on_typing(self, content):
@@ -341,12 +391,11 @@ class AppConsumer(BaseAuthenticatedConsumer):
     def _presence_bootstrap(self):
         """Presence handshake data in ONE database query + ONE cache read.
 
-        Returns ``(peer_ids, online_map, audience_groups)`` or ``None`` when
-        presence is disabled for this deployment. ``_presence_peers`` is
-        queried once (it used to run three times per connection) and the
-        per-peer ``cache.get`` loop is replaced by a single ``get_many`` —
-        with a remote Redis that difference alone is N network round trips
-        per handshake.
+        Returns ``(peer_ids, online_map)`` or ``None`` when presence is
+        disabled for this deployment. ``_presence_peers`` is queried once (it
+        used to run three times per connection) and the per-peer ``cache.get``
+        loop is replaced by a single ``get_many`` — with a remote Redis that
+        difference alone is N network round trips per handshake.
         """
         from apps.platform_settings.services import messaging_policy
 
@@ -354,8 +403,7 @@ class AppConsumer(BaseAuthenticatedConsumer):
             return None
         peers = _presence_peers(self.user)
         online_map = safe_cache.safe_get_many([f"presence:{x}" for x in peers], operation="ws_presence") if peers else {}
-        audience_groups = [realtime.user_group(x) for x in peers]
-        return peers, online_map, audience_groups
+        return peers, online_map
 
     @database_sync_to_async
     def _touch_last_seen(self):
@@ -440,11 +488,11 @@ class ConversationConsumer(BaseAuthenticatedConsumer):
             # Authenticated but not a participant: a permanent refusal, so the
             # client is told explicitly instead of being left to reconnect.
             await self.accept()
-            await self.send_json({"type": "auth.error", "code": "FORBIDDEN"})
+            await self._safe_send_json({"type": "auth.error", "code": "FORBIDDEN"})
             await self.close(code=4403)
             return
         self.group = realtime.conversation_group(self.conversation_id)
-        await self.channel_layer.group_add(self.group, self.channel_name)
+        await self._safe_group_add(self.group)
         await self.accept()
         self._start_expiry_watch()
         delivered = await self._mark_delivered()
@@ -459,7 +507,7 @@ class ConversationConsumer(BaseAuthenticatedConsumer):
         if task:
             task.cancel()
         if hasattr(self, "group"):
-            await self.channel_layer.group_discard(self.group, self.channel_name)
+            await self._safe_group_discard(self.group)
 
     async def receive_json(self, content, **kwargs):
         if isinstance(content, dict) and content.get("type") == "ping":

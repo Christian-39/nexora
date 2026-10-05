@@ -35,6 +35,26 @@ def user_group(user_id) -> str:
     return f"user_{user_id}"
 
 
+async def _async_group_send(layer, group: str, event_type: str, message: dict) -> None:
+    try:
+        await layer.group_send(group, message)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - realtime must never break a consumer or request
+        logger.warning(
+            "Failed to publish %s to %s (%s)",
+            event_type,
+            group,
+            exc.__class__.__name__,
+            extra={
+                "event": "realtime.publish_failed",
+                "group": group,
+                "event_type": event_type,
+                "error_type": exc.__class__.__name__,
+            },
+        )
+
+
 def _send(group: str, event_type: str, payload: dict) -> None:
     """Publish one event, from either a sync view or an async consumer.
 
@@ -53,11 +73,22 @@ def _send(group: str, event_type: str, payload: dict) -> None:
         except RuntimeError:
             loop = None
         if loop is not None:
-            loop.create_task(layer.group_send(group, message))
+            loop.create_task(_async_group_send(layer, group, event_type, message))
         else:
             async_to_sync(layer.group_send)(group, message)
-    except Exception:  # noqa: BLE001 - realtime must never break a request
-        logger.exception("Failed to publish %s to %s", event_type, group)
+    except Exception as exc:  # noqa: BLE001 - realtime must never break a request
+        logger.warning(
+            "Failed to publish %s to %s (%s)",
+            event_type,
+            group,
+            exc.__class__.__name__,
+            extra={
+                "event": "realtime.publish_failed",
+                "group": group,
+                "event_type": event_type,
+                "error_type": exc.__class__.__name__,
+            },
+        )
 
 
 def emit(group: str, event_type: str, payload: dict, *, on_commit: bool = True) -> None:

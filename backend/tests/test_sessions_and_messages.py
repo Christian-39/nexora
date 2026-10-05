@@ -54,6 +54,7 @@ def test_pin_change_is_enforced_before_other_endpoints(member_a, admin):
     private_conversation(admin, member_a)
     client = APIClient()
     login(client, member_a, "123456")
+    initial_session = member_a.device_sessions.filter(revoked_at__isnull=True).get()
     blocked = client.get("/api/conversations/")
     assert blocked.status_code == 403
     assert blocked.json()["code"] == "PERMISSION_DENIED"
@@ -66,11 +67,17 @@ def test_pin_change_is_enforced_before_other_endpoints(member_a, admin):
         HTTP_X_CSRFTOKEN=token,
     )
     assert changed.status_code == 200
+    assert changed.json()["data"]["must_change_pin"] is False
     member_a.refresh_from_db()
     assert member_a.credential_state == "CHANGED"
     assert member_a.check_password("418273")
-    # Changing the PIN revokes every session, including this one.
-    assert not member_a.device_sessions.filter(revoked_at__isnull=True).exists()
+    # Changing the PIN revokes the prior session and issues a fresh session
+    # so the caller can immediately proceed without a second sign-in.
+    initial_session.refresh_from_db()
+    assert initial_session.revoked_at is not None
+    assert member_a.device_sessions.filter(revoked_at__isnull=True).count() == 1
+    unblocked = client.get("/api/conversations/")
+    assert unblocked.status_code == 200
 
 
 @pytest.mark.django_db

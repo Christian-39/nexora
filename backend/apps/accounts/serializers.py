@@ -176,17 +176,93 @@ class MemberUpdateSerializer(serializers.ModelSerializer):
 
 
 class PinSerializer(serializers.Serializer):
-    current_pin = serializers.RegexField(r"^\d{6}$", error_messages={"invalid": "Enter your current six-digit PIN."})
-    new_pin = serializers.RegexField(r"^\d{6}$", error_messages={"invalid": "The new PIN must be six digits."})
+    current_pin = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        error_messages={"invalid": "Enter your current six-digit PIN."},
+    )
+    old_pin = serializers.CharField(required=False, allow_blank=True, write_only=True)
+    new_pin = serializers.RegexField(
+        r"^\d{6}$",
+        error_messages={
+            "required": "Enter a new six-digit PIN.",
+            "blank": "Enter a new six-digit PIN.",
+            "invalid": "The new PIN must be six digits.",
+        },
+    )
+    confirm_pin = serializers.CharField(required=False, allow_blank=True, write_only=True)
+
+    WEAK_PINS = {
+        "000000",
+        "111111",
+        "123456",
+        "654321",
+        "999999",
+        "112233",
+        "121212",
+        "123123",
+        "000123",
+    }
 
     def validate_new_pin(self, value):
-        if value == self.initial_data.get("current_pin"):
-            raise serializers.ValidationError("The new PIN must differ from the current one.")
-        if value in {"000000", "111111", "123456", "654321", "999999"}:
+        if value in self.WEAK_PINS:
             raise serializers.ValidationError("Choose a less predictable PIN.")
         if len(set(value)) == 1:
             raise serializers.ValidationError("Choose a less predictable PIN.")
+        if value in "01234567890" or value in "09876543210":
+            raise serializers.ValidationError("Choose a less predictable PIN.")
         return value
+
+    def validate(self, attrs):
+        import re
+
+        from .services import initial_pin
+
+        user = self.context.get("user") or getattr(self.context.get("request"), "user", None)
+        must_change = bool(
+            user
+            and getattr(user, "is_authenticated", False)
+            and getattr(user, "must_change_pin", False)
+        )
+
+        raw_current = attrs.get("current_pin") or attrs.get("old_pin") or ""
+        current_pin = str(raw_current).strip()
+        new_pin = attrs["new_pin"]
+
+        if not must_change:
+            if not current_pin:
+                raise serializers.ValidationError({"current_pin": ["Enter your current six-digit PIN."]})
+            if not re.fullmatch(r"^\d{6}$", current_pin):
+                raise serializers.ValidationError({"current_pin": ["Enter your current six-digit PIN."]})
+        elif current_pin and not re.fullmatch(r"^\d{6}$", current_pin):
+            raise serializers.ValidationError({"current_pin": ["Enter your current six-digit PIN."]})
+
+        attrs["current_pin"] = current_pin
+
+        if "confirm_pin" in self.initial_data:
+            confirm_pin = str(self.initial_data.get("confirm_pin") or "").strip()
+            if not confirm_pin:
+                raise serializers.ValidationError({"confirm_pin": ["Confirm the new PIN."]})
+            if confirm_pin != new_pin:
+                raise serializers.ValidationError({"confirm_pin": ["Confirmation PIN does not match."]})
+
+        if current_pin and new_pin == current_pin:
+            raise serializers.ValidationError({"new_pin": ["The new PIN must differ from the current one."]})
+
+        if user and getattr(user, "is_authenticated", False):
+            if user.check_password(new_pin):
+                raise serializers.ValidationError(
+                    {"new_pin": ["The new PIN must differ from the current one."]}
+                )
+            try:
+                if getattr(user, "phone", "") and new_pin == initial_pin(user.phone):
+                    raise serializers.ValidationError(
+                        {"new_pin": ["The new PIN cannot match your initial phone-derived PIN."]}
+                    )
+            except ValueError:
+                pass
+
+        return attrs
 
 
 class ProfileSerializer(serializers.ModelSerializer):

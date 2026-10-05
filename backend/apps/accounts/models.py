@@ -16,5 +16,8 @@ class User(AbstractBaseUser,PermissionsMixin,TimeStampedModel):
  class Meta:
   indexes=[models.Index(fields=['role','is_active']),models.Index(fields=['full_name'])]
  USERNAME_FIELD='phone'; REQUIRED_FIELDS=['full_name']; objects=UserManager()
+ @property
+ def must_change_pin(self) -> bool:
+  return self.credential_state != self.Credential.CHANGED
 class DeviceSession(TimeStampedModel):
  id=models.UUIDField(primary_key=True,default=uuid.uuid4,editable=False); user=models.ForeignKey(User,on_delete=models.CASCADE,related_name='device_sessions'); jti=models.CharField(max_length=64,unique=True); device_label=models.CharField(max_length=120,blank=True); user_agent=models.CharField(max_length=200,blank=True); ip_hash=models.CharField(max_length=64,blank=True); last_active=models.DateTimeField(auto_now=True); expires_at=models.DateTimeField(); revoked_at=models.DateTimeField(null=True,blank=True)
