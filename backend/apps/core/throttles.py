@@ -22,6 +22,7 @@ import time
 from rest_framework.throttling import AnonRateThrottle, SimpleRateThrottle, UserRateThrottle
 
 from .cache import CACHE_ERRORS, should_report
+from .observability import sanitize
 
 logger = logging.getLogger("nexora.throttle")
 
@@ -77,7 +78,7 @@ class ResilientThrottleMixin:
             "check REDIS_URL / the managed Redis instance",
             scope,
             exc.__class__.__name__,
-            exc,
+            sanitize(exc, limit=300),
             "falling back to the per-process limiter"
             if self.local_fallback
             else ("request allowed without rate limiting" if allowed else "request blocked"),

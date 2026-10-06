@@ -150,3 +150,39 @@ test('an unsafe request is not sent when CSRF bootstrap returns no usable token'
   );
   assert.deepEqual(calls.map(pathname), ['/api/auth/csrf/']);
 });
+
+test('a CSRF-specific 403 refreshes the token once and retries login without redirecting the API origin', { concurrency: false }, async () => {
+  const calls = [];
+  let csrfCalls = 0;
+  let loginCalls = 0;
+  const apiModule = await loadApi(async (url, init = {}) => {
+    calls.push({ url: String(url), init });
+    const path = new URL(url).pathname;
+    if (path === '/api/auth/csrf/') {
+      csrfCalls += 1;
+      return jsonResponse(200, {
+        success: true,
+        message: 'CSRF cookie set',
+        data: { csrf_token: `csrf-${csrfCalls}` },
+      });
+    }
+    assert.equal(path, '/api/auth/login/');
+    loginCalls += 1;
+    assert.equal(new URL(url).origin, API_ORIGIN);
+    assert.equal(header(calls.at(-1), 'X-CSRFToken'), `csrf-${loginCalls}`);
+    return loginCalls === 1
+      ? jsonResponse(403, { success: false, message: 'CSRF validation failed.', code: 'CSRF_FAILED', errors: {} })
+      : jsonResponse(200, { success: true, message: 'ok', data: { id: 'user-1' } });
+  });
+
+  const user = await apiModule.api.auth.login('+2348012345678', '123456');
+  assert.equal(user.id, 'user-1');
+  assert.equal(csrfCalls, 2);
+  assert.equal(loginCalls, 2);
+  assert.deepEqual(calls.map(pathname), [
+    '/api/auth/csrf/',
+    '/api/auth/login/',
+    '/api/auth/csrf/',
+    '/api/auth/login/',
+  ]);
+});

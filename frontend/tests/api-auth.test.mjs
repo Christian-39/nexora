@@ -52,8 +52,9 @@ function envelope(data = {}) {
   return { success: true, message: '', data };
 }
 
-async function loadApi(fetchImpl) {
+async function loadApi(fetchImpl, runtime = {}) {
   installEnvironment(fetchImpl);
+  globalThis.NEXORA_RUNTIME = { API_BASE_URL: API_ORIGIN, ...runtime };
   return import(new URL(`../assets/js/api.js?auth-case=${counter++}`, import.meta.url).href);
 }
 

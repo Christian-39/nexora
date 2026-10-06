@@ -17,6 +17,7 @@ FAILED with a short machine code and the original stays downloadable.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -72,8 +73,13 @@ def _spool(fileobj) -> str:
     return handle.name
 
 
-def probe_duration_ms(fileobj) -> int | None:
-    """Duration in milliseconds via ffprobe, or None when unavailable."""
+def probe_media_info(fileobj) -> dict | None:
+    """Return probed stream kinds and duration without trusting the browser MIME.
+
+    ``None`` means ffprobe is unavailable or could not parse the container.
+    The upload validator uses stream kinds only to disambiguate ambiguous MP4
+    brands and WebM headers; raw probe output is never logged.
+    """
     binary = _binary(settings.FFPROBE_BINARY)
     if not binary:
         return None
@@ -85,9 +91,9 @@ def probe_duration_ms(fileobj) -> int | None:
                 "-v",
                 "error",
                 "-show_entries",
-                "format=duration",
+                "format=duration:stream=codec_type",
                 "-of",
-                "default=noprint_wrappers=1:nokey=1",
+                "json",
                 path,
             ],
             capture_output=True,
@@ -95,12 +101,40 @@ def probe_duration_ms(fileobj) -> int | None:
             timeout=FFPROBE_TIMEOUT,
             check=False,
         )
-        value = (result.stdout or "").strip()
-        return int(float(value) * 1000) if value and value != "N/A" else None
-    except (subprocess.SubprocessError, ValueError):
+        if result.returncode != 0:
+            return None
+        payload = json.loads(result.stdout or "{}")
+        if not isinstance(payload, dict):
+            return None
+        streams = payload.get("streams", [])
+        streams = streams if isinstance(streams, list) else []
+        kinds = {
+            str(stream.get("codec_type") or "").lower()
+            for stream in streams
+            if isinstance(stream, dict)
+        }
+        format_info = payload.get("format", {})
+        format_info = format_info if isinstance(format_info, dict) else {}
+        raw_duration = format_info.get("duration")
+        try:
+            duration_ms = int(float(raw_duration) * 1000) if raw_duration not in (None, "N/A", "") else None
+        except (TypeError, ValueError):
+            duration_ms = None
+        return {
+            "has_audio": "audio" in kinds,
+            "has_video": "video" in kinds,
+            "duration_ms": duration_ms,
+        }
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
         return None
     finally:
         os.unlink(path)
+
+
+def probe_duration_ms(fileobj) -> int | None:
+    """Duration in milliseconds via ffprobe, or None when unavailable."""
+    info = probe_media_info(fileobj)
+    return info.get("duration_ms") if info else None
 
 
 # ---------------------------------------------------------------------------

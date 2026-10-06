@@ -10,7 +10,7 @@
  *  - Duplicate protection uses a stable client_id per attachment.
  */
 
-import { ApiError, api, resolveMediaUrl, upload } from './api.js';
+import { ApiError, api, apiConfig, resolveMediaUrl, upload } from './api.js';
 import { getLimits } from './theme.js';
 import {
   Emitter,
@@ -35,13 +35,22 @@ export const mediaEvents = new Emitter();
  * @param {'image'|'video'|'voice'|'auto'} [expected]
  * @returns {{ok:true,kind:string}|{ok:false,message:string}}
  */
+function mimeEssence(value = '') {
+  return String(value).split(';', 1)[0].trim().toLowerCase();
+}
+
+function allowedMime(allowed, actual) {
+  const essence = mimeEssence(actual);
+  return !allowed.length || allowed.some((value) => mimeEssence(value) === essence);
+}
+
 export function validateFile(file, expected = 'auto') {
   if (!file) return { ok: false, message: 'No file selected.' };
   const limits = getLimits();
   const kind = expected === 'auto' ? mediaKind(file.type) : expected;
 
   if (kind === 'image') {
-    if (limits.allowedImageTypes.length && !limits.allowedImageTypes.includes(file.type)) {
+    if (!allowedMime(limits.allowedImageTypes, file.type)) {
       return { ok: false, message: 'That image format is not supported.' };
     }
     if (file.size > limits.maxImageBytes) {
@@ -51,7 +60,7 @@ export function validateFile(file, expected = 'auto') {
   }
 
   if (kind === 'video') {
-    if (limits.allowedVideoTypes.length && !limits.allowedVideoTypes.includes(file.type)) {
+    if (!allowedMime(limits.allowedVideoTypes, file.type)) {
       return { ok: false, message: 'That video format is not supported.' };
     }
     if (file.size > limits.maxVideoBytes) {
@@ -186,10 +195,29 @@ export async function uploadDraft(conversationId, draft, options = {}) {
   const promise = upload(`/api/conversations/${encodeURIComponent(conversationId)}/messages/`, form, {
     signal: controller.signal,
     onProgress: (info) => {
+      // The transport helper reaches 100% on HTTP 2xx. For messages, wait for
+      // the domain response/idempotency key below before showing completion.
+      if (info.percent >= 100) return;
       mediaEvents.emit('progress', draft.clientId, info);
       onProgress?.(info);
     },
   })
+    .then((message) => {
+      // A 2xx transport status alone is not a confirmed message. Requiring the
+      // idempotency key in the response keeps the optimistic bubble/draft when
+      // a proxy returns an empty or malformed 2xx after the server committed.
+      if (!message || typeof message !== 'object' || !message.id || message.client_id !== draft.clientId) {
+        throw new ApiError({
+          message: 'The server did not confirm this attachment. Retry to confirm its status.',
+          code: 'UPLOAD_UNCONFIRMED',
+          status: 0,
+        });
+      }
+      const complete = { loaded: draft.size, total: draft.size, percent: 100 };
+      mediaEvents.emit('progress', draft.clientId, complete);
+      onProgress?.(complete);
+      return message;
+    })
     .finally(() => activeUploads.delete(draft.clientId));
 
   activeUploads.set(draft.clientId, { controller, promise });
@@ -227,6 +255,16 @@ function isExpired(expiresAt) {
   return Number.isFinite(t) && t - Date.now() < 15000; // refresh slightly early
 }
 
+function needsSignedCrossOriginMediaUrl(value) {
+  if (!value || !apiConfig.origin || apiConfig.origin === window.location.origin) return false;
+  try {
+    const url = new URL(resolveMediaUrl(value), window.location.origin);
+    return url.origin === apiConfig.origin && /^\/api\/media\/[^/]+\/?$/.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Resolve a usable URL for a media object, re-requesting a fresh signed URL
  * from the backend when the cached one is missing or about to expire.
@@ -238,7 +276,11 @@ export async function getMediaUrl(media, variant = 'full') {
   if (!media) return null;
   const direct = variant === 'thumbnail' ? media.thumbnailUrl : media.url;
 
-  if (direct && !isExpired(media.expiresAt)) {
+  // AttachmentSerializer's direct URL is an authenticated /api/media/ route.
+  // A cross-origin <img>/<video>/<audio> request cannot reliably carry the
+  // HttpOnly API cookie (notably with third-party-cookie restrictions). Ask the
+  // authorized backend resolver for a short-lived private-storage URL first.
+  if (direct && !isExpired(media.expiresAt) && !needsSignedCrossOriginMediaUrl(direct)) {
     return resolveMediaUrl(direct);
   }
 

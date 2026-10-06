@@ -11,7 +11,7 @@ Security-first, independently deployed Django/DRF/Channels backend. Each install
 - Admin-created groups with validated active membership, transactional add/remove membership, matching conversation authorization, configurable send permissions, archive support, and audit records.
 - Persistent notifications, user-scoped push-subscription APIs, durable push-delivery queue, retry/backoff, automatic invalid-subscription cleanup, and a locking-safe `push_worker` management command.
 - Authorized image/video/voice upload and download endpoints, signature/extension/size validation, disk-backed large uploads, random private storage keys, image verification, ffprobe duration/codec/dimension checks, media receipts/notifications/WebSocket events, and private S3-compatible storage.
-- Resumable S3-compatible multipart upload sessions with signed part URLs, size verification, cancellation, idempotent client IDs, private keys, and a durable finalizer that validates content before publishing a message.
+- Resumable chunked upload sessions over authorized API routes: ordered 5 MiB parts stream into private staging storage, session size is enforced, retries use stable client IDs, and `/complete/` validates before creating the message. `finalize_uploads` expires abandoned OPEN sessions and retries cleanup for completed/aborted staging objects; it does not publish messages or process direct multipart uploads.
 - Durable locking-safe media worker that streams originals to temporary disk, creates bounded WebP image derivatives and video posters with Pillow/FFmpeg, records processing state, and serves every variant through the same conversation authorization check.
 - Database-driven message/media/edit/delete/profile policies with bounded serializer validation, short-lived cache invalidation, and audit records for settings and branding changes.
 - Validated logo/favicon uploads with random private storage keys and controlled public proxy endpoints.
@@ -34,7 +34,7 @@ python manage.py migrate
 python manage.py createsuperuser
 uvicorn config.asgi:application --host 0.0.0.0 --port 8000
 python manage.py push_worker              # separate durable push worker
-python manage.py finalize_uploads          # validates completed direct uploads
+python manage.py finalize_uploads          # expires abandoned resumable sessions and retries staging cleanup
 python manage.py media_worker             # image/video derivative worker
 pytest
 ```
@@ -57,7 +57,7 @@ Redis is mandatory in production (channel layer, cache, presence) and the boot f
 
 Run migrations before switching traffic (`bin/render-build.sh` does this for the web service only, so parallel worker deploys cannot race).
 
-Set a unique `SECRET_KEY`, database credentials, exact `ALLOWED_HOSTS`, `CORS_ALLOWED_ORIGINS`, `CSRF_TRUSTED_ORIGINS`, `REDIS_URL`, private storage credentials and VAPID keys per deployment. When the frontend is on another site, also set `COOKIE_SAMESITE=None` and `COOKIE_SECURE=True`, or the browser will not send the session cookies. Provide FFmpeg/ffprobe to the API and media-worker hosts (`bin/render-build.sh` installs a static build into `backend/bin/`). Never share a database, bucket or credential set between organizations.
+Set a unique `SECRET_KEY`, database credentials, exact `ALLOWED_HOSTS`, `CORS_ALLOWED_ORIGINS`, `CSRF_TRUSTED_ORIGINS`, `REDIS_URL`, private storage credentials and VAPID keys per deployment. When the frontend is on another site, also set `COOKIE_SAMESITE=None` and `COOKIE_SECURE=True`, or the browser will not send the session cookies. Provide FFmpeg/ffprobe to the API and media-worker hosts (`bin/render-build.sh` installs a static build into `backend/bin/`). The upload finalizer also needs permission to list objects under `media/staging/` so it can retry cleanup of superseded chunk objects; scope that bucket-list permission to the staging prefix where supported. Never share a database, bucket or credential set between organizations.
 
 Background processing runs as its own services, never inside the web service:
 
@@ -77,7 +77,7 @@ python manage.py finalize_uploads
 - `GET /api/security/` and `GET /api/audit/` with administrator-only filtering
 - `GET /api/unread/` for authoritative global and per-conversation unread counts
 - `POST /api/media/`; `GET /api/media/{attachment_uuid}/`
-- `/api/uploads/`; `/api/uploads/{uuid}/part/`; `/complete/`; abort/status via `/api/uploads/{uuid}/`
+- `POST /api/uploads/`; `/api/uploads/{uuid}/` for owner-only progress; `/api/uploads/{uuid}/part/`; `/api/uploads/{uuid}/complete/`
 - `/api/notifications/`; `/api/notifications/read/`; `/api/push/`
 - `GET/PATCH /api/settings/`; `POST /api/settings/branding/`; `GET /api/audit/` (administrator only)
 - `GET /api/public/config/`; `GET /api/public/branding/logo/`; `/favicon/`
@@ -89,7 +89,7 @@ Responses use `{success,message,data}` or `{success,message,code,errors}`. Acces
 
 ## Media and push
 
-The models reserve private storage keys rather than public URLs. Production media endpoints must issue short-lived signed URLs only after conversation authorization. Upload completion should validate signatures with libmagic/Pillow/ffprobe and verify object metadata. Push subscriptions are persisted; delivery workers should use VAPID environment secrets and deactivate HTTP 404/410 subscriptions.
+The models reserve private storage keys rather than public URLs. Production media endpoints issue short-lived signed URLs only after conversation authorization. Direct and resumable upload completion validates server-detected signatures, extensions, image structure, and (when available) ffprobe stream kind/duration before message commit. Push subscriptions are persisted; delivery workers use VAPID environment secrets and deactivate HTTP 404/410 subscriptions.
 
 ## Security notes
 
@@ -97,4 +97,4 @@ PINs are only passed to Django's password hasher. They must never be logged. UUI
 
 ## Current scope boundary
 
-This repository is a production-oriented core, not a claim that every item in the supplied 80-section specification is finished. Before launch, complete and independently review: resumable/direct-to-object-storage uploads, generated video posters and image derivatives, presence/last-seen privacy controls, richer profile/settings controls, notification aggregation, deployment manifests, operational monitoring, backup/restore drills, malware scanning, migrations review, and the complete acceptance/security/load-test matrix.
+This repository is a production-oriented core, not a claim that every item in the supplied 80-section specification is finished. Before launch, independently review direct-to-object-storage upload integration, operational monitoring, backup/restore drills, malware scanning, migration plans, and the complete acceptance/security/load-test matrix.

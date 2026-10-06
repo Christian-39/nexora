@@ -30,6 +30,8 @@ import time
 
 from django.core.cache import cache
 
+from .observability import sanitize
+
 logger = logging.getLogger("nexora.cache")
 
 #: Exceptions a cache backend may raise. Redis raises its own hierarchy and
@@ -75,7 +77,7 @@ def _report(operation: str, exc: BaseException) -> None:
         "check REDIS_URL / the managed Redis instance)",
         operation,
         exc.__class__.__name__,
-        exc,
+        sanitize(exc, limit=300),
         exc_info=logger.isEnabledFor(logging.DEBUG),
     )
 

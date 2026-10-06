@@ -14,7 +14,7 @@ over REST and WebSockets.
 frontend/
 ├── build.mjs           injects public API_BASE_URL and versions sw.js
 ├── vercel.json         Vercel build/output and security/cache headers
-├── .env.example        blank public API_BASE_URL example
+├── .env.example        local API_BASE_URL example and Vercel guidance
 ├── index.html          session probe → admin.html or chat.html
 ├── login.html          sign-in + enforced first-login PIN change
 ├── chat.html           conversation list + thread + composer (both roles)
@@ -56,8 +56,8 @@ node build.mjs
 ```
 
 The build copies the static app to `dist/`, injects the JSON-encoded public
-origin into every HTML page, and versions the service-worker cache using both
-the commit identity and origin. Example value:
+origin into every HTML page, and versions the service-worker cache from the
+static source fingerprint, commit identity and API origin. Example value:
 
 ```text
 API_BASE_URL=https://api.example.org
@@ -71,15 +71,25 @@ secret; do not put credentials or secret keys in it.
 
 ### Local static hosting
 
+For a separate Django API on port 8000 and this static frontend on port 5500:
+
 ```sh
-python3 -m http.server 5500
+cp .env.example .env       # local example: http://127.0.0.1:8000
+node build.mjs
+python3 -m http.server 5500 --directory dist
 ```
 
-Without an injected build value the app uses root-relative `/api/` URLs and the
-current page origin for WebSockets. For a separate local API origin, set
-`API_BASE_URL` in an untracked `frontend/.env` or in the shell before running
-`node build.mjs`. The committed `.env.example` intentionally leaves the value
-blank. Never commit a real frontend `.env`.
+This explicit API origin prevents `/api/` requests from being sent to the
+standalone static server (which otherwise returns 405). `frontend/.env` is
+untracked and never shipped. For a same-origin reverse proxy, set
+`API_BASE_URL=same-origin` before building; serving the unbuilt source without
+a runtime override also intentionally keeps root-relative URLs for that proxy.
+
+On Vercel, set `API_BASE_URL` in the project environment to the public HTTPS
+Django API origin. Never use the local example value there. The Vercel build
+fails if this production value is missing, loopback, or plain HTTP unless an
+explicit same-origin reverse proxy is configured. Never commit a real
+frontend `.env`.
 
 The `API_PREFIX` remains `/api`. REST requests live in `assets/js/api.js`; the
 WebSocket scheme/origin is derived centrally (`http→ws`, `https→wss`) from the

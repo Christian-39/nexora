@@ -182,3 +182,77 @@ def test_client_error_sink_logs_and_redacts_secrets():
     assert "123456" not in combined
     assert "secret-jwt-value" not in combined
     assert "[redacted]" in combined.lower()
+
+
+@pytest.mark.django_db
+def test_request_log_has_role_timing_query_metrics_and_never_logs_query_text(admin):
+    import logging
+
+    from django.http import HttpResponse
+    from django.test import RequestFactory, override_settings
+
+    from apps.accounts.models import User
+    from apps.core.middleware import RequestLogMiddleware
+
+    records = []
+
+    class ListHandler(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = ListHandler()
+    request_logger = logging.getLogger("nexora.request")
+    request_logger.addHandler(handler)
+
+    def get_response(request):
+        User.objects.filter(pk=admin.pk).count()
+        return HttpResponse(status=503)
+
+    request = RequestFactory().get(
+        "/api/search/?q=private-message-never-log&token=do-not-log-this"
+    )
+    request.user = admin
+    try:
+        with override_settings(SLOW_REQUEST_MS=0, SLOW_QUERY_MS=0):
+            middleware = RequestLogMiddleware(get_response)
+            response = middleware(request)
+    finally:
+        request_logger.removeHandler(handler)
+
+    assert response.status_code == 503
+    record = next(record for record in records if record.name == "nexora.request")
+    message = record.getMessage()
+    assert "/api/search/" in message
+    assert "db_queries=1" in message
+    assert "db_ms=" in message and "db_slow=1" in message
+    assert "ADMIN" in message
+    assert str(admin.id) == record.user_id
+    assert record.user_role == "ADMIN"
+    assert "private-message-never-log" not in message
+    assert "do-not-log-this" not in message
+    assert "?q=" not in message
+
+
+def test_production_formatter_scrubs_exception_text_before_writing_logs():
+    import logging
+
+    from apps.core.observability import ProductionFormatter, scrub
+
+    try:
+        raise RuntimeError(
+            'storage failed pin=123456 token=secret-value '
+            'AWS_SECRET_ACCESS_KEY=provider-secret csrf_token="csrf-secret" X-Amz-Signature=signed-value'
+        )
+    except RuntimeError:
+        record = logging.LogRecord("nexora.test", logging.ERROR, __file__, 1, "unexpected failure", (), __import__("sys").exc_info())
+
+    formatter = ProductionFormatter("%(levelname)s %(message)s")
+    rendered = formatter.format(record)
+    assert "123456" not in rendered
+    assert "secret-value" not in rendered
+    assert "provider-secret" not in rendered
+    assert "csrf-secret" not in rendered
+    assert "signed-value" not in rendered
+    assert "[redacted]" in rendered
+    nested = scrub({"signed_url": "https://objects.example/private?token=secret"})
+    assert nested["signed_url"] == "[redacted]"

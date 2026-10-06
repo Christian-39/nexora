@@ -101,5 +101,7 @@ test('the runtime resolver contains no deployment host or loopback/port fallback
   const source = await readFile(new URL('../assets/js/config.js', import.meta.url), 'utf8');
   assert.doesNotMatch(source, /onrender\.com|localhost|127\.0\.0\.1|0\.0\.0\.0|::1|LOCAL_API_PORT|PRODUCTION_API_ORIGIN|8000/);
   const env = await readFile(new URL('../.env.example', import.meta.url), 'utf8');
-  assert.match(env, /^API_BASE_URL=$/m);
+  assert.match(env, /^API_BASE_URL=http:\/\/127\.0\.0\.1:8000$/m);
+  assert.match(env, /Vercel: set API_BASE_URL in Project/);
+  assert.match(env, /^# API_BASE_URL=same-origin$/m);
 });

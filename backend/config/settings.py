@@ -761,7 +761,7 @@ LOGGING = {
             "()": "apps.core.observability.ProductionFormatter",
             "format": (
                 "%(asctime)s %(levelname)-8s %(name)s "
-                "[req=%(request_id)s user=%(user_id)s op=%(operation)s] %(message)s"
+                "[req=%(request_id)s user=%(user_id)s role=%(user_role)s op=%(operation)s] %(message)s"
             ),
         },
         "simple": {"format": "%(asctime)s %(levelname)s %(name)s %(message)s"},

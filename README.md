@@ -108,14 +108,24 @@ cd frontend
 python -m http.server 5500
 ```
 
-For a split frontend/API origin, set `API_BASE_URL` in an untracked
-`frontend/.env` or the shell and run `node build.mjs` before serving `dist/`.
-The browser-side `config.js` reads only the build-injected `API_BASE_URL`; it
-never infers a backend hostname, assumes port 8000, or falls back to a committed
-production origin. Empty means root-relative same-origin proxy; an explicit
-`same-origin` value is also accepted. Vercel builds require either a valid
-public HTTPS origin or explicit same-origin proxy mode; they reject loopback
-and insecure HTTP API origins.
+For the common local split (static frontend on `127.0.0.1:5500`, Django on
+`127.0.0.1:8000`), copy `frontend/.env.example` to `frontend/.env`, build, and
+serve `dist/`:
+
+```bash
+cp frontend/.env.example frontend/.env
+cd frontend && node build.mjs
+python3 -m http.server 5500 --directory dist
+```
+
+The example points to the local Django origin so `/api/auth/login/` cannot be
+mistakenly posted to the static server. For a same-origin reverse proxy, use
+`API_BASE_URL=same-origin`. The browser-side `config.js` reads only the
+build-injected `API_BASE_URL`; it never guesses a backend hostname or falls
+back to a committed production origin. On Vercel, configure the public HTTPS
+API origin in the Vercel project environment; its production build rejects a
+missing, loopback, or plain-HTTP API origin unless same-origin proxy mode is
+explicitly selected.
 
 The WebSocket scheme is derived from that same value (`http→ws`, `https→wss`).
 The handshake uses the HttpOnly access cookie; credentials are not placed in a
@@ -378,11 +388,14 @@ Upload is a single multipart `POST /api/conversations/{id}/messages/` carrying
 one transaction. A resumable chunked API (`/api/uploads/…`) exists for very
 large files.
 
-Validation order: declared size → **content signature (magic bytes)** →
-declared MIME must agree → extension must match the signature → structural
-decode and pixel limits for images → probed duration for audio/video. A file
-is stored under a generated, unguessable key; the client's filename never
-touches the filesystem. Executables, archives and PDFs are rejected outright.
+Validation order: server and organization size ceilings → **content signature
+(magic bytes)** → extension must match the detected type → structural decode
+and pixel limits for images → probed stream kind and duration for audio/video
+when `ffprobe` is available. Browser MIME is only a hint: ambiguous voice MP4
+is accepted only when the extension/MIME indicate audio and `ffprobe` confirms
+an audio-only stream. A file is stored under a generated, unguessable key; the
+client's filename never touches the storage path. Executables, archives and
+PDFs are rejected outright.
 
 Files are private. `GET /api/media/{uuid}/` authorizes the caller and then
 streams the object with HTTP range support; `GET /api/media/{uuid}/url/`

@@ -73,10 +73,10 @@ if (process.env.VERCEL === '1' && !apiBaseUrl && !explicitlySameOrigin) {
   throw new Error('Vercel deployment requires API_BASE_URL (an HTTP(S) origin, or explicit same-origin for a reverse proxy).');
 }
 
-// Include the API origin in the build identity so an environment-only change
-// still installs a coherent new PWA cache containing the matching runtime config.
+// Include source content and API origin in the build identity. This covers
+// Git-based deploys, manual deploys without a commit SHA, and env-only origin
+// changes, so a deployed worker cannot retain an older client shell.
 const commit = String(process.env.VERCEL_GIT_COMMIT_SHA || process.env.GITHUB_SHA || 'local').slice(0, 40);
-const buildId = createHash('sha256').update(`${commit}\n${apiBaseUrl}`).digest('hex').slice(0, 12);
 
 await rm(output, { recursive: true, force: true });
 await mkdir(output, { recursive: true });
@@ -99,6 +99,28 @@ await Promise.all(topLevelEntries
   .filter((entry) => !excludedTopLevel.has(entry.name) && !excludedFiles.has(entry.name) && !entry.name.startsWith('.env'))
   .map((entry) => cp(join(root, entry.name), join(output, entry.name), copyOptions)));
 
+async function hashTree(directory, hash) {
+  const entries = await readdir(directory, { withFileTypes: true });
+  entries.sort((left, right) => left.name.localeCompare(right.name));
+  for (const entry of entries) {
+    const path = join(directory, entry.name);
+    const name = relative(output, path).split(sep).join('/');
+    if (entry.isDirectory()) {
+      hash.update(`directory:${name}\n`);
+      await hashTree(path, hash);
+    } else if (entry.isFile()) {
+      hash.update(`file:${name}\n`);
+      hash.update(await readFile(path));
+    }
+  }
+}
+
+const sourceHash = createHash('sha256');
+await hashTree(output, sourceHash);
+const buildId = createHash('sha256')
+  .update(`${commit}\n${apiBaseUrl}\n${sourceHash.digest('hex')}`)
+  .digest('hex')
+  .slice(0, 12);
 const injectedConfig = JSON.stringify({ API_BASE_URL: apiBaseUrl });
 for (const name of [
   'index.html', 'login.html', 'chat.html', 'groups.html', 'members.html',

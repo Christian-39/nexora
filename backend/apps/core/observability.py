@@ -31,6 +31,7 @@ from contextvars import ContextVar
 #: has no ``request`` object, such as a service layer or a Channels consumer).
 _request_id: ContextVar[str] = ContextVar("nexora_request_id", default="-")
 _user_id: ContextVar[str] = ContextVar("nexora_user_id", default="-")
+_user_role: ContextVar[str] = ContextVar("nexora_user_role", default="-")
 _operation: ContextVar[str] = ContextVar("nexora_operation", default="-")
 
 
@@ -38,13 +39,15 @@ def new_request_id() -> str:
     return uuid.uuid4().hex[:32]
 
 
-def set_request_context(*, request_id: str | None = None, user_id=None, operation: str | None = None):
+def set_request_context(*, request_id: str | None = None, user_id=None, user_role=None, operation: str | None = None):
     """Bind correlation values for the current execution context."""
     tokens = {}
     if request_id is not None:
         tokens["request_id"] = _request_id.set(str(request_id)[:64] or "-")
     if user_id is not None:
         tokens["user_id"] = _user_id.set(str(user_id)[:64] or "-")
+    if user_role is not None:
+        tokens["user_role"] = _user_role.set(str(user_role)[:20] or "-")
     if operation is not None:
         tokens["operation"] = _operation.set(str(operation)[:120] or "-")
     return tokens
@@ -53,7 +56,7 @@ def set_request_context(*, request_id: str | None = None, user_id=None, operatio
 def reset_request_context(tokens) -> None:
     for name, token in (tokens or {}).items():
         try:
-            {"request_id": _request_id, "user_id": _user_id, "operation": _operation}[name].reset(token)
+            {"request_id": _request_id, "user_id": _user_id, "user_role": _user_role, "operation": _operation}[name].reset(token)
         except (KeyError, ValueError):  # pragma: no cover - defensive
             pass
 
@@ -64,6 +67,10 @@ def get_request_id() -> str:
 
 def get_user_id() -> str:
     return _user_id.get()
+
+
+def get_user_role() -> str:
+    return _user_role.get()
 
 
 def get_operation() -> str:
@@ -93,6 +100,8 @@ SECRET_MARKERS = (
     "credential",
     "session",
     "signature",
+    "signed_url",
+    "presigned_url",
     "database_url",
     "redis_url",
 )
@@ -102,8 +111,22 @@ REDACTED = "[redacted]"
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _URL_CREDENTIALS = re.compile(r"\b(redis|rediss|mysql)://[^@\s]+@", re.IGNORECASE)
 _KV_SECRET = re.compile(
-    r"\b(pin|current_pin|new_pin|confirm_pin|old_pin|password|passwd|secret|token|access_token|refresh_token|cookie|csrftoken|authorization)\b(\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,&;}\]]+)",
-    re.IGNORECASE,
+    r"""(?P<open_quote>['\"]?)\b
+       (?P<key>
+           (?:[A-Za-z0-9]+[_-])*
+           (?:
+               pin|current[_-]?pin|new[_-]?pin|confirm[_-]?pin|old[_-]?pin|
+               password|passwd|passphrase|secret|token|access[_-]?token|refresh[_-]?token|id[_-]?token|
+               authorization|cookie|set[_-]?cookie|csrf(?:[_-]?token|middlewaretoken)?|api[_-]?key|access[_-]?key|
+               private[_-]?key|credential(?:s)?|signature|signed[_-]?url|presigned[_-]?url|signed[_-]?uri|
+               database[_-]?url|redis[_-]?url|connection[_-]?string|dsn
+           )
+           (?:[_-][A-Za-z0-9]+)*
+       )\b(?P<close_quote>['\"]?)
+       (?P<separator>\s*[:=]\s*)
+       (?:\"[^\"]*\"|'[^']*'|[^\s,&;}\]]+)
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
 _BEARER_TOKEN = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]+", re.IGNORECASE)
 _JWT_TOKEN = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
@@ -129,7 +152,13 @@ def sanitize(value, *, limit: int = 500) -> str:
     text = text.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
     text = _CONTROL.sub("", text)
     text = _URL_CREDENTIALS.sub(r"\1://[redacted]@", text)
-    text = _KV_SECRET.sub(rf"\1\2{REDACTED}", text)
+    text = _KV_SECRET.sub(
+        lambda match: (
+            f"{match.group('open_quote')}{match.group('key')}"
+            f"{match.group('close_quote')}{match.group('separator')}{REDACTED}"
+        ),
+        text,
+    )
     text = _BEARER_TOKEN.sub(f"Bearer {REDACTED}", text)
     text = _JWT_TOKEN.sub(REDACTED, text)
     if len(text) > limit:
@@ -168,6 +197,7 @@ class RequestContextFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
         record.request_id = getattr(record, "request_id", None) or get_request_id()
         record.user_id = getattr(record, "user_id", None) or get_user_id()
+        record.user_role = getattr(record, "user_role", None) or get_user_role()
         record.operation = getattr(record, "operation", None) or get_operation()
         return True
 
@@ -199,9 +229,15 @@ class ProductionFormatter(logging.Formatter):
             record.request_id = get_request_id()
         if not hasattr(record, "user_id"):
             record.user_id = get_user_id()
+        if not hasattr(record, "user_role"):
+            record.user_role = get_user_role()
         if not hasattr(record, "operation"):
             record.operation = get_operation()
-        return super().format(record)
+        rendered = super().format(record)
+        # Scrub fully rendered records too, including exception text emitted by
+        # ``exc_info``. Preserve traceback line boundaries while preventing
+        # credential-shaped values and control characters from reaching logs.
+        return "\n".join(sanitize(line, limit=4000) for line in rendered.splitlines())
 
 
 # ---------------------------------------------------------------------------

@@ -146,7 +146,9 @@ describe('Mobile PWA chat layout, swipe-to-reply, and composer tray invariants',
 
   test('frontend/.env.example documents the public API_BASE_URL build variable', () => {
     const envExample = readFileSync(join(FRONTEND_DIR, '.env.example'), 'utf8');
-    assert.match(envExample, /^API_BASE_URL=$/m);
-    assert.doesNotMatch(envExample, /onrender\.com|vercel\.app|localhost|127\.0\.0\.1/i);
+    assert.match(envExample, /^API_BASE_URL=http:\/\/127\.0\.0\.1:8000$/m);
+    assert.match(envExample, /Vercel: set API_BASE_URL in Project/);
+    assert.match(envExample, /^# API_BASE_URL=same-origin$/m);
+    assert.doesNotMatch(envExample, /onrender\.com|vercel\.app/i);
   });
 });

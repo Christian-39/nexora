@@ -117,6 +117,12 @@ def _log(exc, context, status_code: int) -> None:
     operation = view.__class__.__name__ if view is not None else "-"
     method = getattr(request, "method", "-")
     path = sanitize(getattr(request, "path", "-"), limit=200)
+    user = getattr(request, "user", None)
+    authenticated = bool(getattr(user, "is_authenticated", False))
+    user_id = str(getattr(user, "id", "")) if authenticated else "-"
+    role = str(getattr(user, "role", "-")).upper() if authenticated else "-"
+    user_role = role if role in {"ADMIN", "MEMBER"} else "-"
+    log_context = {"user_id": user_id, "user_role": user_role, "request_id": get_request_id()}
 
     if status_code >= 500:
         logger.error(
@@ -128,6 +134,7 @@ def _log(exc, context, status_code: int) -> None:
             exc.__class__.__name__,
             sanitize(exc, limit=400),
             exc_info=exc,
+            extra=log_context,
         )
     elif status_code in (401, 403, 429):
         # Security-relevant but expected: no traceback, still searchable.
@@ -138,6 +145,7 @@ def _log(exc, context, status_code: int) -> None:
             operation,
             status_code,
             exc.__class__.__name__,
+            extra=log_context,
         )
     elif status_code >= 400:
         logger.info(
@@ -147,6 +155,7 @@ def _log(exc, context, status_code: int) -> None:
             operation,
             status_code,
             exc.__class__.__name__,
+            extra=log_context,
         )
 
 

@@ -75,6 +75,40 @@ def test_signature_detection(head, expected):
     assert signature_mime(head) == expected
 
 
+def test_webm_video_track_marker_after_512_bytes_is_not_misclassified_as_audio():
+    header = bytes([0x1A, 0x45, 0xDF, 0xA3]) + b"metadata" * 80 + b"V_VP9"
+    assert signature_mime(header) == "video/webm"
+
+
+@pytest.mark.django_db
+def test_browser_audio_mp4_is_accepted_only_when_probe_confirms_audio_only(monkeypatch):
+    from django.core.files.uploadedfile import SimpleUploadedFile
+    from rest_framework.exceptions import ValidationError
+
+    from apps.media import validators
+
+    mp4 = bytes([0, 0, 0, 24]) + b"ftypmp42" + bytes([0, 0, 0, 0]) + b"mp42isom" + bytes(32)
+    audio = SimpleUploadedFile("voice.m4a", mp4, content_type="audio/mp4;codecs=mp4a.40.2")
+    monkeypatch.setattr(
+        validators,
+        "_probe_media_info",
+        lambda _file: {"has_audio": True, "has_video": False, "duration_ms": 1200},
+    )
+    validated = validate_upload(audio, kind="VOICE")
+    assert validated.mime_type == "audio/mp4"
+    assert validated.extension == ".m4a"
+    assert validated.duration_ms == 1200
+
+    disguised_video = SimpleUploadedFile("voice.m4a", mp4, content_type="audio/mp4")
+    monkeypatch.setattr(
+        validators,
+        "_probe_media_info",
+        lambda _file: {"has_audio": True, "has_video": True, "duration_ms": 1200},
+    )
+    with pytest.raises(ValidationError):
+        validate_upload(disguised_video, kind="VOICE")
+
+
 def test_storage_keys_are_unguessable_and_traversal_proof():
     key = storage_key("media/originals", ".jpg")
     assert key.startswith("media/originals/")
@@ -285,8 +319,11 @@ def test_media_worker_retries_then_marks_failed(private_thread, member_a, monkey
 
 
 @pytest.mark.django_db
-def test_chunked_upload_session(private_thread, member_a):
+def test_chunked_upload_session(private_thread, member_a, monkeypatch):
     from django.core.files.uploadedfile import SimpleUploadedFile
+    from django.core.management import call_command
+
+    from apps.media.models import UploadSession
 
     client = authed(member_a)
     payload = jpeg_bytes(size=(64, 64)).getvalue()
@@ -306,6 +343,19 @@ def test_chunked_upload_session(private_thread, member_a):
     assert started.status_code == 201, started.data
     session_id = started.json()["data"]["id"]
 
+    session = UploadSession.objects.get(pk=session_id)
+    first_staging_key = session.staging_key
+    real_delete = default_storage.delete
+    failed_old_delete = {"value": False}
+
+    def fail_old_part_once(path):
+        if path == first_staging_key and not failed_old_delete["value"]:
+            failed_old_delete["value"] = True
+            raise OSError("temporary cleanup failure for a superseded part")
+        return real_delete(path)
+
+    monkeypatch.setattr(default_storage, "delete", fail_old_part_once)
+
     # Resuming with the same client_id must not create a second session.
     assert client.post(
         "/api/uploads/",
@@ -321,6 +371,18 @@ def test_chunked_upload_session(private_thread, member_a):
             format="multipart",
         )
         assert response.status_code == 200, response.data
+        if index == 0:
+            # The response may be lost after the part commit. Retrying the same
+            # index acknowledges it without appending its bytes a second time.
+            duplicate = client.put(
+                f"/api/uploads/{session_id}/part/?part=0",
+                {"chunk": SimpleUploadedFile("part", blob)},
+                format="multipart",
+            )
+            assert duplicate.status_code == 200, duplicate.data
+            assert duplicate.json()["data"]["next_part"] == 1
+            assert duplicate.json()["data"]["received_bytes"] == half
+            assert default_storage.exists(first_staging_key), "failed superseded-part cleanup must remain retryable"
 
     # Out-of-order parts are refused.
     assert client.put(
@@ -329,9 +391,141 @@ def test_chunked_upload_session(private_thread, member_a):
         format="multipart",
     ).status_code == 400
 
+    session = UploadSession.objects.get(pk=session_id)
+    current_staging_key = session.staging_key
+    original_delete = real_delete
+
+    def temporary_delete_failure(_key):
+        raise OSError("temporary object-storage outage")
+
+    monkeypatch.setattr(default_storage, "delete", temporary_delete_failure)
     completed = client.post(f"/api/uploads/{session_id}/complete/", {"caption": "big"}, format="json")
     assert completed.status_code in (200, 201), completed.data
     assert Attachment.objects.count() == 1
+    attachment_key = Attachment.objects.get().storage_key
+    session.refresh_from_db()
+    assert session.state == UploadSession.State.COMPLETED
+    assert session.staging_key
+    assert default_storage.exists(attachment_key)
+
+    # If the original completion response is lost, the same session returns
+    # the already-created message rather than a misleading 400 or a duplicate.
+    retried = client.post(f"/api/uploads/{session_id}/complete/", {"caption": "big"}, format="json")
+    assert retried.status_code == 200, retried.data
+    assert retried.json()["data"]["client_id"] == key
+    assert Attachment.objects.count() == 1
+
+    monkeypatch.setattr(default_storage, "delete", original_delete)
+    call_command("finalize_uploads", "--once")
+    session.refresh_from_db()
+    assert session.staging_key == ""
+    assert not default_storage.exists(first_staging_key), "finalizer retries cleanup for a superseded part"
+    assert not default_storage.exists(current_staging_key)
+    assert default_storage.exists(attachment_key), "staging cleanup must not delete the committed attachment"
+
+
+@pytest.mark.django_db
+def test_chunked_upload_does_not_acknowledge_a_missing_staging_object(private_thread, member_a):
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    from apps.media.models import UploadSession
+
+    client = authed(member_a)
+    payload = jpeg_bytes(size=(64, 64)).getvalue()
+    key = client_id()
+    started = client.post(
+        "/api/uploads/",
+        {
+            "kind": "IMAGE",
+            "client_id": key,
+            "size": len(payload),
+            "name": "image.jpg",
+            "conversation": str(private_thread.id),
+        },
+        format="json",
+    )
+    assert started.status_code == 201, started.data
+    session = UploadSession.objects.get(pk=started.json()["data"]["id"])
+    default_storage.delete(session.staging_key)
+
+    response = client.put(
+        f"/api/uploads/{session.id}/part/?part=0",
+        {"chunk": SimpleUploadedFile("part", payload)},
+        format="multipart",
+    )
+
+    assert response.status_code == 400
+    session.refresh_from_db()
+    assert session.next_part == 0
+    assert session.received_bytes == 0
+
+
+@pytest.mark.django_db
+def test_upload_finalizer_expires_sessions_and_retries_staging_cleanup(member_a, private_thread, settings, monkeypatch):
+    from django.core.files.base import ContentFile
+    from django.core.management import call_command
+    from django.utils import timezone
+
+    from apps.media.models import UploadSession
+    from apps.media.validators import storage_key
+
+    settings.MEDIA_PROCESS_INLINE = False
+    expired_key = storage_key("media/staging", ".part")
+    completed_key = storage_key("media/staging", ".part")
+    default_storage.save(expired_key, ContentFile(b"partial"))
+    default_storage.save(completed_key, ContentFile(b"leftover"))
+    expired = UploadSession.objects.create(
+        user=member_a,
+        conversation=private_thread,
+        kind="IMAGE",
+        client_id=client_id(),
+        declared_name="partial.jpg",
+        declared_size=100,
+        part_size=5 * 1024 * 1024,
+        received_bytes=7,
+        staging_key=expired_key,
+        expires_at=timezone.now() - timezone.timedelta(seconds=1),
+    )
+    completed = UploadSession.objects.create(
+        user=member_a,
+        conversation=private_thread,
+        kind="IMAGE",
+        client_id=client_id(),
+        declared_name="complete.jpg",
+        declared_size=8,
+        part_size=5 * 1024 * 1024,
+        received_bytes=8,
+        staging_key=completed_key,
+        state=UploadSession.State.COMPLETED,
+        expires_at=timezone.now() + timezone.timedelta(hours=1),
+    )
+
+    real_delete = default_storage.delete
+    failed_once = {"value": False}
+
+    def flaky_delete(key):
+        if key == expired_key and not failed_once["value"]:
+            failed_once["value"] = True
+            raise OSError("temporary storage cleanup failure")
+        return real_delete(key)
+
+    monkeypatch.setattr(default_storage, "delete", flaky_delete)
+    call_command("finalize_uploads", "--once")
+
+    expired.refresh_from_db()
+    completed.refresh_from_db()
+    assert expired.state == UploadSession.State.ABORTED
+    assert expired.staging_key == expired_key
+    assert default_storage.exists(expired_key), "failed delete remains linked for a later retry"
+    assert completed.state == UploadSession.State.COMPLETED
+    assert completed.staging_key == ""
+    assert not default_storage.exists(completed_key)
+
+    monkeypatch.setattr(default_storage, "delete", real_delete)
+    call_command("finalize_uploads", "--once")
+    expired.refresh_from_db()
+    assert expired.staging_key == ""
+    assert not default_storage.exists(expired_key)
 
 
 @pytest.mark.django_db

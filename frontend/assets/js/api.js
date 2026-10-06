@@ -137,14 +137,20 @@ export class ApiError extends Error {
    * @param {number} init.status   HTTP status (0 for transport failures)
    * @param {string} init.code     machine code, e.g. PERMISSION_DENIED
    * @param {object} init.errors   field errors keyed by field name
+   * @param {string|null} init.method HTTP method, when known
+   * @param {string|null} init.endpoint URL origin + path only (no query string)
+   * @param {string|null} init.host request host, when known
    */
-  constructor({ message, status = 0, code = 'ERROR', errors = {}, retryAfter = null, cause = null }) {
+  constructor({ message, status = 0, code = 'ERROR', errors = {}, retryAfter = null, cause = null, method = null, endpoint = null, host = null }) {
     super(message || 'Something went wrong.');
     this.name = 'ApiError';
     this.status = status;
     this.code = code;
     this.errors = errors || {};
     this.retryAfter = retryAfter;
+    this.method = method;
+    this.endpoint = endpoint;
+    this.host = host;
     if (cause) this.cause = cause;
   }
 
@@ -155,6 +161,7 @@ export class ApiError extends Error {
   get isAuth() { return this.status === 401; }
   get isForbidden() { return this.status === 403; }
   get isNotFound() { return this.status === 404; }
+  get isMethodNotAllowed() { return this.status === 405; }
   get isConflict() { return this.status === 409; }
   get isValidation() { return this.status === 400 || this.status === 422; }
   get isRateLimited() { return this.status === 429; }
@@ -176,6 +183,7 @@ const STATUS_MESSAGES = {
   401: 'Your session has ended. Please sign in again.',
   403: 'You are not authorized to perform this action.',
   404: 'That item could not be found.',
+  405: 'The API route rejected this HTTP method. Check API_BASE_URL and the route configuration.',
   409: 'This action conflicts with the current state. Refresh and try again.',
   413: 'That file is larger than the allowed limit.',
   415: 'That file type is not supported.',
@@ -286,19 +294,48 @@ async function parseBody(response) {
   }
 }
 
-function toApiError(status, payload, headers) {
+function toApiError(status, payload, headers, context = {}) {
   const retryAfterRaw = headers?.get?.('retry-after');
   const retryAfter = retryAfterRaw ? Number(retryAfterRaw) : null;
   const code =
     (payload && typeof payload === 'object' && typeof payload.code === 'string' && payload.code) ||
     `HTTP_${status}`;
+  let parsedUrl = null;
+  try {
+    if (context.url) parsedUrl = new URL(context.url, window.location.origin);
+  } catch { /* keep the safe status fallback */ }
+  const endpoint = parsedUrl ? `${parsedUrl.origin}${parsedUrl.pathname}` : null;
+  const method = String(context.method || '').toUpperCase() || null;
+  const host = parsedUrl?.host || null;
+  let message = extractMessage(payload, status);
+
+  if (status === 405) {
+    if (parsedUrl && parsedUrl.origin === window.location.origin && !API_ORIGIN) {
+      message = `The same-origin host (${host}) rejected ${method || 'the request'} ${parsedUrl.pathname}. If this host only serves the frontend, set API_BASE_URL to the Django API origin; otherwise configure a POST-capable /api proxy.`;
+    } else if (parsedUrl) {
+      message = `The API host (${host}) rejected ${method || 'the request'} ${parsedUrl.pathname}. Verify API_BASE_URL and that this route supports the requested method.`;
+    } else {
+      message = STATUS_MESSAGES[405];
+    }
+  }
+
   return new ApiError({
-    message: extractMessage(payload, status),
+    message,
     status,
     code,
     errors: extractErrors(payload),
     retryAfter: Number.isFinite(retryAfter) ? retryAfter : null,
+    method,
+    endpoint,
+    host,
   });
+}
+
+function isCsrfFailure(payload) {
+  const details = payload && typeof payload === 'object'
+    ? [payload.code, payload.message, payload.detail]
+    : [payload];
+  return details.some((value) => /csrf|cross[- ]site request forgery/i.test(String(value || '')));
 }
 
 /* ============================================================
@@ -553,6 +590,7 @@ async function executeRequest(path, options = {}) {
 
   let attempt = 0;
   let refreshed = false;
+  let csrfRetried = false;
 
   for (;;) {
     attempt += 1;
@@ -614,7 +652,10 @@ async function executeRequest(path, options = {}) {
     cleanup();
 
     if (response.ok) {
-      if (auth) resetAuthenticationFailures();
+      // A successful login is the explicit recovery path after a definitive
+      // anonymous-state latch, even though login itself must not carry the old
+      // bearer token. Failed login attempts never clear that session state.
+      if (auth || isLoginPath(path)) resetAuthenticationFailures();
       const payload = await parseBody(response);
       const data = unwrap(payload);
       if (raw) {
@@ -631,7 +672,17 @@ async function executeRequest(path, options = {}) {
 
     // --- error path ---
     const payload = await parseBody(response);
-    const error = toApiError(response.status, payload, response.headers);
+    const error = toApiError(response.status, payload, response.headers, { url, method: verb });
+
+    // A CSRF-specific 403 is safe to retry once: Django refuses the request
+    // before the view runs, and the JSON bootstrap returns the current token.
+    // Ordinary permission denials are never retried.
+    if (response.status === 403 && !csrfRetried && !SAFE_METHODS.has(verb) && isCsrfFailure(payload)) {
+      csrfToken = null;
+      csrfRetried = true;
+      await ensureCsrfToken();
+      continue;
+    }
 
     if (response.status === 401 && auth && allowRefresh && !refreshed && !isAuthPath(path)) {
       refreshed = true;
@@ -653,7 +704,9 @@ async function executeRequest(path, options = {}) {
     }
 
     if (response.status === 401) {
-      if (auth) tokenStore.clear();
+      // A rejected sign-in is an application credential failure, not evidence
+      // that any already-authenticated session in this tab is invalid.
+      if (auth && !isAuthPath(path)) tokenStore.clear();
       if (auth && !isAuthPath(path)) apiEvents.emit('unauthorized', error);
       throw error;
     }
@@ -676,6 +729,10 @@ async function executeRequest(path, options = {}) {
 
     throw error;
   }
+}
+
+function isLoginPath(path) {
+  return /(?:^|\/)(?:api\/)?auth\/login\/?$/.test(String(path));
 }
 
 function isAuthPath(path) {
@@ -701,39 +758,36 @@ export const del = (path, options = {}) => request(path, { ...options, method: '
  * @param {AbortSignal} [options.signal]
  * @returns {Promise<any>}
  */
-export function upload(path, formData, options = {}) {
-  const { onProgress, signal, timeout = DEFAULTS.uploadTimeout, method = 'POST' } = options;
-
-  return ensureCsrfToken().then(() => new Promise((resolve, reject) => {
+function xhrUploadAttempt(url, formData, { onProgress, signal, timeout, method, auth }) {
+  return new Promise((resolve, reject) => {
     if (navigator.onLine === false) {
+      apiEvents.emit('offline');
       reject(new ApiError({ message: "You're offline. The upload will need to be retried.", code: 'OFFLINE', status: 0 }));
+      return;
+    }
+    if (signal?.aborted) {
+      reject(new ApiError({ message: 'Upload cancelled.', code: 'ABORTED', status: 0 }));
       return;
     }
 
     const xhr = new XMLHttpRequest();
-    xhr.open(method, buildUrl(path), true);
+    xhr.open(method, url, true);
     xhr.withCredentials = true;
     xhr.responseType = 'text';
     if (timeout > 0) xhr.timeout = timeout;
 
-    for (const [key, value] of Object.entries(authHeaders(method))) {
+    for (const [key, value] of Object.entries(authHeaders(method, {}, { auth }))) {
       // Content-Type intentionally omitted: XHR sets the multipart boundary.
       xhr.setRequestHeader(key, value);
     }
 
     const abortHandler = () => xhr.abort();
-    if (signal) {
-      if (signal.aborted) {
-        reject(new ApiError({ message: 'Upload cancelled.', code: 'ABORTED', status: 0 }));
-        return;
-      }
-      signal.addEventListener('abort', abortHandler, { once: true });
-    }
+    signal?.addEventListener('abort', abortHandler, { once: true });
     const cleanup = () => signal?.removeEventListener('abort', abortHandler);
 
     if (onProgress && xhr.upload) {
       xhr.upload.addEventListener('progress', (event) => {
-        if (!event.lengthComputable) return;
+        if (!event.lengthComputable || !event.total) return;
         onProgress({
           loaded: event.loaded,
           total: event.total,
@@ -746,31 +800,28 @@ export function upload(path, formData, options = {}) {
       cleanup();
       let payload = null;
       try { payload = xhr.responseText ? JSON.parse(xhr.responseText) : null; } catch { payload = xhr.responseText || null; }
-      if (xhr.status >= 200 && xhr.status < 300) {
-        onProgress?.({ loaded: 1, total: 1, percent: 100 });
-        resolve(unwrap(payload));
-      } else {
-        const error = toApiError(xhr.status, payload, {
-          get: (h) => xhr.getResponseHeader(h),
-        });
-        if (xhr.status === 401) { tokenStore.clear(); apiEvents.emit('unauthorized', error); }
-        if (xhr.status === 403) apiEvents.emit('forbidden', error);
-        reject(error);
-      }
+      resolve({
+        status: xhr.status,
+        payload,
+        url: xhr.responseURL || url,
+        headers: { get: (name) => xhr.getResponseHeader(name) },
+      });
     });
 
     xhr.addEventListener('error', () => {
       cleanup();
+      const offline = navigator.onLine === false;
+      if (offline) apiEvents.emit('offline');
       reject(new ApiError({
-        message: 'The upload failed because the connection was interrupted.',
-        code: 'NETWORK_ERROR',
+        message: offline ? "You're offline. Reconnect to retry this upload." : 'The upload failed because the connection was interrupted.',
+        code: offline ? 'OFFLINE' : 'NETWORK_ERROR',
         status: 0,
       }));
     });
 
     xhr.addEventListener('timeout', () => {
       cleanup();
-      reject(new ApiError({ message: 'The upload timed out.', code: 'TIMEOUT', status: 0 }));
+      reject(new ApiError({ message: 'The upload timed out. Its server-side result may still be confirmed by retrying.', code: 'TIMEOUT', status: 0 }));
     });
 
     xhr.addEventListener('abort', () => {
@@ -779,7 +830,83 @@ export function upload(path, formData, options = {}) {
     });
 
     xhr.send(formData);
-  }));
+  });
+}
+
+export async function upload(path, formData, options = {}) {
+  const {
+    onProgress,
+    signal,
+    timeout = DEFAULTS.uploadTimeout,
+    method = 'POST',
+    auth = true,
+    allowRefresh = true,
+  } = options;
+  const verb = String(method).toUpperCase();
+  const url = buildUrl(path);
+
+  if (!SAFE_METHODS.has(verb)) await ensureCsrfToken();
+
+  let refreshed = false;
+  let csrfRetried = false;
+  for (;;) {
+    const result = await xhrUploadAttempt(url, formData, {
+      onProgress, signal, timeout, method: verb, auth,
+    });
+    if (result.status >= 200 && result.status < 300) {
+      if (auth) resetAuthenticationFailures();
+      onProgress?.({ loaded: 1, total: 1, percent: 100 });
+      return unwrap(result.payload);
+    }
+
+    const error = toApiError(result.status, result.payload, result.headers, {
+      url: result.url,
+      method: verb,
+    });
+
+    // As in fetch(), only a CSRF-specific 403 is replayed, and only once.
+    // CSRF validation happens before the upload view stages or commits bytes.
+    if (result.status === 403 && !csrfRetried && !SAFE_METHODS.has(verb) && isCsrfFailure(result.payload)) {
+      csrfToken = null;
+      csrfRetried = true;
+      await ensureCsrfToken();
+      continue;
+    }
+
+    // Upload requests use the same single-flight refresh as ordinary API
+    // requests. A 401 occurs before message creation; the existing client_id
+    // remains stable if the browser needs an explicit user retry later.
+    if (result.status === 401 && auth && allowRefresh && !refreshed && !isAuthPath(path)) {
+      refreshed = true;
+      const refreshResult = await tryRefreshSession();
+      if (refreshResult.ok) continue;
+      if (refreshResult.reason === 'unreachable') {
+        throw new ApiError({
+          message: 'Your session could not be verified because the service is temporarily unreachable. Please retry.',
+          code: 'AUTH_REFRESH_UNAVAILABLE',
+          status: 0,
+          cause: error,
+        });
+      }
+      tokenStore.clear();
+      apiEvents.emit('unauthorized', error);
+      throw error;
+    }
+
+    if (result.status === 401) {
+      if (auth && !isAuthPath(path)) {
+        tokenStore.clear();
+        apiEvents.emit('unauthorized', error);
+      }
+      throw error;
+    }
+    if (result.status === 403) {
+      apiEvents.emit('forbidden', error);
+      throw error;
+    }
+    if (result.status === 429) apiEvents.emit('ratelimit', error);
+    throw error;
+  }
 }
 
 /* ============================================================
@@ -834,7 +961,7 @@ export const api = {
   /* ---- auth ---- */
   auth: {
     login: (identifier, pin, options) =>
-      post('/api/auth/login/', { identifier, phone: identifier, pin }, { timeout: 20000, ...options, allowRefresh: false, retries: 0 }),
+      post('/api/auth/login/', { identifier, phone: identifier, pin }, { timeout: 20000, ...options, auth: false, allowRefresh: false, retries: 0 }),
     logout: (options) => post('/api/auth/logout/', {}, { timeout: 10000, ...options, allowRefresh: false, retries: 0 }),
     refresh: (options) => post('/api/auth/refresh/', {}, { timeout: 15000, ...options, allowRefresh: false, retries: 0 }),
     changePin: (payload, options) => post('/api/auth/change-pin/', payload, { timeout: 15000, ...options, retries: 0 }),

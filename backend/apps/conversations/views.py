@@ -10,6 +10,7 @@ never reach a client.
 from __future__ import annotations
 
 import logging
+import time
 
 from django.db import models, transaction
 from django.db.models import Count, OuterRef, Prefetch, Q, Subquery
@@ -22,6 +23,7 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 
 from apps.accounts.models import User
+from apps.core.observability import sanitize
 from apps.core.throttles import MessageThrottle, SearchThrottle, UploadThrottle
 
 from . import realtime
@@ -309,9 +311,14 @@ def create_message_from_stored_upload(
     poster=None,
     declared_duration=None,
 ):
+    operation_started = time.perf_counter()
     from apps.media.services import create_attachment, stage_upload
     from apps.media.validators import validate_upload
 
+    log_context = {
+        "user_id": str(getattr(request.user, "id", "-")),
+        "user_role": str(getattr(request.user, "role", "-")).upper(),
+    }
     client_id = str(client_id or "").strip()
     if not client_id:
         raise ValidationError({"client_id": "A client_id is required for idempotent uploads."})
@@ -328,7 +335,9 @@ def create_message_from_stored_upload(
     except (TypeError, ValueError):
         duration_ms = None
 
+    validation_started = time.perf_counter()
     validated = validate_upload(fileobj, kind=kind, declared_name=declared_name, duration_ms=duration_ms)
+    validation_ms = int((time.perf_counter() - validation_started) * 1000)
 
     reply_to = None
     if reply_to_id:
@@ -340,14 +349,42 @@ def create_message_from_stored_upload(
     # large PUT can take tens of seconds; doing it inside the transaction
     # pinned a pooled MySQL connection and its locks for the whole transfer.
     upload_log.info(
-        "upload staging kind=%s size=%s mime=%s conversation=%s",
+        "upload stage started kind=%s size=%s mime=%s conversation=%s validation_ms=%s storage_op=put",
         kind,
         validated.size,
         validated.mime_type,
         conversation.id,
+        validation_ms,
+        extra=log_context,
     )
-    staged = stage_upload(fileobj, validated, poster=poster)
+    storage_started = time.perf_counter()
+    try:
+        staged = stage_upload(fileobj, validated, poster=poster)
+    except Exception as exc:
+        storage_ms = int((time.perf_counter() - storage_started) * 1000)
+        upload_log.error(
+            "upload storage stage failed kind=%s size=%s conversation=%s storage_op=put validation_ms=%s storage_ms=%s exception=%s message=%s",
+            kind,
+            validated.size,
+            conversation.id,
+            validation_ms,
+            storage_ms,
+            exc.__class__.__name__,
+            sanitize(exc, limit=300),
+            extra=log_context,
+        )
+        raise
+    storage_ms = int((time.perf_counter() - storage_started) * 1000)
+    upload_log.info(
+        "upload storage stage complete kind=%s size=%s conversation=%s storage_ms=%s",
+        kind,
+        validated.size,
+        conversation.id,
+        storage_ms,
+        extra=log_context,
+    )
 
+    database_started = time.perf_counter()
     try:
         with transaction.atomic():
             message, created = send_message(
@@ -361,6 +398,7 @@ def create_message_from_stored_upload(
             if created:
                 create_attachment(message=message, validated=validated, staged=staged)
                 caption_for(message, caption)
+        database_ms = int((time.perf_counter() - database_started) * 1000)
         if not created:
             # Lost an idempotency race: the staged object is unreferenced.
             staged.discard()
@@ -368,23 +406,50 @@ def create_message_from_stored_upload(
         # Never leave an object behind that no row points at, and never let
         # the client believe a failed send succeeded.
         staged.discard()
+        database_ms = int((time.perf_counter() - database_started) * 1000)
         upload_log.error(
-            "upload failed after staging kind=%s size=%s conversation=%s (%s: %s)",
+            "upload database commit failed kind=%s size=%s conversation=%s storage_op=database validation_ms=%s storage_ms=%s database_ms=%s exception=%s message=%s",
             kind,
             validated.size,
             conversation.id,
+            validation_ms,
+            storage_ms,
+            database_ms,
             exc.__class__.__name__,
-            exc,
+            sanitize(exc, limit=300),
+            extra=log_context,
         )
         raise
 
+    reload_started = time.perf_counter()
     message = _reload(message)
-    upload_log.info("upload committed message=%s kind=%s size=%s", message.id, kind, validated.size)
+    reload_ms = int((time.perf_counter() - reload_started) * 1000)
+    realtime_started = time.perf_counter()
     if created:
         realtime.broadcast_new_message(message, request=request, recipient_ids=recipients_of(message))
+    realtime_ms = int((time.perf_counter() - realtime_started) * 1000)
+    serialize_started = time.perf_counter()
+    serialized = MessageSerializer(message, context={"request": request}).data
+    serialize_ms = int((time.perf_counter() - serialize_started) * 1000)
+    total_ms = int((time.perf_counter() - operation_started) * 1000)
+    upload_log.info(
+        "upload complete message=%s kind=%s size=%s conversation=%s validation_ms=%s storage_ms=%s database_ms=%s reload_ms=%s realtime_ms=%s serialize_ms=%s total_ms=%s",
+        message.id,
+        kind,
+        validated.size,
+        conversation.id,
+        validation_ms,
+        storage_ms,
+        database_ms,
+        reload_ms,
+        realtime_ms,
+        serialize_ms,
+        total_ms,
+        extra=log_context,
+    )
     return envelope(
         "Message sent",
-        MessageSerializer(message, context={"request": request}).data,
+        serialized,
         status=201 if created else 200,
     )
 

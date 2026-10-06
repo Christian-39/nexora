@@ -7,6 +7,8 @@ const login = await readFile(new URL('../login.html', import.meta.url), 'utf8');
 const auth = await readFile(new URL('../assets/js/auth.js', import.meta.url), 'utf8');
 const chatCss = await readFile(new URL('../assets/css/chat.css', import.meta.url), 'utf8');
 const mainCss = await readFile(new URL('../assets/css/main.css', import.meta.url), 'utf8');
+const build = await readFile(new URL('../build.mjs', import.meta.url), 'utf8');
+const push = await readFile(new URL('../assets/js/push.js', import.meta.url), 'utf8');
 
 
 test('installed shell navigation and code are served cache-first', () => {
@@ -41,6 +43,18 @@ test('login installs the shell and sixth PIN digit requests submit', () => {
 
 test('successful login consumes the profile returned by login without mandatory me request', () => {
   assert.match(auth, /payload\?\.id \? payload : null/);
+});
+
+
+test('deployment fingerprints client source and offers an explicit safe service-worker activation path', () => {
+  assert.match(build, /async function hashTree/);
+  assert.match(build, /sourceHash\.digest\('hex'\)/);
+  assert.match(build, /apiBaseUrl/);
+  assert.match(push, /updateViaCache:\s*'none'/);
+  assert.match(push, /reg\.waiting.*promptUpdate/s);
+  assert.match(push, /NEXORA_SKIP_WAITING/);
+  assert.match(push, /worker\.postMessage\(\{ type: 'NEXORA_SKIP_WAITING' \}\)/);
+  assert.match(push, /controllerchange/);
 });
 
 

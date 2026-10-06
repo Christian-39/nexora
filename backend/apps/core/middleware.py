@@ -27,7 +27,7 @@ import logging
 import time
 
 from django.conf import settings
-from django.db import DatabaseError, IntegrityError, OperationalError
+from django.db import DatabaseError, IntegrityError, OperationalError, connection
 
 from .observability import (
     get_request_id,
@@ -66,6 +66,7 @@ class RequestIDMiddleware:
         tokens = set_request_context(
             request_id=request_id,
             user_id="-",
+            user_role="-",
             operation=f"{request.method} {request.path}",
         )
         try:
@@ -77,22 +78,42 @@ class RequestIDMiddleware:
 
 
 class RequestLogMiddleware:
-    """One structured line per slow / failed request."""
+    """One structured line per slow / failed request, with safe DB timings."""
 
     def __init__(self, get_response):
         self.get_response = get_response
         self.slow_ms = int(getattr(settings, "SLOW_REQUEST_MS", SLOW_REQUEST_MS_DEFAULT))
+        self.slow_query_ms = int(getattr(settings, "SLOW_QUERY_MS", 500))
 
     def __call__(self, request):
         started = time.perf_counter()
-        response = self.get_response(request)
+        db = {"queries": 0, "ms": 0.0, "slow": 0, "slowest_ms": 0.0}
+
+        # Count/time SQL without capturing SQL or parameters (which could
+        # contain message bodies or other private data). Connection.execute_wrapper
+        # is request-scoped and adds only a small timer around each DB call.
+        def measure_query(execute, sql, params, many, context):
+            query_started = time.perf_counter()
+            try:
+                return execute(sql, params, many, context)
+            finally:
+                elapsed = (time.perf_counter() - query_started) * 1000
+                db["queries"] += 1
+                db["ms"] += elapsed
+                db["slowest_ms"] = max(db["slowest_ms"], elapsed)
+                if elapsed >= self.slow_query_ms:
+                    db["slow"] += 1
+
+        with connection.execute_wrapper(measure_query):
+            response = self.get_response(request)
         duration_ms = int((time.perf_counter() - started) * 1000)
 
-        # The authenticated user is only known after the view ran.
+        # DRF authentication populates request.user during the view.
         user = getattr(request, "user", None)
-        user_id = str(getattr(user, "id", "")) if getattr(user, "is_authenticated", False) else "-"
-        set_request_context(user_id=user_id)
-
+        authenticated = bool(getattr(user, "is_authenticated", False))
+        user_id = str(getattr(user, "id", "")) if authenticated else "-"
+        role = str(getattr(user, "role", "-")).upper() if authenticated else "-"
+        user_role = role if role in {"ADMIN", "MEMBER"} else "-"
         status = getattr(response, "status_code", 0)
         slow = duration_ms >= self.slow_ms
 
@@ -103,16 +124,25 @@ class RequestLogMiddleware:
         else:
             return response
 
-        logger.log(
-            level,
-            "%s %s -> %s in %dms%s",
-            request.method,
-            sanitize(request.get_full_path(), limit=300),
-            status,
-            duration_ms,
-            " [SLOW]" if slow else "",
-            extra={"user_id": user_id},
-        )
+        context_tokens = set_request_context(user_id=user_id, user_role=user_role)
+        try:
+            logger.log(
+                level,
+                "%s %s -> %s in %dms role=%s db_queries=%d db_ms=%d db_slow=%d db_slowest_ms=%d%s",
+                request.method,
+                sanitize(getattr(request, "path", "/"), limit=300),
+                status,
+                duration_ms,
+                user_role,
+                db["queries"],
+                round(db["ms"]),
+                db["slow"],
+                round(db["slowest_ms"]),
+                " [SLOW]" if slow else "",
+                extra={"user_id": user_id, "user_role": user_role},
+            )
+        finally:
+            reset_request_context(context_tokens)
         return response
 
 
@@ -131,7 +161,10 @@ class ExceptionLogMiddleware:
         setattr(exception, LOGGED_ATTR, True)
 
         user = getattr(request, "user", None)
-        user_id = str(getattr(user, "id", "")) if getattr(user, "is_authenticated", False) else "-"
+        authenticated = bool(getattr(user, "is_authenticated", False))
+        user_id = str(getattr(user, "id", "")) if authenticated else "-"
+        role = str(getattr(user, "role", "-")).upper() if authenticated else "-"
+        user_role = role if role in {"ADMIN", "MEMBER"} else "-"
 
         if isinstance(exception, IntegrityError):
             category = "database integrity failure"
@@ -146,10 +179,10 @@ class ExceptionLogMiddleware:
             "%s during %s %s: %s: %s",
             category,
             request.method,
-            sanitize(request.get_full_path(), limit=300),
+            sanitize(getattr(request, "path", "/"), limit=300),
             exception.__class__.__name__,
             sanitize(exception, limit=400),
             exc_info=exception,
-            extra={"user_id": user_id, "request_id": get_request_id()},
+            extra={"user_id": user_id, "user_role": user_role, "request_id": get_request_id()},
         )
         return None  # let Django/DRF produce the actual response

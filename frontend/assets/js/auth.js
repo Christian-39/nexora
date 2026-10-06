@@ -73,6 +73,7 @@ let knownAnonymous = readKnownAnonymous();
 let currentUser = knownAnonymous ? null : readCachedProfile();
 if (knownAnonymous) writeCachedProfile(null);
 let bootstrapPromise = null;
+let authRevision = 0;
 let signingOut = false;
 /**
  * True when the most recent bootstrap could NOT verify the session because the
@@ -163,11 +164,17 @@ export function bootstrap(options = {}) {
 
   // One network revalidation at a time, shared by every caller.
   const network = bootstrapPromise || (bootstrapPromise = (async () => {
+    const revision = authRevision;
     try {
-      const me = await api.me.get({ retries: 1, timeout: 12000 });
+      const me = await api.me.get({ retries: 1, timeout: 12000, signal: options.signal });
+      // A late session probe must never overwrite a login/logout that completed
+      // while its request was in flight.
+      if (revision !== authRevision) return currentUser;
       sessionUnverified = false;
       return setUser(me);
     } catch (error) {
+      if (revision !== authRevision) return currentUser;
+      if (error instanceof ApiError && error.isAborted) return currentUser;
       if (error instanceof ApiError && error.isAuth) {
         // A 401 after one shared refresh attempt is a confirmed anonymous
         // state. Persist only that presentation state, never a credential.
@@ -231,10 +238,11 @@ export async function requireSession(options = {}) {
 }
 
 /** Redirect an already-authenticated user away from the login page. */
-export async function redirectIfAuthenticated() {
+export async function redirectIfAuthenticated(options = {}) {
   // The login page must not bounce a signed-out user away on the basis of a
   // stale snapshot — require the authoritative network answer here.
-  const user = await bootstrap({ fresh: true });
+  const user = await bootstrap({ fresh: true, signal: options.signal });
+  if (options.signal?.aborted) return false;
   if (user && !mustChangeCredential()) {
     window.location.replace(landingPage());
     return true;
@@ -281,6 +289,7 @@ export function redirectToLogin(reason) {
  * @returns {Promise<{user:object, mustChangePin:boolean}>}
  */
 export async function login(identifier, pin) {
+  authRevision += 1;
   const payload = await api.auth.login(String(identifier).trim(), String(pin));
   resetAuthenticationFailures();
   // Bearer deployments return a short-lived access token; keep it in memory only.
@@ -304,6 +313,7 @@ export async function login(identifier, pin) {
  * @param {{currentPin?:string,newPin?:string,confirmPin?:string,current_pin?:string,new_pin?:string,confirm_pin?:string}} input
  */
 export async function changePin(input = {}) {
+  authRevision += 1;
   const currentPin = input.currentPin ?? input.current_pin ?? null;
   const newPin = input.newPin ?? input.new_pin ?? '';
   const confirmPin = input.confirmPin ?? input.confirm_pin ?? '';
@@ -324,6 +334,7 @@ export async function changePin(input = {}) {
 export async function logout({ silent = false } = {}) {
   if (signingOut) return;
   signingOut = true;
+  authRevision += 1;
   // Kill the realtime transport first: timers, heartbeat, queued events and
   // reconnection all stop before the credential is invalidated, so a logout
   // can never leave a socket retrying against a dead session.

@@ -23,6 +23,9 @@ graceful_timeout = 30
 keepalive = 5
 
 accesslog = "-"
+# Do not log %(r)s: Gunicorn's default request line includes the query string,
+# which may contain private search terms. %(U)s is the path without parameters.
+access_log_format = '%(t)s %(h)s "%(m)s %(U)s" %(s)s %(L)s'
 errorlog = "-"
 capture_output = True
 

@@ -118,8 +118,10 @@ def signature_mime(head: bytes) -> str | None:
     for offset, magic, mime in _SIGNATURES:
         if head[offset : offset + len(magic)] == magic:
             if mime == "video/webm":
-                # Matroska carries both audio-only and video WebM.
-                return "video/webm" if b"V_" in head[:512] else "audio/webm"
+                # Matroska carries both audio-only and video WebM. Track codec
+                # IDs can appear after the EBML/segment metadata, so inspect
+                # the full bounded header read rather than only the first 512 B.
+                return "video/webm" if b"V_" in head else "audio/webm"
             return mime
 
     if head[:4] == b"RIFF":
@@ -240,11 +242,55 @@ def validate_upload(fileobj, *, kind: str, declared_name: str = "", duration_ms:
         raise ValidationError("That file type is not permitted.")
 
     mime = sniff(fileobj)
+    extension = os.path.splitext(str(declared_name or getattr(fileobj, "name", "")))[1].lower()
+    declared_mime = str(getattr(fileobj, "content_type", "") or "").split(";", 1)[0].strip().lower()
+    if not extension:
+        extension = ""
+
+    probe_info = None
+    media_containers = set(VIDEO_TYPES) | set(AUDIO_TYPES)
+    if kind in ("VIDEO", "VOICE") and mime in media_containers:
+        probe_info = _probe_media_info(fileobj)
+
+        # ISO-BMFF's generic brands (isom/mp42) do not distinguish audio-only
+        # Safari recordings from video at the magic-byte level. Accept a voice
+        # MP4 only when the browser's MIME/filename are audio hints AND ffprobe
+        # independently confirms an audio-only stream.
+        if (
+            kind == "VOICE"
+            and mime in {"video/mp4", "video/quicktime"}
+            and declared_mime == "audio/mp4"
+            and extension in AUDIO_TYPES["audio/mp4"]
+            and probe_info
+            and probe_info["has_audio"]
+            and not probe_info["has_video"]
+        ):
+            mime = "audio/mp4"
+
+        # WebM's EBML header can place track codec IDs beyond the fixed magic
+        # bytes. If ffprobe confirms the stream kind, correct only this
+        # ambiguous audio/video classification; the extension and allow-list
+        # are still checked below.
+        if kind == "VIDEO" and mime == "audio/webm" and probe_info and probe_info["has_video"]:
+            mime = "video/webm"
+        elif (
+            kind == "VOICE"
+            and mime == "video/webm"
+            and probe_info
+            and probe_info["has_audio"]
+            and not probe_info["has_video"]
+        ):
+            mime = "audio/webm"
+
+        if probe_info and kind == "VIDEO" and not probe_info["has_video"]:
+            raise ValidationError("The file does not contain a video stream.")
+        if probe_info and kind == "VOICE" and (not probe_info["has_audio"] or probe_info["has_video"]):
+            raise ValidationError("A voice note must contain an audio-only stream.")
+
     allowed = KIND_TYPES[kind]
     if mime not in allowed:
         raise ValidationError("The file content does not match a supported format.")
 
-    extension = os.path.splitext(str(declared_name or getattr(fileobj, "name", "")))[1].lower()
     if not extension:
         extension = allowed[mime][0]
     if extension not in allowed[mime]:
@@ -255,7 +301,8 @@ def validate_upload(fileobj, *, kind: str, declared_name: str = "", duration_ms:
         width, height = _validate_image(fileobj)
 
     if kind in ("VIDEO", "VOICE"):
-        duration_ms = _probe_duration_ms(fileobj) or duration_ms
+        probed_duration = probe_info.get("duration_ms") if probe_info else None
+        duration_ms = probed_duration or duration_ms
         if kind == "VOICE":
             maximum = policy["max_voice_duration_seconds"] * 1000
             if duration_ms and duration_ms > maximum:
@@ -305,8 +352,14 @@ def _validate_image(fileobj) -> tuple[int, int]:
     return width, height
 
 
+def _probe_media_info(fileobj) -> dict | None:
+    """Probe audio/video stream kinds and duration when ffprobe is available."""
+    from .processing import probe_media_info
+
+    return probe_media_info(fileobj)
+
+
 def _probe_duration_ms(fileobj) -> int | None:
     """Probe duration with ffprobe. Returns None when ffprobe is unavailable."""
-    from .processing import probe_duration_ms
-
-    return probe_duration_ms(fileobj)
+    info = _probe_media_info(fileobj)
+    return info.get("duration_ms") if info else None

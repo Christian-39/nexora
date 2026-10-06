@@ -15,6 +15,8 @@ from django.conf import settings
 from django.core.files.storage import default_storage
 from django.db import transaction
 
+from apps.core.observability import sanitize
+
 from .validators import storage_key
 
 
@@ -24,7 +26,20 @@ logger = logging.getLogger("nexora.upload")
 def store_upload(fileobj, validated, *, prefix: str = "media/originals") -> str:
     """Stream an upload to private storage under an unguessable key."""
     key = storage_key(prefix, validated.extension)
-    return default_storage.save(key, fileobj)
+    try:
+        return default_storage.save(key, fileobj)
+    except Exception:
+        # A backend can fail after writing some bytes; the candidate name is
+        # known even when Storage.save never returns its canonical key.
+        try:
+            default_storage.delete(key)
+        except Exception as cleanup_exc:  # noqa: BLE001 - preserve original error
+            logger.warning(
+                "failed upload object cleanup deferred storage_op=delete exception=%s message=%s",
+                cleanup_exc.__class__.__name__,
+                sanitize(cleanup_exc, limit=300),
+            )
+        raise
 
 
 @dataclass
@@ -36,9 +51,10 @@ class StagedUpload:
     a pooled MySQL connection (plus its row locks) open for that long is what
     let two concurrent uploads stall the whole web service.
 
-    The trade-off is that a failure after staging would leak the object, so
-    the caller MUST invoke :meth:`discard` on any error path. ``manage.py
-    finalize_uploads`` sweeps anything that still slips through.
+    The trade-off is that a failure after staging could leave an unreferenced
+    object, so the caller MUST invoke :meth:`discard` on any error path. The
+    ``finalize_uploads`` worker only retries resumable-session staging cleanup;
+    it does not scan arbitrary private-storage objects.
     """
 
     storage_key: str
@@ -53,24 +69,29 @@ class StagedUpload:
                 default_storage.delete(key)
             except Exception as exc:  # noqa: BLE001 - cleanup must never mask the original error
                 logger.warning(
-                    "could not remove staged object after a failed upload (%s: %s); "
-                    "finalize_uploads will sweep it",
+                    "could not remove staged object after a failed upload (%s: %s)",
                     exc.__class__.__name__,
-                    exc,
+                    sanitize(exc, limit=300),
                 )
 
 
 def stage_upload(fileobj, validated, *, poster=None) -> StagedUpload:
     """Write the original (and optional poster) to storage. No DB work."""
     staged = StagedUpload(storage_key=store_upload(fileobj, validated))
-    if poster is not None:
-        from .validators import signature_mime
+    try:
+        if poster is not None:
+            from .validators import signature_mime
 
-        head = poster.read(512)
-        poster.seek(0)
-        if signature_mime(head) in ("image/jpeg", "image/png", "image/webp"):
-            staged.thumbnail_key = default_storage.save(storage_key("media/posters", ".jpg"), poster)
-    return staged
+            head = poster.read(512)
+            poster.seek(0)
+            if signature_mime(head) in ("image/jpeg", "image/png", "image/webp"):
+                staged.thumbnail_key = default_storage.save(storage_key("media/posters", ".jpg"), poster)
+        return staged
+    except Exception:
+        # The original was already stored but no caller received the handle to
+        # clean it up. Remove it before re-raising the staging failure.
+        staged.discard()
+        raise
 
 
 @transaction.atomic
