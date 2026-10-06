@@ -31,8 +31,13 @@ async function readLocalEnv() {
 }
 
 function isLoopbackHost(hostname) {
-  const host = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
-  return host === 'localhost' || host === '::1' || host === '0.0.0.0' || /^127(?:\.\d{1,3}){3}$/.test(host);
+  const host = String(hostname || '')
+    .toLowerCase()
+    .replace(/^\[|\]$/g, '')
+    .replace(/\.+$/, '');
+  return host === 'localhost' || host.endsWith('.localhost') ||
+    host === '::' || host === '::1' || host === '0.0.0.0' ||
+    /^127(?:\.\d{1,3}){3}$/.test(host);
 }
 
 function normalizePublicOrigin(rawValue) {
@@ -53,6 +58,9 @@ function normalizePublicOrigin(rawValue) {
   }
   if (process.env.VERCEL === '1' && isLoopbackHost(url.hostname)) {
     throw new Error('A Vercel production build cannot use a loopback API_BASE_URL.');
+  }
+  if (process.env.VERCEL === '1' && url.protocol !== 'https:') {
+    throw new Error('A Vercel production build requires HTTPS for API_BASE_URL.');
   }
   return url.origin;
 }

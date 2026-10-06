@@ -8,8 +8,9 @@ const FRONTEND = fileURLToPath(new URL('..', import.meta.url));
 
 function runBuild(apiBaseUrl) {
   const env = { ...process.env, VERCEL: '1' };
-  if (apiBaseUrl === undefined) delete env.API_BASE_URL;
-  else env.API_BASE_URL = apiBaseUrl;
+  // An explicit blank beats any developer-local .env file, keeping these
+  // deployment checks deterministic on machines that have a real API origin.
+  env.API_BASE_URL = apiBaseUrl ?? '';
   return spawnSync('node', ['build.mjs'], {
     cwd: FRONTEND,
     env,
@@ -36,7 +37,7 @@ test('Vercel build injects API_BASE_URL into every page and versions the service
   assert.match(serviceWorker, /const VERSION = 'build-[a-f0-9]{12}';/);
 });
 
-test('Vercel refuses missing and loopback API origins, but accepts explicit same-origin proxy mode', async () => {
+test('Vercel refuses missing, loopback, and insecure API origins but accepts explicit same-origin proxy mode', async () => {
   const missing = runBuild(undefined);
   assert.notEqual(missing.status, 0);
   assert.match(missing.stderr, /requires API_BASE_URL/);
@@ -44,6 +45,14 @@ test('Vercel refuses missing and loopback API origins, but accepts explicit same
   const loopback = runBuild('http://127.0.0.1:8000');
   assert.notEqual(loopback.status, 0);
   assert.match(loopback.stderr, /cannot use a loopback/);
+
+  const localhostSubdomain = runBuild('https://api.localhost');
+  assert.notEqual(localhostSubdomain.status, 0);
+  assert.match(localhostSubdomain.stderr, /cannot use a loopback/);
+
+  const insecure = runBuild('http://api.example.test');
+  assert.notEqual(insecure.status, 0);
+  assert.match(insecure.stderr, /requires HTTPS/);
 
   const sameOrigin = runBuild('same-origin');
   assert.equal(sameOrigin.status, 0, sameOrigin.stderr || sameOrigin.stdout);

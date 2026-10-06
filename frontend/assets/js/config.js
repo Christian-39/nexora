@@ -2,8 +2,8 @@
  * NEXORA — the single browser-side configuration authority.
  *
  * Static hosting cannot read .env files in the browser. `build.mjs` injects
- * the public API_BASE_URL into runtime-config.js at build time; this module is
- * the only place that reads that generated value. An empty value deliberately
+ * the public API_BASE_URL into each page's `nexora-config` JSON block at build
+ * time; this module is the only place that reads that generated value. An empty value deliberately
  * means same-origin (for deployments using a reverse proxy), never a guessed
  * production or loopback URL.
  */

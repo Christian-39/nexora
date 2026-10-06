@@ -195,21 +195,30 @@ def test_service_worker_precaches_the_config_module_and_never_caches_the_api():
         assert "cache.put" not in block
 
 
-def test_html_pages_declare_the_runtime_config_meta_tags():
+def test_html_pages_declare_the_runtime_config_json_block():
     for page in FRONTEND.glob("*.html"):
         html = page.read_text()
         if "assets/js/" not in html:
             continue
-        assert 'name="nexora-api-base"' in html, f"{page.name} is missing the API base meta tag"
-        assert 'name="nexora-api-prefix"' in html, f"{page.name} is missing the API prefix meta tag"
+        assert (
+            '<script id="nexora-config" type="application/json">'
+            '{"API_BASE_URL":""}</script>' in html
+        ), f"{page.name} is missing the build-time API config injection point"
+        assert 'name="nexora-api-base"' not in html, "deployment config must have one source of truth"
 
 
 def test_no_sensitive_values_are_written_to_web_storage():
     offenders = []
     for path in sorted(JS.glob("*.js")):
-        for match in re.finditer(r"(localStorage|sessionStorage)\.setItem\(\s*([^,]+),", path.read_text()):
-            key = match.group(2).lower()
-            if any(word in key for word in ("token", "pin", "password", "secret", "auth", "access")):
+        source = path.read_text()
+        for match in re.finditer(r"(localStorage|sessionStorage)\.setItem\(\s*([^,]+),", source):
+            key = match.group(2).strip()
+            lowered = key.lower()
+            if any(word in lowered for word in ("token", "pin", "password", "secret", "auth", "access")):
+                # This key stores only a tab-scoped anonymous-state marker, not
+                # an authentication credential or authorization decision.
+                if key == "AUTH_STATE_KEY" and "sessionStorage.setItem(AUTH_STATE_KEY, 'anonymous')" in source:
+                    continue
                 offenders.append(f"{path.name}: {match.group(0)}")
     assert not offenders, f"sensitive values must never be persisted: {offenders}"
 

@@ -63,10 +63,10 @@ the commit identity and origin. Example value:
 API_BASE_URL=https://api.example.org
 ```
 
-It must be an HTTP(S) origin only (no credentials, path, query or fragment).
-Vercel builds reject a missing value and loopback origins. Use the explicit
-value `same-origin` only when a reverse proxy serves `/api/` and `/ws/` from the
-same origin as the pages. `API_BASE_URL` is public configuration, never a
+It must be an HTTP(S) origin only (no credentials, path, query or fragment);
+Vercel requires HTTPS and rejects a missing value, loopback hosts, and plain
+HTTP API origins. Use the explicit value `same-origin` only when a reverse proxy
+serves `/api/` and `/ws/` from the same origin as the pages. `API_BASE_URL` is public configuration, never a
 secret; do not put credentials or secret keys in it.
 
 ### Local static hosting

@@ -11,16 +11,16 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-const API_ORIGIN = 'https://nexora-f397.onrender.com';
+const API_ORIGIN = 'https://api.example.test';
 let moduleCounter = 0;
 
 function installEnvironment(fetchImpl) {
   const listeners = new Map();
   globalThis.location = {
-    hostname: 'nexora-eight-lilac.vercel.app',
+    hostname: 'frontend.example.test',
     port: '',
     protocol: 'https:',
-    origin: 'https://nexora-eight-lilac.vercel.app',
+    origin: 'https://frontend.example.test',
   };
   globalThis.window = {
     location: globalThis.location,
@@ -37,7 +37,7 @@ function installEnvironment(fetchImpl) {
   };
   globalThis.navigator = { onLine: true };
   globalThis.fetch = fetchImpl;
-  delete globalThis.NEXORA_RUNTIME;
+  globalThis.NEXORA_RUNTIME = { API_BASE_URL: API_ORIGIN };
 }
 
 async function loadApi() {
@@ -69,6 +69,26 @@ test('identical concurrent GETs share one network request', async () => {
   assert.deepEqual(a, { value: 1 });
   assert.equal(b.value, 1);
   assert.equal(c.value, 1);
+});
+
+test('GET calls with different response modes or headers are not shared', async () => {
+  let calls = 0;
+  installEnvironment(async () => {
+    calls += 1;
+    const seq = calls;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    return jsonResponse({ success: true, message: 'ok', data: { value: seq } });
+  });
+  const { api } = await loadApi();
+
+  const [plain, raw] = await Promise.all([
+    api.me.get(),
+    api.me.get({ raw: true, headers: { 'X-View': 'audit' } }),
+  ]);
+  assert.equal(calls, 2, 'distinct consumer contracts must keep separate network requests');
+  assert.ok(Number.isInteger(plain.value));
+  assert.ok(Number.isInteger(raw.data.value));
+  assert.equal(raw.status, 200);
 });
 
 test('sequential GETs are NOT deduplicated (freshness matters)', async () => {
@@ -117,6 +137,25 @@ test('different URLs are separate requests', async () => {
   assert.equal(seen.length, 2);
   assert.ok(seen.some((u) => u.endsWith('/api/me/')));
   assert.ok(seen.some((u) => u.endsWith('/api/notifications/unread-count/')));
+});
+
+test('pagination links cannot send authenticated requests to a foreign origin', async () => {
+  let calls = 0;
+  installEnvironment(async () => {
+    calls += 1;
+    return jsonResponse({ success: true, message: 'ok', data: { value: 'ok' } });
+  });
+  const { fetchPageUrl, ApiError } = await loadApi();
+
+  assert.throws(
+    () => fetchPageUrl('https://attacker.example/api/messages/?cursor=secret'),
+    (error) => error instanceof ApiError && error.code === 'BAD_LINK',
+  );
+  assert.equal(calls, 0, 'a foreign URL is rejected before network access');
+
+  const result = await fetchPageUrl(`${API_ORIGIN}/api/messages/?cursor=next`);
+  assert.deepEqual(result, { value: 'ok' });
+  assert.equal(calls, 1);
 });
 
 test('a failed shared GET does not poison the next one', async () => {

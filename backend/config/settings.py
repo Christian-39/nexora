@@ -703,7 +703,8 @@ SECURE_HSTS_PRELOAD = config("SECURE_HSTS_PRELOAD", default=False, cast=boolean)
 SECURE_SSL_REDIRECT = config("SECURE_SSL_REDIRECT", default=False, cast=boolean)
 
 #: The API serves JSON and media only — a deny-all CSP is both correct and
-#: compatible. The static frontend ships its own CSP via its host/meta tag.
+#: compatible. Static HTML is deployed separately; its host-level CSP must be
+#: reviewed against the page's inline bootstrap scripts and style attributes.
 CONTENT_SECURITY_POLICY = config(
     "CONTENT_SECURITY_POLICY",
     default=(

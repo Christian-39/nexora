@@ -142,6 +142,46 @@ test('an unreachable refresh is not treated as logout and can be retried later',
   assert.equal(unauthorized, 0);
 });
 
+test('a CSRF 403 during refresh is retryable and does not latch logout', async () => {
+  let csrfCalls = 0;
+  let refreshCalls = 0;
+  let meCalls = 0;
+  const apiModule = await loadApi(async (url, init) => {
+    const path = pathOf(url);
+    if (path === '/api/auth/csrf/') {
+      csrfCalls += 1;
+      return jsonResponse(envelope({ csrf_token: `csrf-${csrfCalls}` }));
+    }
+    if (path === '/api/auth/refresh/') {
+      refreshCalls += 1;
+      assert.equal(init.headers['X-CSRFToken'], `csrf-${csrfCalls}`);
+      return refreshCalls === 1
+        ? jsonResponse({ success: false, message: 'CSRF validation failed.' }, 403)
+        : jsonResponse(envelope({}));
+    }
+    if (path === '/api/me/') {
+      meCalls += 1;
+      return meCalls < 3
+        ? jsonResponse({ success: false, message: 'Expired', code: 'INVALID_SESSION', errors: {} }, 401)
+        : jsonResponse(envelope({ id: 'verified-user' }));
+    }
+    throw new Error(`Unexpected URL: ${path}`);
+  });
+
+  let unauthorized = 0;
+  apiModule.apiEvents.on('unauthorized', () => { unauthorized += 1; });
+  await assert.rejects(
+    apiModule.request('/api/me/', { retries: 0 }),
+    (error) => error.code === 'AUTH_REFRESH_UNAVAILABLE',
+  );
+  assert.equal(unauthorized, 0);
+  const profile = await apiModule.request('/api/me/', { retries: 0 });
+  assert.equal(profile.id, 'verified-user');
+  assert.equal(refreshCalls, 2);
+  assert.equal(csrfCalls, 2, 'a 403 invalidates the cached CSRF token before retry');
+  assert.equal(unauthorized, 0);
+});
+
 test('public config is unauthenticated, deduplicated, and does not trigger session refresh', async () => {
   let calls = 0;
   const apiModule = await loadApi(async (_url, init) => {

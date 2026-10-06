@@ -1,206 +1,60 @@
-# NEXORA — Production Audit & Root‑Cause Fix Report
+# Nexora Repository Audit & Patch Report
 
-**Branch:** `fix/production-audit`
-**Scope of this pass (agreed triage):** the six highest‑impact, well‑diagnosed
-root causes — auth logout regression, shell/topbar flicker, mobile bottom‑nav
-regression, dashboard staleness, member‑creation feedback, media/voice retry —
-plus the deployment/URL contract cleanup they surfaced. Delivered as a git
-branch + patch. All changes are surgical; the vanilla‑JS ES‑module + Django
-Channels architecture is untouched.
+**Date:** 2026-10-06 | **Repository baseline:** `8093382` (working-tree changes are not committed)
+**Scope:** Frontend deployment/configuration and request behavior, Django authentication/realtime contracts, MySQL/MariaDB integrity migrations, cache behavior, tests, and documentation.
 
-> **Verification honesty:** every result below was executed locally. What was
-> **NOT** executed: anything requiring the live Vercel/Render deployment, the
-> production MySQL/Redis, real object storage, a real browser, or a real mobile
-> device (no push access, no credentials). Those items are marked **NOT
-> EXECUTED** and reasoned about from the code, not claimed as passing.
+## Executive summary
 
-## Test results (executed)
+The Render failure is a deterministic Django migration bug: an unordered grouped aggregate calls `.first()`, which asks Django to add ordering that is not valid for that aggregate. The conversation migration now uses `.exists()` for its duplicate guard. The related long-key digest migrations use the same safe pattern, and the conversation migration also checks existing row shape before replacing the conditional private-chat constraint.
 
-| Suite | Command | Before | After |
-|---|---|---|---|
-| Backend | `pytest` (SQLite in‑memory, PyMySQL fallback) | 152 pass / **1 fail** | **155 pass / 0 fail** |
-| Django checks | `manage.py check` | clean | clean |
-| Migrations | `makemigrations --check` | no drift | **no drift** (no schema change) |
-| Frontend | `node --test frontend/tests/` | 48 pass / **5 fail** | **53 pass / 0 fail** |
+The patch also makes the Vercel API-origin contract explicit, improves safe request deduplication and refresh handling, and keeps private API responses out of the service-worker cache. **No production database was accessed or migrated.** MySQL/MariaDB migration behavior, the Render deployment, and live cross-origin authentication remain unverified.
 
-The 6 baseline failures were all caused by an **obsolete backend URL**
-(`nexora-backend-ptsc.onrender.com`) hard‑coded in test/deploy files while the
-app already used the correct `nexora-f397.onrender.com`. A failing contract test
-can block CI/auto‑deploy, so this was a real (not cosmetic) finding.
+## Confirmed root cause and database changes
 
----
+- Render failed in `conversations.0007_integrity_mysql_unique_hashes`, inside `_backfill_storage_key_hashes`, because `.first()` was used on a grouped/annotated queryset without an explicit ordering. The exception happens before the migration is recorded as applied.
+- The duplicate check now uses `.exists()` on fixed-width digest groups. Grouping on the canonical lowercase SHA-256 value avoids false duplicate matches from MySQL’s commonly case-insensitive collation when original object keys differ only by case.
+- Attachment storage keys, push endpoints, and branding storage keys remain intact. Uniqueness is moved to 64-character SHA-256 digest columns rather than long indexed strings. Model saves and the push-subscription lookup keep those digests synchronized.
+- The staging-column operations inspect the live table before adding the column, and named unique-constraint operations inspect existing constraints before adding them. This is intended to tolerate the known MySQL partial-DDL retry case; it has only been exercised with SQLite logic smoke tests, not a real MySQL/MariaDB server.
+- Private conversation uniqueness is represented by `(kind, admin, member)` plus the existing conversation-shape check. Multiple group rows can retain `member=NULL`; private rows with both IDs set remain unique. The migration stops on malformed conversation shapes or duplicate private pairs rather than deleting or merging data.
+- Legacy long-column unique indexes are inspected and removed where applicable. No production schema change has been run here. If an existing database contains duplicate keys or malformed/duplicate private rows, the migration requires deliberate data repair; it will not silently discard messages or subscriptions.
 
-## Root causes & fixes
+## Frontend, request, and reliability changes
 
-### 1. Authentication regression — false logout on a temporary backend outage
-- **Symptom:** logged in, then logged out "for no reason."
-- **Root cause (frontend):** `auth.js › bootstrap()` returns `null` for BOTH a
-  real `401` and a network/timeout/5xx failure. `requireSession()` treated any
-  `null` as "no session" → `redirectToLogin()`. On Render free‑tier cold starts
-  (`/api/me/` times out), a **valid** session was thrown to the sign‑in screen.
-- **Fix:** `bootstrap()` now records `sessionUnverified` when the failure is
-  connectivity‑only (`isNetwork/isOffline/isTimeout/isServer`) vs a real `401`.
-  `requireSession()` only redirects on a **confirmed** auth failure; on
-  connectivity failure it keeps the (already‑mounted) shell and emits
-  `session-unverified`. Backend authorization is unchanged and still
-  authoritative. *(api.js already had correct 401→single‑refresh→retry, refresh
-  de‑dup, and network classification — left intact.)*
-- **Files:** `frontend/assets/js/auth.js`.
+- `frontend/build.mjs` injects public `API_BASE_URL` into every page’s JSON config block and versions the service-worker cache using the build identity and API origin. Vercel builds reject missing values, loopback hosts, and plain-HTTP API origins. Explicit `same-origin` mode is allowed only when the deployment actually proxies `/api/` and `/ws/`.
+- The browser config has no inferred production host or loopback fallback. `API_BASE_URL` is public configuration, not a secret; no real frontend `.env` is committed.
+- Concurrent GET deduplication now distinguishes response mode, headers, auth/cache policy, timeout, and retry settings. Caller-cancellable requests remain unshared. Pagination links are limited to the configured API origin so a foreign link cannot receive a bearer header or credentialed API request.
+- Refresh remains single-flight and CSRF-protected. A definitive refresh `401` is latched for the tab; network failures and refresh `403` responses do not falsely log the user out. A `403` clears the in-memory CSRF token so a later explicit retry bootstraps it again.
+- WebSocket authentication uses cookies rather than placing credentials in the URL. The service worker only considers explicitly allowlisted public config/branding routes for caching; all other `/api/` traffic stays network-only.
+- Existing visual language and private-chat/group rules were preserved; this patch does not claim a redesign or a measured responsiveness/performance gain.
 
-### 2. Application shell / topbar / sidebar disappears then reappears
-- **Symptom:** navigate → chrome vanishes for seconds → returns.
-- **Root cause (frontend):** every authenticated page did
-  `await requireSession()` **before** `mountNavigation()`. The shell literally
-  did not exist until `/api/me/` resolved — the "WAIT FOR SESSION → MOUNT SHELL"
-  anti‑pattern the brief describes.
-- **Fix:** reordered all six pages to **mount the shell first**
-  (`mountNavigation` + `mountConnectionBanner` + `mountSessionGuards`), paint
-  cached branding, then validate the session in the background and load page
-  data. The nav renders as a guest and **reconciles** when `authEvents 'user'`
-  fires (that subscription already existed). Combined with fix #1, a slow/cold
-  backend no longer blanks or bounces the UI.
-- **Files:** `admin.html`, `chat.html`, `members.html`, `groups.html`,
-  `settings.html`, `profile.html`.
+## Performance and observability assessment
 
-### 3. Sidebar logo / branding regression
-- **Symptom:** org name/logo render empty in the sidebar/header.
-- **Root cause (lifecycle):** exactly the brief's hypothesis —
-  `loadBranding()`→`applyBranding()` queried `[data-brand="logo"]/[org-name]`
-  **before** `mountNavigation()` created those nodes. When the branding cache was
-  "fresh" (<5 min) the network revalidation path returned early and never
-  re‑applied, so the freshly‑created slots stayed blank.
-- **Fix:** `navigation.js` repaints branding into the shell nodes right after it
-  creates them (`render`, `renderHeader`, `openDrawer`) via a new
-  `applyBranding(config, { sideEffects: false })` mode in `theme.js` that
-  repaints names/logo/colours **without** re‑fetching the manifest or
-  cache‑busting the favicon on every re‑render. Public‑config caching &
-  background revalidation are preserved; private data is never cached as public.
-- **Files:** `frontend/assets/js/theme.js`, `frontend/assets/js/navigation.js`.
+The repository’s conversation-list path already uses subqueries, `select_related`/`prefetch_related`, a single latest-message fetch for a page, and batched presence reads. The repository includes query-count and realtime guards for these paths. However, the MySQL-backed tests that exercise those guards could not reach their test database in this environment, and no latency, throughput, or device benchmark was run. Treat the changes as code-level performance safeguards, not measured speedups.
 
-### 4. Mobile bottom navigation regression
-- **Symptom:** the fixed bottom nav bar disappeared after the latest deploy.
-- **Root cause (regression, confirmed via git):** the first commit rendered
-  `.app-nav` as a **fixed bottom bar** at ≤767px ("Primary nav becomes a bottom
-  bar"). Commit **`afc2d79 "updated"`** replaced it with
-  `.app-nav { display:none }` + a header hamburger + drawer.
-- **Fix:** restored the original bottom‑bar CSS (nav reflows to `grid-row: 2`,
-  horizontal `flex`, icon+label items, `env(safe-area-inset-bottom)`, hidden only
-  in full‑screen thread view) and hid the now‑redundant hamburger. **No hamburger
-  or new drawer is introduced as the replacement** — existing icons/labels/links
-  /active states are preserved. Because the bar is a normal grid row inside a
-  `100dvh` shell, it stays pinned above the Android keyboard without
-  `position:fixed`/`100vh` hacks. *(The legacy drawer code remains but is
-  unreachable — smallest safe change; fully reversible.)*
-- **Files:** `frontend/assets/css/responsive.css`, `navigation.js` (doc), and the
-  contract test `test_frontend_contract.py` (it previously asserted the *buggy*
-  hamburger layout — updated to assert the restored bottom bar).
+## Security and environment notes
 
-### 5. Dashboard data not updating
-- **Symptom:** create member / send message, dashboard doesn't reflect it.
-- **Root cause (frontend↔backend contract mismatch, NOT cache):** the backend
-  returned a **nested** payload (`members.total`, `messages.last_7_days`,
-  `conversations.groups` …) but `admin.html` read **flat** keys
-  (`total_members`, `messages_today`, `media_today` …). No key matched → every
-  metric rendered `—`/`0` regardless of DB changes. A full refresh could never
-  fix it. There is **no cache** on `/api/dashboard/`, so it was pure contract.
-- **Fix:** the dashboard view now returns the flat, correctly‑scoped keys the UI
-  reads **alongside** the nested structure (kept because a test asserts it).
-  "Today" is computed on the deployment timezone's calendar day; all message
-  counters (all‑time / 7‑day / today / media‑today / voice‑today) are folded into
-  a **single aggregate query**; "unread conversations" counts **distinct**
-  conversations. No hard‑coded values, no fabricated realtime. The dashboard
-  refetches on navigation, the Refresh button, and socket‑open (all pre‑existing).
-- **Files:** `backend/apps/accounts/views.py` (+ test coverage in
-  `test_settings_and_push.py`).
+- HttpOnly cookies, explicit CSRF bootstrap, server-side authorization, refresh rotation/revocation, and the no-private-service-worker-cache policy are retained. The auth-related session-storage marker records only an anonymous-state flag; access tokens remain in memory in bearer mode.
+- `backend/.env.local.bak` was removed from the working tree without reading or printing its contents. The deletion is pending commit, and deleting a file from the current tree does not remove it from Git history. If it contained credentials, rotate them and consider appropriate history cleanup.
+- The Django API configures a deny-all CSP. Vercel static responses currently set frame, MIME-sniffing, referrer, and permissions headers, but **do not have a CSP**. The static HTML contains inline bootstrap scripts and style attributes; a safe strict policy needs a separate hashed-CSP or script-extraction change. This report does not claim a complete static-site CSP posture.
+- Production requires configured MySQL/MariaDB, Redis, object storage, and matching CORS/CSRF origins. Cross-site frontend/API deployments also need compatible Secure/SameSite cookie settings. Those live deployment settings were not inspected or verified.
+- The tracked backup file’s values were not exposed. No production secrets are included in this report.
 
-### 6. Security events — real database pagination (exactly 10/page)
-- **Symptom:** widget showed 8; brief requires exactly 10 with prev/next.
-- **Root cause:** `admin.html` requested `{ limit: 8 }` — `limit` isn't even the
-  cursor param (`cursor`/`page_size` are), so it was a client‑side cap over a
-  30‑row default page: the "SELECT‑all then slice in JS" anti‑pattern.
-- **Fix (DB‑level):** dedicated `SecurityEventPagination(CursorPagination)` with
-  `page_size = 10`, ordered by the indexed `-created_at` (no new index needed —
-  `SecurityEvent.created_at` is already `db_index=True`). Frontend now requests
-  `page_size: 10` and renders working **Previous/Next** (disabled states, follows
-  opaque cursors, no full‑page reload).
-- **Files:** `backend/apps/security/views.py`, `frontend/admin.html` (+ tests in
-  `test_security.py`).
+## Verification results
 
-### 7. Attachment / voice upload retry (confirmed bug)
-- **Symptom:** upload fails → "Re‑attach the file to send it again." → file lost.
-- **Root cause (frontend resource lifecycle):**
-  1. `sendMedia()` called `this.clearDraft()` — which **disposes** the draft
-     (revokes the preview object URL) — on the *same* draft it was uploading and
-     the optimistic bubble was still showing.
-  2. `finally { draft.dispose() }` destroyed the `File/Blob` on **every** outcome,
-     including failure, so retry was impossible.
-  3. `retryMessage()` for media just told the user to re‑attach and removed it.
-  *(The plumbing was already correct: `uploadDraft` reuses the same `client_id`,
-  guards concurrent uploads, and the backend dedupes on `client_id`.)*
-- **Fix:** failed/unconfirmed media drafts are retained in a `pendingMedia`
-  Map (keyed by `client_id`) holding the `File/Blob`, MIME/name/size, preview and
-  poster URL. `detachDraft()` clears the composer tray **without** disposing the
-  in‑flight resource. `retryMessage()` re‑sends the **same** draft with the
-  **same `client_id`** — no reselection, no re‑recording, and the backend dedupe
-  guarantees no duplicate server message (also safe for the "response‑lost then
-  retry" and "success then WebSocket event then retry" races). Resources are
-  disposed exactly once — on confirm, abort, explicit discard, or controller
-  destroy — including the video poster object URL (fixes a leak). Optimistic
-  rendering and true SENT/DELIVERED/READ status (never faked) are preserved.
-- **Files:** `frontend/assets/js/chat.js`, `frontend/assets/js/messages.js`
-  (new `markLocalSending`).
+| Check | Result | Limitation |
+|---|---|---|
+| `node --test frontend/tests/` | **75 passed, 0 failed** | Includes Vercel missing/loopback/HTTP rejection and same-origin acceptance tests. |
+| `python manage.py check` | **No issues** | Code-level system check; not a database migration test. |
+| `python manage.py makemigrations --check --dry-run --skip-checks` | **No changes detected** | Django warned it could not check migration-history consistency because local MySQL at `127.0.0.1:3306` refused the connection. |
+| Full backend `pytest -q --tb=no --disable-warnings` | **53 passed; 123 setup/errors; 0 assertion failures** | The test database could not be created because MySQL at `127.0.0.1:3306` refused connections. The 123 errors are not passing backend integration tests. |
+| Django 5.2.17 SQLite migration-function smoke tests | Digest backfills, duplicate/shape preflights, case-sensitive key distinction, and staging-column retry helpers passed | These exercise migration logic only; SQLite does not validate MySQL/MariaDB DDL, collation, locks, or deployment state. |
+| Python compilation and `git diff --check` | Passed / clean | Static checks only. |
 
-### 8. Obsolete backend URL / deployment contract
-- **Finding:** `nexora-backend-ptsc.onrender.com` lingered in test files,
-  `render.yaml` (`ALLOWED_HOSTS`), and docs; the app (`config.js`) already used
-  the correct `nexora-f397.onrender.com`.
-- **Fix:** normalized every reference to `nexora-f397.onrender.com`. Render still
-  works either way because `settings.py` appends `RENDER_EXTERNAL_HOSTNAME` to
-  `ALLOWED_HOSTS`, but the stale value was misleading and broke the URL contract
-  tests. CORS/CSRF (`nexora-eight-lilac.vercel.app`) and cross‑site cookies
-  (`SameSite=None; Secure`) were already correct — unchanged.
-- **Files:** `render.yaml`, `README.md`, `DEPLOYMENT_REPORT.md`,
-  `frontend/README.md`, `backend/tests/*`, `frontend/tests/*`.
+## Required follow-up before production
 
----
-
-## Cache strategy (unchanged, verified correct)
-- **Cached (safe/public):** static JS/CSS (revalidated — see note), images
-  (1 week), public branding/config (localStorage, 5‑min freshness window +
-  background revalidation), the generated PWA manifest.
-- **Never publicly cached:** `/api/me/`, messages, members, dashboard, security
-  events, notifications, private media (all `cache: no-store`; SW does not cache
-  authenticated responses).
-- **Note on `vercel.json`:** JS/CSS use `max-age=0, must-revalidate` — this is
-  **correct** for un‑hashed filenames; aggressive immutable caching would serve
-  stale application code after a deploy (the exact hazard the brief warns about).
-  Left as‑is deliberately.
-
-## Verified good (audited, no change needed)
-- **Member‑creation frontend** (`members.js`) already has success toast, field +
-  form‑level error mapping (`mapMemberErrors`), busy‑state duplicate protection,
-  and local reconciliation. Backend `create()` validates and returns typed 400s.
-- **api.js**: in‑flight GET de‑dup, refresh de‑dup, 401 single‑refresh‑then‑retry,
-  timeout/offline classification.
-- **websocket.js**: single socket, bounded backoff + jitter, HTTP‑vs‑WS auth
-  separation, one refresh attempt, heartbeat zombie recycling.
-
-## NOT EXECUTED (require live infra / real devices — reasoned, not claimed)
-- End‑to‑end login/logout, session survival across refresh, and refresh‑storm
-  behavior against the live Render backend.
-- Real Android keyboard / `visualViewport` behavior and the 320–430px breakpoint
-  matrix in a real browser (changes are CSS‑grid + `dvh` + safe‑area, designed to
-  satisfy them).
-- Live dashboard realtime, WebSocket reconnect UX, and media/voice round‑trip
-  through real object storage + FFmpeg workers.
-- MySQL‑specific query plans (tests run on SQLite; no schema/index change was
-  made, so production query shape is unchanged except the dashboard's single
-  combined aggregate).
-
-## How to apply
-```bash
-git checkout -b fix/production-audit
-git apply nexora-production-audit.patch   # or: git am < ...  /  merge the branch
-# backend:  pytest   &&  python manage.py check
-# frontend: node --test frontend/tests/
-```
+1. Take a verified database backup and reproduce the current migration state on a staging MySQL/MariaDB instance using the same server family/version as production.
+2. Inspect whether the failed deploy left the staging digest column or any named indexes behind; rerun the patched migration normally and verify the final columns, nullability, and unique constraints. Do not fake the migration as applied.
+3. If the migration reports duplicates or malformed conversations, resolve them deliberately and preserve associated messages/subscriptions before retrying.
+4. Set Vercel `API_BASE_URL` to the real HTTPS API origin (or configure a working same-origin proxy), then test browser CORS, CSRF, cookie refresh, WebSocket reconnect, upload, and logout behavior from the deployed origins.
+5. Run the complete backend suite and query-count/realtime tests against the configured MySQL test database. Perform mobile/PWA checks on target browsers and measure production-like performance before making latency or throughput claims.
+6. Decide whether to add a hash-based CSP for Vercel static pages or move inline startup code into external assets; do not add `'unsafe-inline'` and describe it as a strict CSP.

@@ -78,7 +78,12 @@ python -m uvicorn config.asgi:application --reload --host 0.0.0.0 --port 8000
 ```
 
 There is no implicit SQLite fallback: configure a local MySQL/MariaDB database
-before running migrations. With `REDIS_URL` empty in development, Channels may
+before running migrations. Long external keys remain unchanged; portable
+uniqueness is enforced through fixed-width SHA-256 digest columns. The integrity
+migrations preflight duplicate/malformed rows and are retry-aware if MySQL has
+already committed a staging-column or index DDL step. Back up and test these
+migrations on a production-like database before deployment; do not mark a
+failed migration as applied. With `REDIS_URL` empty in development, Channels may
 use the in-memory layer and the cache local memory for a single process;
 production requires the managed Redis instance.
 
@@ -94,37 +99,27 @@ in parallel: they claim work with `SELECT … FOR UPDATE SKIP LOCKED`.
 
 ### 3.2 Frontend
 
-The frontend is static. Serve `frontend/` with anything:
+The frontend remains plain static HTML/CSS/JavaScript, with a small Node build
+step for deployment configuration (no bundler or framework). For local
+same-origin proxying, serve the source directly:
 
 ```bash
 cd frontend
-python -m http.server 5500        # or: npx serve -l 5500, or VS Code Live Server
+python -m http.server 5500
 ```
 
-Then open <http://127.0.0.1:5500/login.html>.
+For a split frontend/API origin, set `API_BASE_URL` in an untracked
+`frontend/.env` or the shell and run `node build.mjs` before serving `dist/`.
+The browser-side `config.js` reads only the build-injected `API_BASE_URL`; it
+never infers a backend hostname, assumes port 8000, or falls back to a committed
+production origin. Empty means root-relative same-origin proxy; an explicit
+`same-origin` value is also accepted. Vercel builds require either a valid
+public HTTPS origin or explicit same-origin proxy mode; they reject loopback
+and insecure HTTP API origins.
 
-**No file needs editing to point the frontend at the backend.**
-`frontend/assets/js/config.js` resolves the API origin in this order:
-
-1. `window.NEXORA_RUNTIME = { apiBase: '…' }` (or a `<script id="nexora-config" type="application/json">` blob) injected by the deployment;
-2. `<meta name="nexora-api-base" content="https://api.example.org">`;
-3. **local-dev detection** — a page served from `localhost`/`127.0.0.1` on a
-   known static-server port (5500, 5501, 8080, 3000, 5173 …) assumes Django is
-   on **the same hostname**, port 8000;
-4. **the deployed backend** (`PRODUCTION_API_ORIGIN` in `config.js`) — this
-   project's hosted frontend lives on Vercel and its API on Render, so a hosted
-   page resolves to `https://nexora-f397.onrender.com`;
-5. **same origin** — used when the page is already served *by* the backend
-   (reverse proxy / `devserver.py`), or when an override says `same-origin`.
-
-Step 3 preserves the hostname on purpose. Browsers scope cookies by host and
-ignore the port, so a page on `http://127.0.0.1:5500` must call
-`http://127.0.0.1:8000` — not `localhost:8000` — or the session and CSRF
-cookies are never sent. Use `127.0.0.1` on both sides, or `localhost` on both
-sides.
-
-The WebSocket origin is always derived from the resolved API origin by swapping
-the scheme (`http→ws`, `https→wss`), so TLS can never be mismatched.
+The WebSocket scheme is derived from that same value (`http→ws`, `https→wss`).
+The handshake uses the HttpOnly access cookie; credentials are not placed in a
+query string.
 
 ### 3.3 Everything on one origin (optional)
 
@@ -266,27 +261,31 @@ failing the deploy.
 
 ### 4.4 Frontend (Vercel)
 
-Deploy the `frontend/` directory as a static project — no build step, no
-framework. `frontend/vercel.json` keeps HTML, JS, CSS and `sw.js` revalidated on
-every request so a deploy cannot be masked by a stale cached bundle.
+Set the Vercel project **Root Directory** to `frontend` and define the public
+`API_BASE_URL` environment variable for each deployment environment. The build
+command in `frontend/vercel.json` runs `node build.mjs`; it validates the origin,
+injects it into all HTML pages, and versions the service-worker cache. Example:
 
-No file needs editing to point it at Render: `config.js` resolves the backend
-origin (see 3.2). To aim a fork at a different backend, set **one** value:
-
-```html
-<meta name="nexora-api-base" content="https://api.example.org">
+```text
+API_BASE_URL=https://api.example.org
 ```
 
-or `window.NEXORA_RUNTIME = { apiBase: '…' }` (use `'same-origin'` for a
-reverse-proxy deployment). `CORS_ALLOW_ALL_ORIGINS` is never enabled, in any
-mode.
+Do not include credentials, a URL path, query or fragment. Vercel builds reject
+missing configuration, loopback hosts, and non-HTTPS API origins. Use
+`API_BASE_URL=same-origin` only when Vercel or another proxy actually forwards
+`/api/` and `/ws/` on the page origin. `API_BASE_URL` is public client configuration, not a secret. Do not use
+meta tags or manually edit page HTML for deployment values. `CORS_ALLOW_ALL_ORIGINS`
+is never enabled.
+
+`frontend/vercel.json` serves `dist/` and revalidates HTML, JavaScript, CSS and
+`sw.js` so a deploy cannot be masked by a stale cached bundle.
 
 ### 4.5 Alternative: one origin behind a reverse proxy
 
-One nginx/Caddy serving `frontend/` and forwarding `/api/`, `/ws/`, `/static/`
-and `/health/` to the ASGI server still works unchanged: set
-`nexora-api-base` to `same-origin`, keep `COOKIE_SAMESITE=Lax`, and no CORS is
-involved.
+One nginx/Caddy serving the frontend build and forwarding `/api/`, `/ws/`,
+`/static/` and `/health/` to the ASGI server works unchanged. Build with
+`API_BASE_URL=same-origin`; configure the backend's cookie policy appropriately
+for that topology. The browser uses relative API URLs.
 
 ### 4.6 Web push keys
 
@@ -308,7 +307,8 @@ frontend/
   assets/js/api.js      the ONLY HTTP layer: CSRF, credentials, timeouts,
                         retries, refresh-on-401, normalized errors, uploads
   assets/js/websocket.js single multiplexed socket with bounded backoff
-  sw.js                 PWA shell cache; /api/ is always network-only
+  build.mjs             injects public API_BASE_URL; no client-side host fallback
+  sw.js                 public shell/assets cache; only public config/branding API allowlisted
 backend/
   config/env.py         the ONLY module that reads the environment
   config/settings.py    all configuration, read once, through decouple
@@ -396,39 +396,24 @@ the original, and `media.ready` tells connected clients when they exist.
 ## 6. Tests
 
 ```bash
-cd backend
-pytest                                  # 174 backend tests
+# Frontend (Node's built-in test runner; no npm install)
+node --test frontend/tests/
 
-cd ..
-node --test frontend/tests/*.mjs        # 66 frontend tests (Node built-in runner)
+# Backend (configure an isolated MySQL 8 or MariaDB test database first)
+cd backend
+.venv/bin/pytest
+.venv/bin/python manage.py makemigrations --check --dry-run
 ```
 
-174 backend tests covering authentication, first-login and voluntary PIN change,
-administrator PIN reset, lockout, CSRF, authorization and IDOR, messaging
-idempotency/ordering/receipts, media validation and streaming, WebSocket
-authorization, Redis channel/cache resilience, health checks, redacted error
-logging, push subscription and aggregation, database-driven settings, and — in
-`tests/test_frontend_contract.py` — the frontend↔backend contract itself:
-every endpoint `api.js` calls is asserted against the real URL map, every
-socket event the UI listens for is asserted against the backend source, and
-the frontend is scanned for raw `fetch`, hardcoded origins, `innerHTML`/`eval`
-sinks and sensitive values in web storage.
-
-`tests/test_deployment_config.py` loads `config/settings.py` with a controlled
-environment and asserts the production contract itself: Redis mandatory (and
-never silently replaced by the in-memory layer), the Redis channel layer and
-cache actually selected, CORS restricted to the Vercel origin, CSRF trusted
-origins, cross-site cookies (`SameSite=None; Secure`), MySQL and private
-storage required, the ASGI entry point, and the absence of Docker artefacts.
-
-The 66 frontend tests (`frontend/tests/`, Node's built-in runner) cover API and
-WebSocket URL resolution for local *and* production, PIN validation and
-first-login/voluntary payload shaping, centralized client error redaction,
-optimistic media/voice upload indexing and retry, mobile PWA chat layout and
-swipe-to-reply invariants across 320px–430px viewports, and the whole
-reconnection lifecycle: open, bounded backoff, one-shot session refresh,
-authentication failure, an unreachable backend, logout, sign-in again,
-offline/online and single-socket/single-timer invariants.
+The backend settings deliberately fail closed if a MySQL/MariaDB database is
+not configured; SQLite is not an implicit test or development fallback. Backend
+coverage includes authentication, PIN lifecycle, lockout, CSRF, authorization
+and IDOR, message idempotency/receipts, media validation and storage, WebSocket
+authorization, Redis/cache resilience, health checks, redacted logging, push,
+settings, query-count guards and frontend/backend route contracts. The frontend
+suite covers injected API origin/build output, API refresh deduplication and
+failure classes, public config caching, WebSocket lifecycle, optimistic media
+indexing, PIN contracts, error redaction and mobile layout invariants.
 
 ---
 
@@ -447,13 +432,18 @@ offline/online and single-socket/single-timer invariants.
   views from the CSRF middleware, so the check is explicit). Before its first
   unsafe call, the frontend obtains the token from `/api/auth/csrf/` JSON and
   keeps it in memory; the backend continues to set Django's CSRF cookie.
-* Security headers: HSTS, CSP, `nosniff`, `Referrer-Policy`,
-  `Permissions-Policy`, `X-Frame-Options: DENY`, Secure + SameSite cookies.
+* The Django API applies HSTS, a deny-all CSP, `nosniff`, `Referrer-Policy`,
+  `Permissions-Policy`, `X-Frame-Options: DENY`, and Secure/SameSite cookies.
+  Vercel static pages set frame, MIME-sniffing, referrer, and permissions
+  headers, but do not yet have a CSP: their HTML still contains inline startup
+  scripts and style attributes, so a strict policy needs a separate hashed-CSP
+  change rather than an unsafe-inline claim.
 * No `innerHTML`, no `eval`, no `new Function` in frontend code; all
   user-generated text is inserted as `textContent`.
-* The service worker never caches anything under `/api/` — neither
-  authenticated JSON nor private media — so nothing survives sign-out in a
-  shared cache.
+* The service worker caches only explicitly allowlisted public branding/config
+  endpoints when they return public cache headers and do not vary on cookies or
+  authorization. Every other `/api/` response—including private media and
+  authenticated data—remains network-only and is never retained across sign-out.
 * Audit and security logs strip any key resembling a PIN, password, token or
   secret before writing.
 

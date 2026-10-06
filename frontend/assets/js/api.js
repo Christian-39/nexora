@@ -50,12 +50,29 @@ const RETRY_STATUSES = new Set([408, 425, 429, 502, 503, 504]);
 
 const inflightGets = new Map();
 
-function dedupeGet(url, run) {
-  const existing = inflightGets.get(url);
+function dedupeGet(key, run) {
+  const existing = inflightGets.get(key);
   if (existing) return existing;
-  const promise = run().finally(() => inflightGets.delete(url));
-  inflightGets.set(url, promise);
+  const promise = run().finally(() => inflightGets.delete(key));
+  inflightGets.set(key, promise);
   return promise;
+}
+
+function getDedupeKey(url, options) {
+  const headers = new Headers(options.headers || {});
+  const normalizedHeaders = [...headers.entries()]
+    .map(([name, value]) => [name.toLowerCase(), value])
+    .sort(([a], [b]) => a.localeCompare(b));
+  return JSON.stringify({
+    url,
+    auth: options.auth !== false,
+    allowRefresh: options.allowRefresh !== false,
+    cache: options.cache || 'no-store',
+    raw: options.raw === true,
+    timeout: options.timeout ?? DEFAULTS.timeout,
+    retries: options.retries ?? DEFAULTS.retries,
+    headers: normalizedHeaders,
+  });
 }
 
 export const apiEvents = new Emitter();
@@ -411,13 +428,17 @@ async function performSessionRefresh() {
       cache: 'no-store',
     });
     if (!response.ok) {
-      if (response.status === 401 || response.status === 403) {
+      if (response.status === 401) {
         lastRefreshOutcome = 'rejected';
         setRefreshRejected(true);
         return { ok: false, reason: 'rejected' };
       }
-      // A 5xx, rate limit or network-side response does not prove the refresh
-      // cookie is invalid; keep the local profile and retry on a later request.
+      // Refresh is AllowAny but CSRF-protected, so a 403 can mean the in-memory
+      // CSRF token went stale. Re-bootstrap it on the next explicit retry; do
+      // not mistake CSRF failure for a revoked session.
+      if (response.status === 403) csrfToken = null;
+      // A 403, 5xx, rate limit or network-side response does not prove the
+      // refresh cookie is invalid; preserve local state and allow a retry.
       lastRefreshOutcome = 'unreachable';
       return { ok: false, reason: 'unreachable' };
     }
@@ -495,7 +516,7 @@ export async function request(path, options = {}) {
   // page navigating away can never cancel another caller's request.
   if (SAFE_METHODS.has(verb) && !options.signal) {
     const url = buildUrl(path, options.params);
-    const key = `${url}\n${options.auth === false ? 'public' : 'authenticated'}\n${options.cache || 'no-store'}`;
+    const key = getDedupeKey(url, options);
     return dedupeGet(key, () => executeRequest(path, options));
   }
   return executeRequest(path, options);
@@ -783,8 +804,22 @@ export function normalizePage(payload) {
 
 /** Follow a backend-provided absolute "next" URL safely. */
 export function fetchPageUrl(url, options = {}) {
-  if (!isSafeHttpUrl(url)) throw new ApiError({ message: 'Invalid pagination link.', code: 'BAD_LINK', status: 0 });
-  return request(url, { ...options, method: 'GET' });
+  const apiOrigin = API_ORIGIN || window.location.origin;
+  let parsed;
+  try {
+    parsed = new URL(String(url), `${apiOrigin}/`);
+  } catch {
+    throw new ApiError({ message: 'Invalid pagination link.', code: 'BAD_LINK', status: 0 });
+  }
+  // Pagination links come from the API. Never forward an in-memory bearer
+  // token or credentialed fetch to a foreign origin supplied in a response.
+  if (
+    !isSafeHttpUrl(parsed.href) || parsed.username || parsed.password ||
+    parsed.origin !== apiOrigin
+  ) {
+    throw new ApiError({ message: 'Invalid pagination link.', code: 'BAD_LINK', status: 0 });
+  }
+  return request(parsed.href, { ...options, method: 'GET' });
 }
 
 /* ============================================================
