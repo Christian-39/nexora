@@ -86,6 +86,8 @@ def _add_endpoint_hash_unique(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
+    atomic = False
+    
     dependencies = [
         ("notifications", "0003_notification_aggregate_count_and_more"),
     ]
