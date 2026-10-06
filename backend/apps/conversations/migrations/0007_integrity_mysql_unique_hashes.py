@@ -165,6 +165,8 @@ def _add_private_pair_unique(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
+    atomic = False
+
     dependencies = [
         ("conversations", "0006_messagereceipt_receipt_recipient_unread_idx"),
     ]
