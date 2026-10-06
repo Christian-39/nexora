@@ -34,7 +34,7 @@ def backfill_storage_key_hashes(apps, schema_editor):
         BrandingAsset.objects.values("storage_key")
         .annotate(row_count=Count("pk"))
         .filter(row_count__gt=1)
-        .first()
+        .exists()
     )
     if duplicate:
         raise RuntimeError(

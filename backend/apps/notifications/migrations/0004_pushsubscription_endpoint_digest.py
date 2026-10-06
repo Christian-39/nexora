@@ -34,7 +34,7 @@ def backfill_endpoint_hashes(apps, schema_editor):
         PushSubscription.objects.values("endpoint")
         .annotate(row_count=Count("pk"))
         .filter(row_count__gt=1)
-        .first()
+        .exists()
     )
     if duplicate:
         raise RuntimeError(
