@@ -86,6 +86,8 @@ def _add_storage_key_hash_unique(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
+    atomic = False
+    
     dependencies = [
         ("platform_settings", "0003_platformconfiguration_allow_image_messages_and_more"),
     ]
