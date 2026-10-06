@@ -17,7 +17,7 @@ class Migration(migrations.Migration):
                 ('created_at', models.DateTimeField(auto_now_add=True)),
                 ('updated_at', models.DateTimeField(auto_now=True)),
                 ('kind', models.CharField(choices=[('LOGO', 'Logo'), ('FAVICON', 'Favicon')], max_length=10, unique=True)),
-                ('storage_key', models.CharField(max_length=512, unique=True)),
+                ('storage_key', models.CharField(max_length=512)),
                 ('mime_type', models.CharField(max_length=100)),
                 ('size', models.PositiveIntegerField()),
                 ('width', models.PositiveIntegerField()),

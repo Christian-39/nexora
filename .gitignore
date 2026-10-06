@@ -22,4 +22,6 @@ db.sqlite3
 
 # Node / OS
 node_modules/
+.vercel/
+frontend/dist/
 .DS_Store

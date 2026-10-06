@@ -7,8 +7,9 @@ no tenant registry, no shared database and no shared bucket.
 
 * **Backend** — Django 5 + Django REST Framework + Channels (ASGI), MySQL 8,
   Redis, S3-compatible private object storage.
-* **Frontend** — vanilla JavaScript ES modules, no build step, no framework,
-  installable as a PWA.
+* **Frontend** — vanilla JavaScript ES modules, no framework or bundler;
+  a small Node build step injects public API configuration and versions the
+  service worker. Installable as a PWA.
 * **Authentication** — phone number + six-digit PIN, delivered as HttpOnly
   cookies carrying rotating JWTs bound to revocable device sessions.
 * **No email architecture.** NEXORA never sends email. There is no SMTP
@@ -48,7 +49,7 @@ devices. They are not cosmetic.
 | | Development | Production |
 |---|---|---|
 | Python | 3.11+ | 3.11+ |
-| Database | SQLite (automatic fallback) | **MySQL 8+ (required)** |
+| Database | MySQL 8+ or MariaDB (explicitly configured) | **MySQL 8+ or MariaDB (required)** |
 | Redis | optional (in-memory fallbacks) | **required** |
 | Object storage | local filesystem | **S3-compatible bucket (required)** |
 | `ffmpeg` / `ffprobe` | optional | **required for video posters and duration probing** |
@@ -76,9 +77,10 @@ python manage.py createsuperuser --phone +2348030000000   # the first administra
 python -m uvicorn config.asgi:application --reload --host 0.0.0.0 --port 8000
 ```
 
-With `DATABASE_URL` and `DATABASE_NAME` empty and `DEBUG=True`, SQLite is used
-automatically. With `REDIS_URL` empty, Channels uses the in-memory layer and
-the cache uses local memory — fine for one process, **not** for production.
+There is no implicit SQLite fallback: configure a local MySQL/MariaDB database
+before running migrations. With `REDIS_URL` empty in development, Channels may
+use the in-memory layer and the cache local memory for a single process;
+production requires the managed Redis instance.
 
 Background workers (optional locally, required in production):
 

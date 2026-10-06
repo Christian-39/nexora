@@ -10,6 +10,7 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 
+from apps.core.hashes import sha256_hex
 from apps.core.throttles import PushThrottle
 
 from .models import Notification, PushSubscription
@@ -90,8 +91,9 @@ class PushViewSet(viewsets.ModelViewSet):
             raise ValidationError({"keys": "Both p256dh and auth keys are required."})
 
         subscription, created = PushSubscription.objects.update_or_create(
-            endpoint=endpoint,
+            endpoint_hash=sha256_hex(endpoint),
             defaults={
+                "endpoint": endpoint,
                 "user": request.user,
                 "p256dh": p256dh[:255],
                 "auth": auth[:255],
@@ -107,9 +109,11 @@ class PushViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=["post"])
     def unsubscribe(self, request):
         endpoint = str(request.data.get("endpoint", "")).strip()
-        if not endpoint:
-            raise ValidationError({"endpoint": "An endpoint is required."})
-        updated = PushSubscription.objects.filter(user=request.user, endpoint=endpoint).update(
+        if not endpoint or len(endpoint) > 1000:
+            raise ValidationError({"endpoint": "A valid endpoint is required."})
+        updated = PushSubscription.objects.filter(
+            user=request.user, endpoint_hash=sha256_hex(endpoint)
+        ).update(
             is_active=False
         )
         return envelope("Push subscription removed", {"removed": updated})

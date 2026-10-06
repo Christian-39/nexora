@@ -1,11 +1,13 @@
 """Credentials, lockout, CSRF, secret exposure and IDOR."""
 
 import pytest
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 from rest_framework.test import APIClient
 
 from apps.accounts.models import User
 from apps.accounts.services import create_member, initial_pin
+from apps.conversations.models import Conversation
 from apps.conversations.services import private_conversation, send_message
 from tests.conftest import authed, client_id
 
@@ -41,6 +43,19 @@ def test_admin_to_member_and_member_to_admin_are_the_same_thread(admin, member_a
     second, created_second = private_conversation(member_a, admin)
     assert first.id == second.id
     assert created_first and not created_second
+
+
+@pytest.mark.django_db(transaction=True)
+def test_private_thread_uniqueness_is_a_database_constraint_on_mysql(admin, member_a):
+    Conversation.objects.create(kind=Conversation.Kind.PRIVATE, admin=admin, member=member_a)
+    with pytest.raises(IntegrityError):
+        with transaction.atomic():
+            Conversation.objects.create(kind=Conversation.Kind.PRIVATE, admin=admin, member=member_a)
+
+    # GROUP rows deliberately have a NULL member, so many groups may belong to
+    # the same administrator without weakening private-pair uniqueness.
+    Conversation.objects.create(kind=Conversation.Kind.GROUP, admin=admin, member=None)
+    Conversation.objects.create(kind=Conversation.Kind.GROUP, admin=admin, member=None)
 
 
 @pytest.mark.django_db

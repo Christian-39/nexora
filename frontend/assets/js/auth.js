@@ -9,7 +9,7 @@
  *  - Role flags drive UX only. The backend is the authorization boundary.
  */
 
-import { ApiError, api, apiEvents, tokenStore } from './api.js';
+import { ApiError, api, apiEvents, tokenStore, resetAuthenticationFailures } from './api.js';
 import { Emitter, prefs } from './utils.js';
 import { realtime } from './websocket.js';
 
@@ -19,6 +19,22 @@ const ROLE_ADMIN = 'admin';
 const ROLE_MEMBER = 'member';
 
 const PROFILE_CACHE_KEY = 'nexora.sessionProfile.v1';
+const AUTH_STATE_KEY = 'nexora.authState.v1';
+
+function readKnownAnonymous() {
+  try {
+    return sessionStorage.getItem(AUTH_STATE_KEY) === 'anonymous';
+  } catch {
+    return false;
+  }
+}
+
+function writeKnownAnonymous(value) {
+  try {
+    if (value) sessionStorage.setItem(AUTH_STATE_KEY, 'anonymous');
+    else sessionStorage.removeItem(AUTH_STATE_KEY);
+  } catch { /* storage unavailable/private mode */ }
+}
 
 function readCachedProfile() {
   try {
@@ -53,7 +69,9 @@ function writeCachedProfile(user) {
 // Restore only safe display state synchronously so the multi-page shell can
 // paint identity/role immediately. The HttpOnly cookie and /api/me/ remain the
 // sole authority and always revalidate this snapshot.
-let currentUser = readCachedProfile();
+let knownAnonymous = readKnownAnonymous();
+let currentUser = knownAnonymous ? null : readCachedProfile();
+if (knownAnonymous) writeCachedProfile(null);
 let bootstrapPromise = null;
 let signingOut = false;
 /**
@@ -103,6 +121,11 @@ function normalizeRole(role) {
 function setUser(user) {
   const previous = currentUser;
   currentUser = user ? { ...user, role: normalizeRole(user.role || (user.is_admin ? 'admin' : 'member')) } : null;
+  if (currentUser) {
+    knownAnonymous = false;
+    writeKnownAnonymous(false);
+    resetAuthenticationFailures();
+  }
   writeCachedProfile(currentUser);
   if (previous?.id !== currentUser?.id || (!previous) !== (!currentUser)) {
     authEvents.emit('user', currentUser);
@@ -110,6 +133,12 @@ function setUser(user) {
     authEvents.emit('user-updated', currentUser);
   }
   return currentUser;
+}
+
+function markSessionAnonymous() {
+  knownAnonymous = true;
+  writeKnownAnonymous(true);
+  clearLocalSessionArtifacts();
 }
 
 /** Merge a partial profile update coming from REST or WebSocket. */
@@ -128,6 +157,10 @@ export function patchUser(partial) {
  * @returns {Promise<object|null>} the authenticated user or null
  */
 export function bootstrap(options = {}) {
+  // A definitively anonymous tab has nothing to revalidate. A successful login
+  // or a separately verified /me response clears this presentation-only latch.
+  if (knownAnonymous) return Promise.resolve(null);
+
   // One network revalidation at a time, shared by every caller.
   const network = bootstrapPromise || (bootstrapPromise = (async () => {
     try {
@@ -136,26 +169,20 @@ export function bootstrap(options = {}) {
       return setUser(me);
     } catch (error) {
       if (error instanceof ApiError && error.isAuth) {
-        // The backend positively rejected the credential: this is a real logout.
+        // A 401 after one shared refresh attempt is a confirmed anonymous
+        // state. Persist only that presentation state, never a credential.
         sessionUnverified = false;
         const hadUser = !!currentUser;
-        clearLocalSessionArtifacts();
+        markSessionAnonymous();
         setUser(null);
-        // Pages that already proceeded from the cached snapshot must still be
-        // bounced to login when the backend rejects the session.
         if (hadUser) authEvents.emit('session-expired');
         return null;
       }
-      // Network/server issues must not silently log the user out. Flag the
-      // session as *unverified* (not gone) so requireSession keeps the shell
-      // mounted instead of bouncing to the sign-in screen.
-      if (error instanceof ApiError && (error.isNetwork || error.isOffline || error.isTimeout || error.isServer)) {
-        sessionUnverified = true;
-        authEvents.emit('bootstrap-error', error);
-        return null;
-      }
-      sessionUnverified = false;
-      setUser(null);
+      // A timeout, network failure, refresh-service outage, 5xx, or unexpected
+      // response does not prove the cookie is invalid. Preserve any safe profile
+      // snapshot and let the UI reconcile when connectivity returns.
+      sessionUnverified = true;
+      authEvents.emit('bootstrap-error', error);
       return null;
     } finally {
       bootstrapPromise = null;
@@ -255,6 +282,7 @@ export function redirectToLogin(reason) {
  */
 export async function login(identifier, pin) {
   const payload = await api.auth.login(String(identifier).trim(), String(pin));
+  resetAuthenticationFailures();
   // Bearer deployments return a short-lived access token; keep it in memory only.
   if (tokenStore.isBearerMode) {
     const token = payload?.access || payload?.access_token || payload?.token;
@@ -306,7 +334,8 @@ export async function logout({ silent = false } = {}) {
     // Even if the call fails we clear local state; the cookie may already be gone.
   } finally {
     tokenStore.clear();
-    clearLocalSessionArtifacts();
+    markSessionAnonymous();
+    resetAuthenticationFailures();
     setUser(null);
     authEvents.emit('logout');
     signingOut = false;
@@ -408,12 +437,13 @@ export function validateNewPin(newPin, confirmPin, currentPin = null) {
 
 apiEvents.on('unauthorized', () => {
   if (signingOut) return;
-  if (!currentUser) return;
+  const hadUser = !!currentUser;
   tokenStore.clear();
+  markSessionAnonymous();
+  if (!hadUser) return;
   // The session is gone: the socket must not keep reconnecting behind the
   // "session expired" screen.
   realtime.stop('session-expired');
-  clearLocalSessionArtifacts();
   setUser(null);
   authEvents.emit('session-expired');
 });

@@ -28,7 +28,7 @@
  *   - stop() is terminal until start()/restart() is called again.
  */
 
-import { apiConfig, refreshSession, tokenStore } from './api.js';
+import { apiConfig, refreshSession } from './api.js';
 import { config as runtimeConfig } from './config.js';
 import { Emitter, backoffDelay } from './utils.js';
 
@@ -166,16 +166,10 @@ class RealtimeClient {
   /* ---------------- internals ---------------- */
 
   #url() {
-    // Always derived from the centralized API origin (config.js), so the
-    // scheme can never be mismatched and there is no second source of truth.
-    const base = apiConfig.wsOrigin;
-    const url = new URL(this.#path, base);
-    // Bearer deployments cannot set Authorization headers on WebSockets;
-    // the backend contract accepts a short-lived token query parameter.
-    if (tokenStore.isBearerMode && tokenStore.get()) {
-      url.searchParams.set('token', tokenStore.get());
-    }
-    return url.toString();
+    // Always derived from centralized deployment config. WebSockets authenticate
+    // only with the HttpOnly access cookie; credentials never enter the URL,
+    // where reverse-proxy/access logs could retain them.
+    return new URL(this.#path, apiConfig.wsOrigin).toString();
   }
 
   #setState(next, detail = null) {

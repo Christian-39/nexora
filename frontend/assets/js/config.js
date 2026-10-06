@@ -1,16 +1,12 @@
 /**
- * NEXORA — config.js
-
-/* ============================================================
-   Sources
-   ============================================================ */
-
-function readMeta(name) {
-  if (typeof document === 'undefined') return null;
-  const node = document.querySelector(`meta[name="${name}"]`);
-  const value = node?.getAttribute('content')?.trim();
-  return value || null;
-}
+ * NEXORA — the single browser-side configuration authority.
+ *
+ * Static hosting cannot read .env files in the browser. `build.mjs` injects
+ * the public API_BASE_URL into runtime-config.js at build time; this module is
+ * the only place that reads that generated value. An empty value deliberately
+ * means same-origin (for deployments using a reverse proxy), never a guessed
+ * production or loopback URL.
+ */
 
 function readInlineConfig() {
   if (typeof document === 'undefined') return {};
@@ -20,58 +16,48 @@ function readInlineConfig() {
     const parsed = JSON.parse(node.textContent || '{}');
     return parsed && typeof parsed === 'object' ? parsed : {};
   } catch {
-    // A malformed deployment blob must never break boot; fall through.
     return {};
   }
 }
 
-const RUNTIME = { ...readInlineConfig(), ...(globalThis.NEXORA_RUNTIME || {}) };
+const RUNTIME = {
+  ...readInlineConfig(),
+  ...(globalThis.NEXORA_RUNTIME && typeof globalThis.NEXORA_RUNTIME === 'object'
+    ? globalThis.NEXORA_RUNTIME
+    : {}),
+};
 
-/* ============================================================
-   Helpers
-   ============================================================ */
+const trimSlashes = (value) => String(value || '').trim().replace(/\/+$/, '');
 
-const trimSlashes = (value) => String(value || '').replace(/\/+$/, '');
+function normalizeApiBase(value) {
+  const raw = trimSlashes(value);
+  if (!raw || /^same[-_]?origin$/i.test(raw)) return '';
 
-/** Kept for backward compatibility with any module still importing it; no
- *  longer consulted by isLocalDevFrontend (see J1-style detection below). */
-export const LOCAL_STATIC_PORTS = new Set(['3000', '4173', '5173', '5500', '5501', '8080', '8081', '']);
-
-/** Hostnames that mean "this developer's machine" — same set J1 uses,
- *  plus the extra loopback literals Nexora already recognized. */
-export const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1', '0.0.0.0', '']);
-
-/** Default port Django/uvicorn listens on in development. */
-export const LOCAL_API_PORT = String(RUNTIME.localApiPort || readMeta('nexora-local-api-port') || '8000');
-
-export const PRODUCTION_API_ORIGIN = 'https://nexora-f397.onrender.com';
-const SANDBOX_PREVIEW_RE = /\.e2b\.app$/;
-
-export function isLocalHostname(hostname) {
-  return LOCAL_HOSTS.has(String(hostname || '').toLowerCase());
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new TypeError('Invalid API_BASE_URL: expected an absolute HTTP(S) origin or an empty value.');
+  }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
+    throw new TypeError('Invalid API_BASE_URL: only credential-free HTTP(S) origins are allowed.');
+  }
+  if (url.pathname !== '/' || url.search || url.hash) {
+    throw new TypeError('Invalid API_BASE_URL: provide the API origin only, without a path, query, or fragment.');
+  }
+  return url.origin;
 }
 
-export function isSandboxPreview(hostname) {
-  return SANDBOX_PREVIEW_RE.test(String(hostname || ''));
-}
-
-export function isLocalDevFrontend(location = globalThis.location) {
-  if (!location) return false;
-  if (location.protocol === 'file:') return true;
-  return isLocalHostname(location.hostname);
-}
-
-/** Swap an http(s) origin to its ws(s) equivalent, preserving TLS. */
+/** Swap an HTTP(S) origin to its WS(S) equivalent without changing TLS. */
 export function toWebSocketOrigin(httpOrigin) {
   const origin = trimSlashes(httpOrigin);
-  if (!origin) return '';
   if (origin.startsWith('https://')) return `wss://${origin.slice(8)}`;
   if (origin.startsWith('http://')) return `ws://${origin.slice(7)}`;
   if (origin.startsWith('wss://') || origin.startsWith('ws://')) return origin;
   return origin;
 }
 
-/** Swap a ws(s) origin back to http(s). */
+/** Swap a WS(S) origin back to HTTP(S). */
 export function toHttpOrigin(wsOrigin) {
   const origin = trimSlashes(wsOrigin);
   if (origin.startsWith('wss://')) return `https://${origin.slice(6)}`;
@@ -79,66 +65,25 @@ export function toHttpOrigin(wsOrigin) {
   return origin;
 }
 
-/* ============================================================
-   Resolution — J1-style: same machine (dev) vs sandbox preview vs prod
-   ============================================================ */
-
-const ENV_API_BASE_URL =
-  typeof process !== 'undefined' && process?.env?.API_BASE_URL ? String(process.env.API_BASE_URL) : '';
-
-export function resolveApiOrigin(location = globalThis.location, runtimeOverride = null) {
-  const rt = runtimeOverride || { ...readInlineConfig(), ...(globalThis.NEXORA_RUNTIME || {}) };
-  const explicit = trimSlashes(
-    rt.API_BASE_URL ||
-      rt.apiBaseUrl ||
-      rt.apiBase ||
-      rt.apiOrigin ||
-      globalThis.API_BASE_URL ||
-      ENV_API_BASE_URL ||
-      readMeta('nexora-api-base') ||
-      readMeta('api-base-url')
-  );
-  if (explicit) {
-    // An explicit "same-origin" marker is how a reverse-proxy deployment opts
-    // out of the hosted default below.
-    return /^same[-_]?origin$/i.test(explicit) ? '' : explicit;
-  }
-
-  if (!location) return PRODUCTION_API_ORIGIN;
-
-  const hostname = location.protocol === 'file:' ? '127.0.0.1' : location.hostname;
-
-  
-  if (isLocalDevFrontend(location)) {
-    const protocol = location.protocol === 'https:' ? 'https:' : 'http:';
-    return `${protocol}//${hostname}:${LOCAL_API_PORT}`;
-  }
-
-  // Sandboxed preview host — same-origin, proxied by the dev server.
-  if (isSandboxPreview(hostname)) return '';
-
-  // Already served BY the backend (reverse proxy / devserver.py): stay
-  // relative — no CORS preflight, no cookie-domain surprises.
-  if (location.origin && location.origin === PRODUCTION_API_ORIGIN) return '';
-
-  // Hosted frontend (Vercel) with the API on its own origin (Render).
-  return PRODUCTION_API_ORIGIN;
+/** Resolve only deployment-injected configuration; the page hostname is not a backend hint. */
+export function resolveApiOrigin(_location = globalThis.location, runtimeOverride = null) {
+  const runtime = runtimeOverride && typeof runtimeOverride === 'object' ? runtimeOverride : RUNTIME;
+  return normalizeApiBase(runtime.API_BASE_URL);
 }
 
 const API_ORIGIN = resolveApiOrigin();
 const API_PREFIX = (() => {
-  const value = trimSlashes(RUNTIME.apiPrefix || readMeta('nexora-api-prefix') || '/api');
-  if (!value) return '';
-  return value.startsWith('/') ? value : `/${value}`;
+  const raw = trimSlashes(RUNTIME.API_PREFIX || '/api');
+  return raw ? (raw.startsWith('/') ? raw : `/${raw}`) : '';
 })();
-
+const PAGE_ORIGIN = globalThis.location?.origin || '';
 const WS_ORIGIN = trimSlashes(
-  RUNTIME.wsBase || RUNTIME.wsOrigin || readMeta('nexora-ws-base') || toWebSocketOrigin(API_ORIGIN || (globalThis.location?.origin ?? ''))
+  RUNTIME.WS_BASE_URL || RUNTIME.WS_ORIGIN || toWebSocketOrigin(API_ORIGIN || PAGE_ORIGIN),
 );
 
 /**
- * Absolute (or root-relative) URL for an API path.
- * Accepts '/api/me/', 'api/me/' or 'me/' and always produces one canonical form.
+ * Build a canonical API URL. Callers may provide `/api/x/`, `api/x/`, or `x/`.
+ * When API_BASE_URL is empty, URLs remain root-relative for a same-origin proxy.
  */
 export function buildApiUrl(path) {
   const raw = String(path || '');
@@ -146,22 +91,18 @@ export function buildApiUrl(path) {
 
   let suffix = raw.startsWith('/') ? raw : `/${raw}`;
   if (API_PREFIX && !suffix.startsWith(`${API_PREFIX}/`) && suffix !== API_PREFIX) {
-    // Allow callers to pass either '/api/me/' or '/me/'.
     if (!suffix.startsWith('/api/')) suffix = `${API_PREFIX}${suffix}`;
   }
   return `${API_ORIGIN}${suffix}`;
 }
 
-/** Absolute URL for a WebSocket path such as '/ws/app/'. */
-export function buildSocketUrl(path) {
+/** Absolute (or root-relative) URL for a WebSocket endpoint. */
+export function buildSocketUrl(path = '/ws/app/') {
   const suffix = String(path || '/ws/app/');
   return `${WS_ORIGIN}${suffix.startsWith('/') ? suffix : `/${suffix}`}`;
 }
 
-/**
- * Resolve a media URL returned by the backend. Relative paths are joined to
- * the API origin so media works when the API lives on another origin.
- */
+/** Resolve a backend-returned media URL against the configured API origin. */
 export function resolveMediaUrl(value) {
   if (!value) return null;
   const raw = String(value);
@@ -170,23 +111,20 @@ export function resolveMediaUrl(value) {
 }
 
 export const config = Object.freeze({
-  /** '' means "same origin". */
+  /** Empty means same-origin; the API origin is public deployment configuration, not a secret. */
   API_BASE_URL: API_ORIGIN,
   API_ORIGIN,
   API_PREFIX,
   WS_ORIGIN,
-  /** 'cookie' (HttpOnly session, preferred) or 'bearer'. */
-  AUTH_MODE: String(RUNTIME.authMode || readMeta('nexora-auth-mode') || 'cookie').toLowerCase(),
-  CSRF_COOKIE: RUNTIME.csrfCookie || readMeta('nexora-csrf-cookie') || 'csrftoken',
-  CSRF_HEADER: RUNTIME.csrfHeader || readMeta('nexora-csrf-header') || 'X-CSRFToken',
-  REQUEST_TIMEOUT: Number(RUNTIME.requestTimeout) || 15000,
-  /** WebSocket handshake guard: recycle a stuck CONNECTING socket (ms). */
-  CONNECT_TIMEOUT: Number(RUNTIME.connectTimeoutMs) || 15000,
-  UPLOAD_TIMEOUT: Number(RUNTIME.uploadTimeout) || 0,
-  SOCKET_PATH: RUNTIME.socketPath || readMeta('nexora-ws-path') || '/ws/app/',
-  IS_LOCAL_DEV: isLocalDevFrontend(),
-  
-  DEBUG: RUNTIME.debug === true || isLocalDevFrontend(),
+  AUTH_MODE: String(RUNTIME.AUTH_MODE || 'cookie').toLowerCase(),
+  CSRF_COOKIE: RUNTIME.CSRF_COOKIE || 'csrftoken',
+  CSRF_HEADER: RUNTIME.CSRF_HEADER || 'X-CSRFToken',
+  REQUEST_TIMEOUT: Number(RUNTIME.REQUEST_TIMEOUT) || 15000,
+  CONNECT_TIMEOUT: Number(RUNTIME.CONNECT_TIMEOUT_MS) || 15000,
+  UPLOAD_TIMEOUT: Number(RUNTIME.UPLOAD_TIMEOUT) || 0,
+  SOCKET_PATH: RUNTIME.SOCKET_PATH || '/ws/app/',
+  IS_LOCAL_DEV: false,
+  DEBUG: RUNTIME.DEBUG === true,
 });
 
 export default config;

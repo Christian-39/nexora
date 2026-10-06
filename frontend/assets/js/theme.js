@@ -175,7 +175,7 @@ export async function loadBranding(options = {}) {
   // 3. Revalidate against the backend.
   loadPromise = (async () => {
     try {
-      const data = await api.publicConfig();
+      const data = await api.publicConfig({ cache: options.force ? 'reload' : 'default' });
       if (data && typeof data === 'object') {
         currentConfig = { ...EMPTY_CONFIG, ...data };
         writeCache(currentConfig);

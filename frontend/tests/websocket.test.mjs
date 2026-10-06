@@ -80,10 +80,10 @@ function installEnvironment() {
   };
 
   globalThis.location = {
-    hostname: 'nexora-eight-lilac.vercel.app',
+    hostname: 'frontend.example.test',
     port: '',
     protocol: 'https:',
-    origin: 'https://nexora-eight-lilac.vercel.app',
+    origin: 'https://frontend.example.test',
   };
   globalThis.window = Object.assign(target, { location: globalThis.location });
   globalThis.document = {
@@ -95,6 +95,7 @@ function installEnvironment() {
     createElement: () => ({ style: {}, setAttribute() {}, append() {} }),
   };
   globalThis.navigator = { onLine: true };
+  globalThis.NEXORA_RUNTIME = { API_BASE_URL: 'https://api.example.test' };
   globalThis.WebSocket = FakeWebSocket;
   globalThis.localStorage = {
     store: new Map(),
@@ -113,6 +114,9 @@ let moduleCounter = 0;
  */
 async function loadClient(refreshResponses = []) {
   installEnvironment();
+  const api = await import(new URL('../assets/js/api.js', import.meta.url).href);
+  api.resetAuthenticationFailures();
+  api.tokenStore.clear();
   FakeWebSocket.instances.length = 0;
 
   const refreshCalls = [];
@@ -157,11 +161,11 @@ const flush = async (times = 20) => {
 
 /* ------------------------------------------------------------------ tests */
 
-test('the socket URL is the production Render endpoint', async () => {
+test('the socket URL derives from the injected API_BASE_URL', async () => {
   const { realtime } = await loadClient();
   realtime.start('/ws/app/');
   assert.equal(FakeWebSocket.instances.length, 1);
-  assert.equal(FakeWebSocket.instances[0].url, 'wss://nexora-f397.onrender.com/ws/app/');
+  assert.equal(FakeWebSocket.instances[0].url, 'wss://api.example.test/ws/app/');
   realtime.stop();
 });
 

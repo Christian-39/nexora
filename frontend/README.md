@@ -1,8 +1,10 @@
 # NEXORA — Frontend
 
-Pure HTML + CSS + vanilla JavaScript (ES modules). No frameworks, no build step,
-no bundler, no runtime dependencies. It is a static bundle that talks to the
-Django / DRF / Channels backend over REST and WebSockets.
+Pure HTML + CSS + vanilla JavaScript (ES modules). No frameworks, bundler or
+runtime dependencies. The optional Node build step only injects public
+deployment configuration and versions the service worker; it does not compile
+or transform the application. The static bundle talks to Django/DRF/Channels
+over REST and WebSockets.
 
 ---
 
@@ -10,6 +12,9 @@ Django / DRF / Channels backend over REST and WebSockets.
 
 ```
 frontend/
+├── build.mjs           injects public API_BASE_URL and versions sw.js
+├── vercel.json         Vercel build/output and security/cache headers
+├── .env.example        blank public API_BASE_URL example
 ├── index.html          session probe → admin.html or chat.html
 ├── login.html          sign-in + enforced first-login PIN change
 ├── chat.html           conversation list + thread + composer (both roles)
@@ -37,58 +42,75 @@ circular imports (`ui` and `utils` are leaves; `api` depends only on `utils`).
 
 ## 2. Deployment configuration
 
-Configuration is read at load time from `<meta>` tags (or `window.NEXORA_RUNTIME`
-if you prefer to inject it):
+The browser never guesses a backend from the page hostname and contains no
+production API or loopback fallback. `assets/js/config.js` is the only browser
+module that reads the public `API_BASE_URL` value.
 
-| Meta name | Default | Meaning |
-|---|---|---|
-| `nexora-api-base` | `""` (auto) | Backend origin, e.g. `https://api.example.org`. Empty = resolve automatically (see below); `same-origin` = force relative URLs |
-| `nexora-api-prefix` | `/api` | API path prefix |
-| `nexora-auth-mode` | `cookie` | `cookie` (HttpOnly session — recommended) or `bearer` |
+### Vercel build
 
-**Automatic resolution** (`assets/js/config.js`, the only module allowed to
-name a host):
+Set the Vercel project **Root Directory** to `frontend`, configure the public
+`API_BASE_URL` environment variable, and let `frontend/vercel.json` run:
 
-1. `window.NEXORA_RUNTIME.apiBase` / `nexora-config` JSON blob;
-2. `<meta name="nexora-api-base">`;
-3. local dev — a page on `localhost`/`127.0.0.1` at a static-server port uses
-   **the same hostname** on port 8000 (`http://127.0.0.1:5500` →
-   `http://127.0.0.1:8000`; the hostname is never rewritten, because cookies are
-   scoped by host);
-4. hosted — `PRODUCTION_API_ORIGIN`, i.e.
-   `https://nexora-f397.onrender.com`;
-5. same origin — when the page is already served by the backend, or when an
-   override says `same-origin`.
+```sh
+node build.mjs
+```
 
-The WebSocket origin is always derived from the resolved API origin
-(`http→ws`, `https→wss`), so production resolves to
-`wss://nexora-f397.onrender.com/ws/app/` and local to
-`ws://127.0.0.1:8000/ws/app/`. No module builds its own socket host.
+The build copies the static app to `dist/`, injects the JSON-encoded public
+origin into every HTML page, and versions the service-worker cache using both
+the commit identity and origin. Example value:
 
-**This deployment is cross-origin** (frontend on Vercel, API on Render), so the
-backend must send `Access-Control-Allow-Credentials: true` with an explicit
-`Access-Control-Allow-Origin`, and the session cookies must be
-`SameSite=None; Secure`. A same-origin reverse-proxy layout also still works —
-set `nexora-api-base` to `same-origin` and keep `SameSite=Lax`.
+```text
+API_BASE_URL=https://api.example.org
+```
 
-`vercel.json` pins HTML/JS/CSS and `sw.js` to `max-age=0, must-revalidate` so a
-new deployment is never hidden behind a stale cached bundle.
+It must be an HTTP(S) origin only (no credentials, path, query or fragment).
+Vercel builds reject a missing value and loopback origins. Use the explicit
+value `same-origin` only when a reverse proxy serves `/api/` and `/ws/` from the
+same origin as the pages. `API_BASE_URL` is public configuration, never a
+secret; do not put credentials or secret keys in it.
 
-**Tests:** `node --test tests/` (Node's built-in runner; no npm dependencies).
+### Local static hosting
+
+```sh
+python3 -m http.server 5500
+```
+
+Without an injected build value the app uses root-relative `/api/` URLs and the
+current page origin for WebSockets. For a separate local API origin, set
+`API_BASE_URL` in an untracked `frontend/.env` or in the shell before running
+`node build.mjs`. The committed `.env.example` intentionally leaves the value
+blank. Never commit a real frontend `.env`.
+
+The `API_PREFIX` remains `/api`. REST requests live in `assets/js/api.js`; the
+WebSocket scheme/origin is derived centrally (`http→ws`, `https→wss`) from the
+configured API origin. No other module maintains a backend host.
+
+For a cross-origin frontend/API deployment, the backend must return an explicit
+`Access-Control-Allow-Origin` plus `Access-Control-Allow-Credentials: true`,
+trust the frontend origin for CSRF, and set auth cookies `SameSite=None; Secure`.
+For a same-origin reverse proxy, configure cookie policy and proxy routes in the
+backend deployment instead; the browser still uses relative API URLs.
+
+HTML and code responses are revalidated by Vercel. The service worker versions
+its shell cache when `API_BASE_URL` changes, so a previous deployment cannot
+silently keep the old API origin.
+
+**Tests:** `node --test frontend/tests/` (Node's built-in runner; no npm
+dependencies).
 
 ### Authentication transport
 
-* **cookie mode (default).** The browser holds HttpOnly authentication cookies.
-  Nothing is duplicated into `localStorage`. The client obtains the CSRF token
-  from `/api/auth/csrf/` JSON, retains it only in memory, and sends it as
-  `X-CSRFToken` on unsafe methods. Reading `csrftoken` remains a same-origin
-  fallback; a Vercel page cannot read a cookie scoped to the Render hostname.
-* **bearer mode.** The access token is kept **in memory only** (`api.js`
-  `tokenStore`) and is never persisted. A page reload re-establishes the session
-  via `POST /api/auth/refresh/` using the refresh cookie.
+The backend contract is cookie-based: access and rotating refresh tokens are
+HttpOnly, the refresh cookie is path-scoped, and CSRF is required on unsafe
+requests including login and refresh. The central API layer obtains the CSRF
+token from `/api/auth/csrf/` JSON and keeps it in memory; JavaScript never
+copies a PIN, refresh token or session cookie into web storage.
 
-Concurrent 401s trigger exactly one de-duplicated refresh attempt; if it fails,
-an `unauthorized` event is emitted and the user is routed to sign-in.
+Concurrent authenticated 401s share one refresh request. A definitive refresh
+rejection is latched for the tab until a verified session or successful login;
+a timeout, network failure or server outage does not erase the cached display
+snapshot or force a false logout. WebSockets authenticate only with the
+HttpOnly access cookie—credentials are never appended to a URL.
 
 ---
 
@@ -206,8 +228,9 @@ GET  /search/
 > treat a repeat as idempotent and echo `client_id` back in the created message.
 
 ### WebSocket
-Endpoint: `/ws/app/` on the API origin (`ws://`/`wss://` derived automatically).
-In bearer mode a short-lived `?token=` query parameter is appended.
+Endpoint: `/ws/app/` on the configured API origin (`ws://`/`wss://` derived
+automatically). The handshake uses the HttpOnly access cookie only; no token or
+other credential is placed in the URL.
 
 Frames are `{ "type": "...", ...payload }`. Client → server:
 `conversation.join`, `conversation.leave`, `typing`, `message.read`,
@@ -268,10 +291,11 @@ re-resolved automatically on load failure.
 * PINs are masked, never logged, never stored, and the input is wiped after
   submission. Sign-in failures return a deliberately generic message so account
   existence is not disclosed.
-* The service worker **never** caches `/api/` responses, private media, or
-  anything authenticated. Only the public application shell and static assets
-  are cached (`network-only` for API, `stale-while-revalidate` for assets,
-  `network-first + offline.html` for navigations).
+* The service worker caches the public application shell/assets and only an
+  explicit allowlist of anonymous branding/config endpoints, when the response
+  is marked `Cache-Control: public` and does not vary on cookies or
+  authorization. Every other `/api/` response, private media and authenticated
+  data stay network-only; no private API data enters Cache Storage.
 * Notification click routing accepts only same-scope relative paths, focuses an
   existing window when possible, and re-authenticates on cold start — a
   notification URL can never expose conversation data to an unauthenticated
@@ -318,12 +342,10 @@ user content, and constrained media widths.
 
 ## 8. PWA
 
-* `manifest.webmanifest` with maskable icon and shortcuts. For fully dynamic
-  PWA branding, serve this file from Django and inject `name` / `short_name` /
-  `theme_color` / `icons` from the same configuration as `/public/config/`; the
-  static file here is the fallback. Document metadata (`theme-color`,
-  `application-name`, `apple-mobile-web-app-title`, favicon) is always updated
-  dynamically at runtime.
+* `manifest.webmanifest` with maskable icon and shortcuts is the static
+  fallback. After public configuration loads, the page refreshes document
+  metadata and may create a blob-backed manifest with the same public branding;
+  no authenticated data is included.
 * Updates are non-destructive: a new worker installs but does not activate until
   the user accepts a "Reload" toast, which sends `NEXORA_SKIP_WAITING`.
 * `navigator.setAppBadge()` reflects unread state where supported, with a silent
@@ -338,8 +360,9 @@ user content, and constrained media widths.
 python3 -m http.server 8080 --directory frontend
 ```
 
-Point `nexora-api-base` at your Django dev server, or (better) run both behind
-one reverse proxy so cookies and the service worker share an origin.
+The default is same-origin. If the Django API is on a separate local origin,
+set `API_BASE_URL` in an untracked `frontend/.env` or build-time environment,
+then run `node build.mjs`; for same-origin proxying, set `API_BASE_URL=same-origin`.
 
 Service workers and `getUserMedia` (voice notes) require a secure context:
 `https://` or `http://localhost`.

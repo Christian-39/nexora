@@ -266,39 +266,40 @@ def test_every_json_response_uses_the_same_envelope(admin, member_a, private_thr
 
 
 # ---------------------------------------------------------------------------
-# Runtime origin resolution (Vercel frontend ↔ Render backend)
+# Build-injected API origin; no hardcoded backend/loopback fallback
 # ---------------------------------------------------------------------------
 
 CSS = FRONTEND / "assets" / "css"
 
-PRODUCTION_API = "https://nexora-f397.onrender.com"
-PRODUCTION_FRONTEND = "https://nexora-eight-lilac.vercel.app"
 
-
-def test_config_is_the_only_module_that_names_the_backend_origin():
-    """config.js resolves the API origin; nothing else may hardcode a host."""
+def test_api_origin_is_read_from_deployment_config_without_a_hardcoded_host():
     source = (JS / "config.js").read_text()
-    assert PRODUCTION_API in source, "the deployed backend origin must be resolvable"
-    assert PRODUCTION_FRONTEND not in source, "the static host must never be used as an API origin"
+    assert "API_BASE_URL" in source
+    assert "resolveApiOrigin" in source
+    assert "location.hostname" not in source
+    assert "onrender.com" not in source
+    assert "127.0.0.1" not in source
+    assert "localhost" not in source
 
     for path in sorted(JS.glob("*.js")):
-        if path.name == "config.js":
-            continue
-        assert "onrender.com" not in path.read_text(), f"{path.name} hardcodes the backend host"
+        assert "onrender.com" not in path.read_text(), f"{path.name} hardcodes a backend host"
 
 
-def test_local_development_keeps_the_hostname_and_uses_port_8000():
-    source = (JS / "config.js").read_text()
-    assert "LOCAL_API_PORT" in source and "'8000'" in source
-    # 127.0.0.1 must not be silently rewritten to localhost (cookies are
-    # scoped by host), so the resolver reuses location.hostname.
-    assert "location.hostname" in source
+def test_vercel_build_requires_public_api_base_url_and_injects_each_page():
+    source = (FRONTEND / "build.mjs").read_text()
+    assert "process.env.API_BASE_URL" in source
+    assert "requires API_BASE_URL" in source
+    assert "nexora-config" in source
+    assert "API_BASE_URL: apiBaseUrl" in source
+    assert "const VERSION" in (FRONTEND / "sw.js").read_text()
+
+    env_example = (FRONTEND / ".env.example").read_text()
+    assert "API_BASE_URL=" in env_example
 
 
-def test_the_websocket_origin_is_derived_from_the_api_origin():
+def test_websocket_origin_uses_centralized_api_configuration():
     ws = (JS / "websocket.js").read_text()
     assert "apiConfig.wsOrigin" in ws
-    # No second source of truth, and no scheme guessing from the page origin.
     assert "window.location.origin" not in ws
     config_source = (JS / "config.js").read_text()
     assert "toWebSocketOrigin" in config_source

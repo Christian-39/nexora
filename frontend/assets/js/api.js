@@ -68,6 +68,33 @@ export const apiEvents = new Emitter();
 
 let accessToken = null;
 let refreshPromise = null;
+let refreshWaiters = 0;
+let lastRefreshOutcome = 'ok';
+const REFRESH_REJECTED_KEY = 'nexora.auth.refresh-rejected.v1';
+
+function readRefreshRejected() {
+  try {
+    return globalThis.sessionStorage?.getItem(REFRESH_REJECTED_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+let refreshRejected = readRefreshRejected();
+
+function setRefreshRejected(value) {
+  refreshRejected = !!value;
+  try {
+    if (refreshRejected) globalThis.sessionStorage?.setItem(REFRESH_REJECTED_KEY, '1');
+    else globalThis.sessionStorage?.removeItem(REFRESH_REJECTED_KEY);
+  } catch { /* storage may be unavailable; in-memory single-flight still applies */ }
+}
+
+/** Clear a definitive anonymous state after a successful login/session validation. */
+export function resetAuthenticationFailures() {
+  setRefreshRejected(false);
+  lastRefreshOutcome = 'ok';
+}
 
 export const tokenStore = {
   get: () => accessToken,
@@ -346,13 +373,13 @@ export async function ensureCsrfToken() {
   return csrfPromise;
 }
 
-function authHeaders(method, extra = {}) {
+function authHeaders(method, extra = {}, { auth = true } = {}) {
   const headers = { Accept: 'application/json', ...extra };
   if (!SAFE_METHODS.has(method)) {
     const csrf = csrfToken || readableCsrfCookie();
     if (csrf) headers[DEFAULTS.csrfHeader] = csrf;
   }
-  if (AUTH_MODE === 'bearer' && accessToken) {
+  if (auth && AUTH_MODE === 'bearer' && accessToken) {
     headers.Authorization = `Bearer ${accessToken}`;
   }
   headers['X-Requested-With'] = 'XMLHttpRequest';
@@ -371,45 +398,67 @@ function authHeaders(method, extra = {}) {
  * Distinguishing the two failures is what stops a network blip from signing
  * the user out (and an expired session from reconnecting forever).
  */
-let lastRefreshOutcome = 'ok';
-
-async function tryRefreshSession() {
-  if (refreshPromise) return refreshPromise;
-  refreshPromise = (async () => {
-    try {
-      // Refresh is an unsafe request too. This is especially important when a
-      // GET /api/me/ 401 is the first request made after a page load.
-      await ensureCsrfToken();
-      const response = await fetch(buildUrl('/api/auth/refresh/'), {
-        method: 'POST',
-        credentials: 'include',
-        headers: authHeaders('POST', { 'Content-Type': 'application/json' }),
-        body: '{}',
-      });
-      if (!response.ok) {
-        lastRefreshOutcome = response.status === 401 || response.status === 403 ? 'rejected' : 'unreachable';
-        return false;
+async function performSessionRefresh() {
+  try {
+    // Refresh is an unsafe request too. This is especially important when a
+    // GET /api/me/ 401 is the first request made after a page load.
+    await ensureCsrfToken();
+    const response = await fetch(buildUrl('/api/auth/refresh/'), {
+      method: 'POST',
+      credentials: 'include',
+      headers: authHeaders('POST', { 'Content-Type': 'application/json' }, { auth: false }),
+      body: '{}',
+      cache: 'no-store',
+    });
+    if (!response.ok) {
+      if (response.status === 401 || response.status === 403) {
+        lastRefreshOutcome = 'rejected';
+        setRefreshRejected(true);
+        return { ok: false, reason: 'rejected' };
       }
-      const payload = await parseBody(response);
-      const data = unwrap(payload) || {};
-      if (AUTH_MODE === 'bearer') {
-        const token = data.access || data.access_token || data.token;
-        if (!token) {
-          lastRefreshOutcome = 'rejected';
-          return false;
-        }
-        tokenStore.set(token);
-      }
-      lastRefreshOutcome = 'ok';
-      return true;
-    } catch {
+      // A 5xx, rate limit or network-side response does not prove the refresh
+      // cookie is invalid; keep the local profile and retry on a later request.
       lastRefreshOutcome = 'unreachable';
-      return false;
-    } finally {
-      setTimeout(() => { refreshPromise = null; }, 0);
+      return { ok: false, reason: 'unreachable' };
     }
-  })();
-  return refreshPromise;
+
+    const payload = await parseBody(response);
+    const data = unwrap(payload) || {};
+    if (AUTH_MODE === 'bearer') {
+      const token = data.access || data.access_token || data.token;
+      if (!token) {
+        lastRefreshOutcome = 'rejected';
+        setRefreshRejected(true);
+        return { ok: false, reason: 'rejected' };
+      }
+      tokenStore.set(token);
+    }
+    resetAuthenticationFailures();
+    return { ok: true, reason: 'ok' };
+  } catch {
+    lastRefreshOutcome = 'unreachable';
+    return { ok: false, reason: 'unreachable' };
+  }
+}
+
+function tryRefreshSession() {
+  // A 401/403 from refresh is definitive for this tab's current cookies.
+  // Remember it across HTML navigations until a verified session or login.
+  if (refreshRejected) {
+    lastRefreshOutcome = 'rejected';
+    return Promise.resolve({ ok: false, reason: 'rejected' });
+  }
+  if (!refreshPromise) refreshPromise = performSessionRefresh();
+
+  const shared = refreshPromise;
+  refreshWaiters += 1;
+  return shared.finally(() => {
+    refreshWaiters -= 1;
+    // Release immediately after the final current waiter has observed the
+    // outcome. Concurrent 401s still share one promise; a later request can
+    // retry promptly after a transient refresh-service failure.
+    if (refreshWaiters === 0 && refreshPromise === shared) refreshPromise = null;
+  });
 }
 
 /**
@@ -422,9 +471,8 @@ async function tryRefreshSession() {
  *
  * @returns {Promise<{ok:boolean, reason:'ok'|'rejected'|'unreachable'}>}
  */
-export async function refreshSession() {
-  const ok = await tryRefreshSession();
-  return { ok, reason: ok ? 'ok' : lastRefreshOutcome };
+export function refreshSession() {
+  return tryRefreshSession();
 }
 
 /**
@@ -447,7 +495,8 @@ export async function request(path, options = {}) {
   // page navigating away can never cancel another caller's request.
   if (SAFE_METHODS.has(verb) && !options.signal) {
     const url = buildUrl(path, options.params);
-    return dedupeGet(url, () => executeRequest(path, options));
+    const key = `${url}\n${options.auth === false ? 'public' : 'authenticated'}\n${options.cache || 'no-store'}`;
+    return dedupeGet(key, () => executeRequest(path, options));
   }
   return executeRequest(path, options);
 }
@@ -463,6 +512,8 @@ async function executeRequest(path, options = {}) {
     headers: extraHeaders = {},
     raw = false,
     allowRefresh = true,
+    auth = true,
+    cache: cacheMode = 'no-store',
   } = options;
 
   const verb = method.toUpperCase();
@@ -490,8 +541,8 @@ async function executeRequest(path, options = {}) {
       method: verb,
       signal,
       credentials: 'include',
-      headers: authHeaders(verb, extraHeaders),
-      cache: 'no-store',
+      headers: authHeaders(verb, extraHeaders, { auth }),
+      cache: cacheMode,
       mode: 'cors',
     };
 
@@ -542,6 +593,7 @@ async function executeRequest(path, options = {}) {
     cleanup();
 
     if (response.ok) {
+      if (auth) resetAuthenticationFailures();
       const payload = await parseBody(response);
       const data = unwrap(payload);
       if (raw) {
@@ -560,18 +612,28 @@ async function executeRequest(path, options = {}) {
     const payload = await parseBody(response);
     const error = toApiError(response.status, payload, response.headers);
 
-    if (response.status === 401 && allowRefresh && !refreshed && !isAuthPath(path)) {
+    if (response.status === 401 && auth && allowRefresh && !refreshed && !isAuthPath(path)) {
       refreshed = true;
-      const ok = await tryRefreshSession();
-      if (ok) continue;
+      const refreshResult = await tryRefreshSession();
+      if (refreshResult.ok) continue;
+      if (refreshResult.reason === 'unreachable') {
+        // Do not convert a temporary refresh-service outage into a false logout.
+        // Preserve the presentation snapshot and let the UI offer retry.
+        throw new ApiError({
+          message: 'Your session could not be verified because the service is temporarily unreachable. Please retry.',
+          code: 'AUTH_REFRESH_UNAVAILABLE',
+          status: 0,
+          cause: error,
+        });
+      }
       tokenStore.clear();
       apiEvents.emit('unauthorized', error);
       throw error;
     }
 
     if (response.status === 401) {
-      tokenStore.clear();
-      if (!isAuthPath(path)) apiEvents.emit('unauthorized', error);
+      if (auth) tokenStore.clear();
+      if (auth && !isAuthPath(path)) apiEvents.emit('unauthorized', error);
       throw error;
     }
 
@@ -732,7 +794,7 @@ export function fetchPageUrl(url, options = {}) {
 
 export const api = {
   /* ---- public (unauthenticated) ---- */
-  publicConfig: (options) => request('/api/public/config/', { ...options, auth: false, allowRefresh: false, timeout: 10000 }),
+  publicConfig: (options = {}) => request('/api/public/config/', { cache: 'default', ...options, auth: false, allowRefresh: false, timeout: 10000 }),
 
   /* ---- auth ---- */
   auth: {

@@ -61,7 +61,7 @@ class Migration(migrations.Migration):
                 ('created_at', models.DateTimeField(auto_now_add=True)),
                 ('updated_at', models.DateTimeField(auto_now=True)),
                 ('id', models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True, serialize=False)),
-                ('storage_key', models.CharField(max_length=512, unique=True)),
+                ('storage_key', models.CharField(max_length=512)),
                 ('original_name', models.CharField(max_length=255)),
                 ('mime_type', models.CharField(max_length=100)),
                 ('size', models.PositiveBigIntegerField()),

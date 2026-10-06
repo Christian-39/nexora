@@ -144,8 +144,9 @@ describe('Mobile PWA chat layout, swipe-to-reply, and composer tray invariants',
     assert.match(chatCss, /\.thread__jump\s*\{[^}]*width:\s*34px;\s*height:\s*34px/s);
   });
 
-  test('frontend/.env.example documents API_BASE_URL=https://nexora-f397.onrender.com', () => {
+  test('frontend/.env.example documents the public API_BASE_URL build variable', () => {
     const envExample = readFileSync(join(FRONTEND_DIR, '.env.example'), 'utf8');
-    assert.match(envExample, /^API_BASE_URL=https:\/\/nexora-f397\.onrender\.com$/m);
+    assert.match(envExample, /^API_BASE_URL=$/m);
+    assert.doesNotMatch(envExample, /onrender\.com|vercel\.app|localhost|127\.0\.0\.1/i);
   });
 });

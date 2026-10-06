@@ -5,8 +5,9 @@ from __future__ import annotations
 import pytest
 from rest_framework.test import APIClient
 
+from apps.core.hashes import sha256_hex
 from apps.notifications.models import Notification, PushDelivery, PushSubscription
-from apps.platform_settings.models import PlatformConfiguration
+from apps.platform_settings.models import BrandingAsset, PlatformConfiguration
 from tests.conftest import authed, client_id, jpeg_bytes
 
 ENDPOINT = "https://fcm.googleapis.com/fcm/send/abc123"
@@ -99,6 +100,10 @@ def test_branding_asset_upload_and_public_serving(admin, member_a, settings, tmp
         "/api/settings/assets/logo/", {"file": jpeg_bytes(size=(64, 64))}, format="multipart"
     )
     assert response.status_code in (200, 201), response.data
+
+    asset = BrandingAsset.objects.get(kind="LOGO")
+    assert asset.storage_key_hash == sha256_hex(asset.storage_key)
+    assert len(asset.storage_key_hash) == 64
 
     public = APIClient().get("/api/public/config/").json()["data"]
     assert public["logo_url"].endswith("/api/public/branding/logo/")
@@ -195,6 +200,8 @@ def test_push_subscribe_and_unsubscribe(member_a):
 
     subscription = PushSubscription.objects.get()
     assert subscription.user == member_a and subscription.is_active
+    assert subscription.endpoint_hash == sha256_hex(ENDPOINT)
+    assert len(subscription.endpoint_hash) == 64
 
     # Re-subscribing with the same endpoint updates instead of duplicating.
     client.post(

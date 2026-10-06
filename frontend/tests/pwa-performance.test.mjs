@@ -17,7 +17,15 @@ test('installed shell navigation and code are served cache-first', () => {
 });
 
 
-test('API traffic remains network-only and outside Cache Storage', () => {
+test('only explicit public config/branding routes can use service-worker cache', () => {
+  assert.match(sw, /PUBLIC_CACHEABLE_PATH\s*=\s*\/\^\\\/api\\\/public\\\//);
+  assert.match(sw, /staleWhileRevalidatePublic\(request, event\)/);
+  assert.match(sw, /request\.cache === 'reload' \|\| request\.cache === 'no-store'/);
+  assert.match(sw, /response\.type === 'basic' && isPublic && !isPrivate/);
+  assert.match(sw, /\['cookie', 'authorization'\]/);
+});
+
+test('all other API traffic remains network-only and outside Cache Storage', () => {
   assert.match(sw, /PRIVATE_PATH[\s\S]*networkOnlyApi/);
   const networkOnly = sw.split('async function networkOnlyApi', 2)[1].split('async function handleNavigation', 1)[0];
   assert.doesNotMatch(networkOnly, /caches?\.(?:open|put|match)/);

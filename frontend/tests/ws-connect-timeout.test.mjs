@@ -51,10 +51,10 @@ function installEnvironment() {
     },
   };
   globalThis.location = {
-    hostname: 'nexora-eight-lilac.vercel.app',
+    hostname: 'frontend.example.test',
     port: '',
     protocol: 'https:',
-    origin: 'https://nexora-eight-lilac.vercel.app',
+    origin: 'https://frontend.example.test',
   };
   globalThis.window = Object.assign(target, { location: globalThis.location });
   globalThis.document = {
@@ -80,7 +80,7 @@ async function loadClient({ connectTimeoutMs = 60 } = {}) {
     json: async () => ({ success: true, message: '', data: {} }),
     text: async () => '',
   });
-  globalThis.NEXORA_RUNTIME = { connectTimeoutMs };
+  globalThis.NEXORA_RUNTIME = { API_BASE_URL: 'https://api.example.test', CONNECT_TIMEOUT_MS: connectTimeoutMs };
   const suffix = `?case=${Math.random().toString(36).slice(2)}`;
   const mod = await import(new URL(`../assets/js/websocket.js${suffix}`, import.meta.url).href);
   return { ...mod, bus };

@@ -81,6 +81,18 @@ def test_pin_change_is_enforced_before_other_endpoints(member_a, admin):
 
 
 @pytest.mark.django_db
+def test_missing_refresh_cookie_is_rejected_and_cleared(member_a):
+    client = APIClient()
+    client.get("/api/auth/csrf/")
+    token = client.cookies["csrftoken"].value
+    response = client.post("/api/auth/refresh/", {}, format="json", HTTP_X_CSRFTOKEN=token)
+    assert response.status_code == 401
+    assert response.json()["code"] == "INVALID_SESSION"
+    assert response.cookies["nexora_access"]["max-age"] == 0
+    assert response.cookies["nexora_refresh"]["max-age"] == 0
+
+
+@pytest.mark.django_db
 def test_refresh_rotates_and_revoked_session_is_rejected(member_a):
     member_a.credential_state = "CHANGED"
     member_a.save(update_fields=["credential_state"])

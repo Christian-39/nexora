@@ -24,10 +24,10 @@ function installEnvironment() {
     removeEventListener() {},
   };
   globalThis.location = {
-    hostname: 'nexora-eight-lilac.vercel.app',
+    hostname: 'frontend.example.test',
     port: '',
     protocol: 'https:',
-    origin: 'https://nexora-eight-lilac.vercel.app',
+    origin: 'https://frontend.example.test',
   };
   globalThis.window = Object.assign(target, { location: globalThis.location });
   globalThis.document = {

@@ -12,7 +12,7 @@
  * client can classify, never a stale message list.
  */
 
-const VERSION = 'v1.5.0';
+const VERSION = 'v1.6.0'; // build.mjs replaces this with an environment-sensitive build id.
 const PRECACHE = `nexora-shell-${VERSION}`;
 const RUNTIME = `nexora-static-${VERSION}`;
 const OFFLINE_URL = 'offline.html';
@@ -74,6 +74,7 @@ const PRECACHE_URLS = [
  * person to use the device, so these are always network-only.
  */
 const PRIVATE_PATH = /\/api\//;
+const PUBLIC_CACHEABLE_PATH = /^\/api\/public\/(?:config\/|branding\/(?:logo|favicon)\/)$/;
 
 /* ============================================================
    Install / activate
@@ -142,7 +143,16 @@ self.addEventListener('fetch', (event) => {
 
   const url = new URL(request.url);
 
-  // Never touch API traffic, WebSocket upgrades or cross-origin media.
+  // Public branding/config is anonymous and safe to cache. The backend also
+  // emits explicit public Cache-Control headers; all other API data stays
+  // network-only. Cross-origin API requests are not controlled by this worker.
+  if (url.origin === self.location.origin && PUBLIC_CACHEABLE_PATH.test(url.pathname)) {
+    event.respondWith(staleWhileRevalidatePublic(request, event));
+    return;
+  }
+
+  // Never cache authenticated API traffic, private media, WebSockets or
+  // cross-origin resources. The default remains network-only for every /api/.
   if (PRIVATE_PATH.test(url.pathname)) {
     event.respondWith(networkOnlyApi(request));
     return;
@@ -197,9 +207,44 @@ async function cacheFirstCode(request) {
   return response;
 }
 
+/** Safe stale-while-revalidate strategy for the explicitly public config/assets only. */
+async function staleWhileRevalidatePublic(request, event) {
+  const cache = await caches.open(RUNTIME);
+  const bypassCache = request.cache === 'reload' || request.cache === 'no-store';
+  const cached = bypassCache ? null : await cache.match(request, { ignoreSearch: false });
+  const refresh = fetch(request)
+    .then(async (response) => {
+      const directives = (response.headers.get('Cache-Control') || '')
+        .toLowerCase().split(',').map((item) => item.trim());
+      const vary = (response.headers.get('Vary') || '').toLowerCase();
+      const isPublic = directives.some((item) => item === 'public' || item.startsWith('public='));
+      const isPrivate = directives.some((item) => item === 'private' || item.startsWith('private=') || item === 'no-store');
+      if (
+        response.ok && response.type === 'basic' && isPublic && !isPrivate &&
+        !response.headers.has('Set-Cookie') && vary !== '*' &&
+        !vary.split(',').map((item) => item.trim()).some((item) => ['cookie', 'authorization'].includes(item))
+      ) {
+        await cache.put(request, response.clone());
+      }
+      return response;
+    })
+    .catch(() => null);
+
+  if (cached) {
+    // The shell receives the cached public data immediately; refresh runs
+    // without holding up render and only updates this same safe endpoint.
+    event.waitUntil(refresh.then(() => undefined));
+    return cached;
+  }
+  return (await refresh) || new Response(
+    JSON.stringify({ success: false, message: 'Public configuration is temporarily unavailable.', code: 'OFFLINE', errors: {} }),
+    { status: 503, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } },
+  );
+}
+
 /**
- * API requests are never served from cache. On transport failure we synthesize
- * a normalized error envelope so api.js can classify it as offline.
+ * API requests are never served from cache (except the explicit public
+ * allow-list above). On transport failure synthesize an offline envelope.
  */
 async function networkOnlyApi(request) {
   try {

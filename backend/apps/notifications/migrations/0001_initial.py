@@ -21,7 +21,7 @@ class Migration(migrations.Migration):
                 ('created_at', models.DateTimeField(auto_now_add=True)),
                 ('updated_at', models.DateTimeField(auto_now=True)),
                 ('id', models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True, serialize=False)),
-                ('endpoint', models.URLField(max_length=1000, unique=True)),
+                ('endpoint', models.URLField(max_length=1000)),
                 ('p256dh', models.CharField(max_length=255)),
                 ('auth', models.CharField(max_length=255)),
                 ('device_label', models.CharField(blank=True, max_length=120)),

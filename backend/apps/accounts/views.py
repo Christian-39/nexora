@@ -175,7 +175,9 @@ def refresh(request):
     _require_csrf(request)
     token_value = request.COOKIES.get(settings.REFRESH_COOKIE)
     if not token_value:
-        return failure("Session expired.", "INVALID_SESSION", 401)
+        response = failure("Session expired.", "INVALID_SESSION", 401)
+        _clear_cookies(response)
+        return response
     try:
         token = RefreshToken(token_value)
         session = DeviceSession.objects.get(

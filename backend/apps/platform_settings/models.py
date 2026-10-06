@@ -94,8 +94,25 @@ class BrandingAsset(TimeStampedModel):
         FAVICON = "FAVICON"
 
     kind = models.CharField(max_length=10, choices=Kind.choices, unique=True)
-    storage_key = models.CharField(max_length=512, unique=True)
+    storage_key = models.CharField(max_length=512)
+    storage_key_hash = models.CharField(max_length=64, editable=False)
     mime_type = models.CharField(max_length=100)
     size = models.PositiveIntegerField()
     width = models.PositiveIntegerField()
     height = models.PositiveIntegerField()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["storage_key_hash"], name="unique_branding_storage_key_hash"
+            )
+        ]
+
+    def save(self, *args, **kwargs):
+        from apps.core.hashes import sha256_hex
+
+        self.storage_key_hash = sha256_hex(self.storage_key)
+        update_fields = kwargs.get("update_fields")
+        if update_fields is not None and "storage_key" in update_fields:
+            kwargs["update_fields"] = set(update_fields) | {"storage_key_hash"}
+        return super().save(*args, **kwargs)

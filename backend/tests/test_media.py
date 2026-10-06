@@ -8,6 +8,7 @@ import pytest
 from django.core.files.storage import default_storage
 
 from apps.conversations.models import Attachment
+from apps.core.hashes import sha256_hex
 from apps.media.validators import safe_display_name, signature_mime, storage_key, validate_upload
 from tests.conftest import authed, client_id, jpeg_bytes
 
@@ -174,6 +175,8 @@ def test_image_upload_creates_message_attachment_and_derivatives(private_thread,
     assert data["media"]["url"].endswith(f"/api/media/{data['media']['id']}/")
 
     attachment = Attachment.objects.get()
+    assert attachment.storage_key_hash == sha256_hex(attachment.storage_key)
+    assert len(attachment.storage_key_hash) == 64
     # MEDIA_PROCESS_INLINE runs the same code path as the worker.
     attachment.refresh_from_db()
     assert attachment.processing_state == "READY"

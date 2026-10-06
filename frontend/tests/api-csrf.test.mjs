@@ -9,17 +9,17 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 const API_MODULE = new URL('../assets/js/api.js', import.meta.url).href;
-const API_ORIGIN = 'https://nexora-f397.onrender.com';
+const API_ORIGIN = 'https://api.example.test';
 let moduleCounter = 0;
 
 function installEnvironment() {
   const listeners = new Map();
   globalThis.location = {
-    hostname: 'nexora-eight-lilac.vercel.app',
+    hostname: 'frontend.example.test',
     port: '',
     protocol: 'https:',
-    origin: 'https://nexora-eight-lilac.vercel.app',
-    href: 'https://nexora-eight-lilac.vercel.app/login.html',
+    origin: 'https://frontend.example.test',
+    href: 'https://frontend.example.test/login.html',
   };
   globalThis.window = {
     location: globalThis.location,
@@ -36,7 +36,7 @@ function installEnvironment() {
     getElementById: () => null,
   };
   globalThis.navigator = { onLine: true };
-  delete globalThis.NEXORA_RUNTIME;
+  globalThis.NEXORA_RUNTIME = { API_BASE_URL: API_ORIGIN };
 }
 
 function jsonResponse(status, payload) {
