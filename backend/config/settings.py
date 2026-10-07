@@ -43,19 +43,6 @@ SECRET_KEY = config(
 
 ALLOWED_HOSTS = config("ALLOWED_HOSTS", default="localhost,127.0.0.1,[::1]", cast=csv_list)
 
-# Production HTTP and WebSocket traffic must pass through the authenticated
-# Security Relay. Local development/tests may opt out explicitly.
-SECURITY_RELAY_REQUIRED = config(
-    "SECURITY_RELAY_REQUIRED", default=(DJANGO_ENV == "production"), cast=boolean
-)
-SECURITY_RELAY_TOKEN = config("SECURITY_RELAY_TOKEN", default="")
-if SECURITY_RELAY_REQUIRED and len(SECURITY_RELAY_TOKEN) < 32:
-    raise ImproperlyConfigured(
-        "SECURITY_RELAY_TOKEN must be configured with at least 32 characters when SECURITY_RELAY_REQUIRED is enabled."
-    )
-if DJANGO_ENV == "production" and not SECURITY_RELAY_REQUIRED:
-    raise ImproperlyConfigured("Production deployments must require the authenticated Security Relay.")
-
 # ---------------------------------------------------------------------------
 # Applications
 # ---------------------------------------------------------------------------
