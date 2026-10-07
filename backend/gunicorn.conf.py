@@ -32,8 +32,10 @@ capture_output = True
 max_requests = 2000
 max_requests_jitter = 200
 
-# The ASGI SecurityRelayBoundary validates the private relay token and then
-# trusts the relay's fixed X-Forwarded-Proto value. Disable Uvicorn's generic
-# proxy-header parser so arbitrary network peers cannot rewrite client/scheme
-# metadata before that authentication boundary runs.
+# Render terminates TLS and forwards the real peer and scheme in
+# ``X-Forwarded-For`` / ``X-Forwarded-Proto``. Those headers are read by the
+# application code (Django's ``SECURE_PROXY_SSL_HEADER`` and ``apps.security``)
+# rather than by uvicorn's generic proxy parser. Keep the parser off so the
+# ASGI ``scope['client']`` stays anchored to the direct TCP peer and so the
+# only authority on scheme trust is the Django setting above.
 proxy_headers = False

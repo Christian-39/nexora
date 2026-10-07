@@ -51,7 +51,7 @@ _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 def _header_request_id(request) -> str:
-    """Adopt only the bounded ASCII grammar shared by relay and browser."""
+    """Adopt only the bounded ASCII grammar shared by the browser and Render."""
     raw = str(request.headers.get("X-Request-ID", "") or "").strip()
     if _REQUEST_ID_RE.fullmatch(raw):
         return raw

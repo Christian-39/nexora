@@ -283,8 +283,11 @@ function needsSignedCrossOriginMediaUrl(value) {
 
 /**
  * Resolve a usable URL for a media object, re-authorizing through the backend
- * when a cached URL is missing or about to expire. Relay-required production
- * returns the protected relay media route instead of an object-store URL.
+ * when a cached URL is missing or about to expire. The backend now always
+ * returns a short-lived signed object-storage URL (default five-minute TTL)
+ * rather than an authenticated stream; media elements use credentialed CORS
+ * so the cookie-authenticated streaming endpoint still works when called
+ * directly.
  * @param {object} media normalized media object
  * @param {'full'|'thumbnail'} [variant]
  * @returns {Promise<string|null>}
@@ -293,10 +296,9 @@ export async function getMediaUrl(media, variant = 'full') {
   if (!media) return null;
   const direct = variant === 'thumbnail' ? media.thumbnailUrl : media.url;
 
-  // AttachmentSerializer's direct URL is an authenticated /api/media/ route.
-  // Resolve cross-origin protected media explicitly. Relay-required production
-  // keeps the authorized stream on /api/media/ rather than returning an object
-  // storage endpoint; media elements use credentialed CORS for this route.
+  // AttachmentSerializer's direct URL is the signed object-storage address.
+  // Resolve cross-origin media explicitly; media elements use credentialed
+  // CORS so the cookie-authenticated streaming route also still works.
   if (direct && !isExpired(media.expiresAt) && !needsSignedCrossOriginMediaUrl(direct)) {
     return resolveMediaUrl(direct);
   }

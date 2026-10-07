@@ -29,8 +29,7 @@ PRODUCTION_ENV = {
     "DJANGO_ENV": "production",
     "DEBUG": "False",
     "SECRET_KEY": "a-unique-production-secret-key-of-more-than-32-characters",
-    "SECURITY_RELAY_TOKEN": "test-relay-shared-secret-of-at-least-32-chars",
-    "ALLOWED_HOSTS": "nexora-relay.example.test",
+    "ALLOWED_HOSTS": "nexora-f397.onrender.com",
     "CORS_ALLOWED_ORIGINS": "https://nexora-eight-lilac.vercel.app",
     "CSRF_TRUSTED_ORIGINS": "https://nexora-eight-lilac.vercel.app",
     "COOKIE_SAMESITE": "None",
@@ -220,32 +219,31 @@ def test_websocket_origins_are_derived_from_the_configured_frontend():
 
 def test_security_headers_and_proxy_ssl_stay_enabled():
     settings = load_settings()
-    assert settings.SECURITY_RELAY_REQUIRED is True
-    assert len(settings.SECURITY_RELAY_TOKEN) >= 32
+    # The Security Relay is gone — these settings must no longer exist.
+    assert not hasattr(settings, "SECURITY_RELAY_REQUIRED")
+    assert not hasattr(settings, "SECURITY_RELAY_TOKEN")
+    # Render terminates TLS; the forwarded proto header is the single authority.
     assert settings.SECURE_PROXY_SSL_HEADER == ("HTTP_X_FORWARDED_PROTO", "https")
     assert settings.SECURE_CONTENT_TYPE_NOSNIFF is True
     assert settings.SECURE_HSTS_SECONDS > 0
     assert settings.X_FRAME_OPTIONS == "DENY"
 
 
-def test_production_refuses_to_boot_without_a_relay_token_or_with_the_boundary_disabled():
-    with pytest.raises(ImproperlyConfigured, match="SECURITY_RELAY_TOKEN"):
-        load_settings(SECURITY_RELAY_TOKEN=None)
-    with pytest.raises(ImproperlyConfigured, match="must require the authenticated Security Relay"):
-        load_settings(SECURITY_RELAY_REQUIRED="False")
-
-
-def test_non_relay_environment_does_not_trust_forwarded_proto():
+def test_production_boots_even_with_relay_envvars_present():
+    """A stale Render dashboard env group must not block startup."""
     settings = load_settings(
-        DJANGO_ENV="development",
-        DEBUG="True",
-        SECURITY_RELAY_REQUIRED="False",
-        SECURITY_RELAY_TOKEN=None,
-        REDIS_URL=None,
-        STORAGE_BUCKET=None,
-        DATABASE_URL=None,
+        SECURITY_RELAY_REQUIRED="True",
+        SECURITY_RELAY_TOKEN="this-token-must-not-cause-startup-to-fail",
     )
-    assert settings.SECURE_PROXY_SSL_HEADER is None
+    assert not hasattr(settings, "SECURITY_RELAY_REQUIRED")
+    assert not hasattr(settings, "SECURITY_RELAY_TOKEN")
+
+
+def test_production_uses_render_proxy_ssl_header():
+    """``SECURE_PROXY_SSL_HEADER`` is always set so HTTPS-relative cookies and
+    redirects behave correctly behind Render's TLS-terminating proxy."""
+    settings = load_settings()
+    assert settings.SECURE_PROXY_SSL_HEADER == ("HTTP_X_FORWARDED_PROTO", "https")
 
 
 # ---------------------------------------------------------------------------
@@ -266,15 +264,18 @@ def test_the_repository_contains_no_docker_deployment_artefacts():
     assert not offenders, f"Docker artefacts must not exist: {offenders}"
 
 
-def test_the_render_blueprint_deploys_private_asgi_behind_a_native_python_relay():
+def test_the_render_blueprint_runs_a_public_asgi_backend_directly():
     blueprint = (REPO / "render.yaml").read_text()
     assert "config.asgi:application" in blueprint
     assert "uvicorn.workers.UvicornWorker" in blueprint
-    assert "nexora-backend" in blueprint and "type: pserv" in blueprint
-    assert "nexora-security-relay" in blueprint
+    assert "nexora-backend" in blueprint
+    # The backend is a PUBLIC web service, not a private one. Vercel reaches
+    # it directly — there is no relay service in the project anymore.
+    assert "type: web" in blueprint
+    assert "type: pserv" not in blueprint
+    assert "nexora-security-relay" not in blueprint
+    assert "nexora-security-boundary" not in blueprint
     assert "healthCheckPath: /health/live/" in blueprint
-    assert "property: host" in blueprint and "property: port" in blueprint
-    assert "nexora-security-boundary" in blueprint and "generateValue: true" in blueprint
     start_commands = [line for line in blueprint.splitlines() if "startCommand" in line]
     assert start_commands and all("config.wsgi" not in line for line in start_commands)
     assert "runtime: python" in blueprint

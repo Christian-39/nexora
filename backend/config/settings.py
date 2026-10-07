@@ -694,8 +694,10 @@ PUSH_AGGREGATION_WINDOW_SECONDS = config("PUSH_AGGREGATION_WINDOW_SECONDS", defa
 # Security headers
 # ---------------------------------------------------------------------------
 
-# The ASGI SecurityRelayBoundary authenticates the hop before Django honors
-# this header; outside relay-required deployments no forwarded proto is trusted.
+# Render terminates TLS in front of the ASGI workers and forwards the original
+# scheme in ``X-Forwarded-Proto``. Trusting this header is the standard
+# Render deployment pattern and is required for HTTPS-relative cookies and
+# redirects to behave correctly.
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 SECURE_CONTENT_TYPE_NOSNIFF = True
 SECURE_REFERRER_POLICY = "same-origin"

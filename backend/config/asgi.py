@@ -32,7 +32,6 @@ from django.conf import settings  # noqa: E402
 
 from apps.accounts.ws_auth import JWTAuthMiddleware  # noqa: E402
 from apps.conversations.routing import websocket_urlpatterns  # noqa: E402
-from apps.security.relay import SecurityRelayBoundary  # noqa: E402
 
 
 class OriginAllowlist:
@@ -69,11 +68,9 @@ class OriginAllowlist:
         return await self.app(scope, receive, send)
 
 
-application = SecurityRelayBoundary(
-    ProtocolTypeRouter(
-        {
-            "http": django_asgi_app,
-            "websocket": OriginAllowlist(JWTAuthMiddleware(URLRouter(websocket_urlpatterns))),
-        }
-    )
+application = ProtocolTypeRouter(
+    {
+        "http": django_asgi_app,
+        "websocket": OriginAllowlist(JWTAuthMiddleware(URLRouter(websocket_urlpatterns))),
+    }
 )

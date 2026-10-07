@@ -186,16 +186,14 @@ def variant_key(attachment, variant: str) -> str | None:
 
 
 def signed_url(attachment, variant: str = "original") -> str | None:
-    """Return a signed URL only when no production relay privacy boundary exists.
+    """Return a short-lived signed URL for an attachment variant.
 
-    Production media must stay on the authenticated `/api/media/` route so a
-    private object-store endpoint or signed object URL is never exposed to the
-    browser. The relay streams this response (including Range requests) over
-    the private backend hop. Local/non-relay deployments retain the existing
-    short-lived S3 URL behaviour.
+    The backend is the only service that issues these URLs; the private object
+    store itself never returns a publicly addressable object. The signature
+    expires after ``SIGNED_URL_TTL_SECONDS`` so a leaked URL cannot be reused
+    indefinitely, and access still requires the conversation-level
+    authorization that produced it.
     """
-    if settings.SECURITY_RELAY_REQUIRED:
-        return None
     key = variant_key(attachment, variant)
     if not key:
         return None

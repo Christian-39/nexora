@@ -121,12 +121,12 @@ class ResilientThrottleMixin:
 
 
 class SafeAnonRateThrottle(ResilientThrottleMixin, AnonRateThrottle):
-    """Use a hashed browser pseudonym when all clients share a relay address.
+    """Use a hashed browser pseudonym as an anonymous throttle partition.
 
-    The identifier is only an anonymous throttle partition, not an account or
-    audit identity. It is validated and keyed with SECRET_KEY before being used
-    in Redis/local limiter keys. Requests without it fall back to DRF's direct
-    peer address.
+    ``X-Nexora-Client-ID`` is a public browser-supplied nonce, never a user
+    identifier. It is validated against a tight regex, hashed with ``SECRET_KEY``,
+    and used only as the Redis/local limiter key. Requests without it fall
+    back to DRF's direct peer address (the Render reverse proxy address).
     """
 
     def get_ident(self, request):

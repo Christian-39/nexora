@@ -297,8 +297,8 @@ async function parseBody(response) {
 
 function safeRequestId(value) {
   const candidate = String(value || '').trim();
-  // Must match the relay and Django request-ID grammar so the UI's ID is
-  // exactly the one used for backend stage/error log correlation.
+  // Must match the Django request-ID grammar so the UI's ID is exactly the
+  // one used for backend stage/error log correlation.
   return /^[a-zA-Z0-9_-]{1,64}$/.test(candidate) ? candidate : null;
 }
 
