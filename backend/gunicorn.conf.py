@@ -32,7 +32,8 @@ capture_output = True
 max_requests = 2000
 max_requests_jitter = 200
 
-#: Behind the platform's TLS proxy. X-Forwarded-Proto must be honoured or
-#: Django will consider every request insecure and WebSocket upgrades from
-#: https pages will be refused.
-forwarded_allow_ips = os.getenv("FORWARDED_ALLOW_IPS", "*")
+# The ASGI SecurityRelayBoundary validates the private relay token and then
+# trusts the relay's fixed X-Forwarded-Proto value. Disable Uvicorn's generic
+# proxy-header parser so arbitrary network peers cannot rewrite client/scheme
+# metadata before that authentication boundary runs.
+proxy_headers = False

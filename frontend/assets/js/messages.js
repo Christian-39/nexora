@@ -62,9 +62,10 @@ export function normalizeMessage(raw, { currentUserId } = {}) {
   const senderId = raw.sender_id ?? raw.sender?.id ?? raw.author?.id ?? null;
   const kind = raw.kind || raw.message_type || raw.type || inferKind(raw);
 
+  const clientId = raw.client_id ?? raw.client_message_id ?? null;
   return {
     id: id != null ? String(id) : null,
-    clientId: raw.client_id ?? raw.client_message_id ?? null,
+    clientId: clientId != null ? String(clientId) : null,
     conversationId: String(raw.conversation_id ?? raw.conversation ?? raw.thread_id ?? ''),
     kind: normalizeKind(kind),
     text: typeof raw.text === 'string' ? raw.text : typeof raw.body === 'string' ? raw.body : typeof raw.content === 'string' ? raw.content : '',
@@ -200,10 +201,21 @@ class ConversationMessages {
     return this.byId.get(key) || this.byClientId.get(key) || null;
   }
 
-  /** Insert keeping ascending order; returns the stored message. */
+  /** Insert keeping ascending order; reconcile either stable identifier. */
   insert(message) {
-    const existing = this.find(message.id) || (message.clientId ? this.byClientId.get(message.clientId) : null);
-    if (existing) return this.merge(existing, message);
+    const byId = message.id ? this.byId.get(String(message.id)) : null;
+    const byClientId = message.clientId ? this.byClientId.get(String(message.clientId)) : null;
+    // Prefer the optimistic/client-id record. If an older server response did
+    // not echo client_id, this also absorbs a second row already indexed by id.
+    const existing = byClientId || byId;
+    if (existing) {
+      for (const duplicate of new Set([byId, byClientId])) {
+        if (!duplicate || duplicate === existing) continue;
+        this.#detach(duplicate);
+        this.merge(existing, duplicate);
+      }
+      return this.merge(existing, message);
+    }
 
     const ts = timeOf(message);
     let i = this.items.length;
@@ -214,25 +226,50 @@ class ConversationMessages {
     return message;
   }
 
+  /** Remove one object and only the aliases that still point to it. */
+  #detach(message) {
+    const index = this.items.indexOf(message);
+    if (index >= 0) this.items.splice(index, 1);
+    if (message.id && this.byId.get(String(message.id)) === message) this.byId.delete(String(message.id));
+    if (message.clientId && this.byClientId.get(String(message.clientId)) === message) {
+      this.byClientId.delete(String(message.clientId));
+    }
+  }
+
   /** Idempotent merge: server data wins, status only ever moves forward. */
   merge(target, incoming) {
+    const oldTime = timeOf(target);
+    const oldIndex = this.items.indexOf(target);
     const nextStatus =
       (STATUS_RANK[incoming.status] ?? 0) >= (STATUS_RANK[target.status] ?? 0) ? incoming.status : target.status;
 
-    // Reindex if the optimistic placeholder just received its server id.
+    // A newer server timestamp can move an optimistic placeholder relative to
+    // messages that arrived while its request was in flight.
     if (incoming.id && incoming.id !== target.id) {
-      if (target.id) this.byId.delete(target.id);
-      this.byId.set(incoming.id, target);
+      if (target.id && this.byId.get(String(target.id)) === target) this.byId.delete(String(target.id));
+      const collision = this.byId.get(String(incoming.id));
+      if (collision && collision !== target) this.#detach(collision);
+      this.byId.set(String(incoming.id), target);
     }
 
     Object.assign(target, incoming, {
+      id: incoming.id ?? target.id,
       status: nextStatus,
       clientId: target.clientId || incoming.clientId,
       local: false,
       error: incoming.error ?? null,
       progress: null,
     });
-    if (target.clientId) this.byClientId.set(target.clientId, target);
+    if (target.id) this.byId.set(String(target.id), target);
+    if (target.clientId) this.byClientId.set(String(target.clientId), target);
+
+    if (oldIndex >= 0 && oldTime !== timeOf(target)) {
+      this.items.splice(oldIndex, 1);
+      const nextTime = timeOf(target);
+      let index = this.items.length;
+      while (index > 0 && timeOf(this.items[index - 1]) > nextTime) index -= 1;
+      this.items.splice(index, 0, target);
+    }
     return target;
   }
 
@@ -241,8 +278,10 @@ class ConversationMessages {
     if (!message) return null;
     const idx = this.items.indexOf(message);
     if (idx >= 0) this.items.splice(idx, 1);
-    if (message.id) this.byId.delete(message.id);
-    if (message.clientId) this.byClientId.delete(message.clientId);
+    if (message.id && this.byId.get(String(message.id)) === message) this.byId.delete(String(message.id));
+    if (message.clientId && this.byClientId.get(String(message.clientId)) === message) {
+      this.byClientId.delete(String(message.clientId));
+    }
     return message;
   }
 
@@ -252,8 +291,8 @@ class ConversationMessages {
     const overflow = this.items.length - MAX_RETAINED;
     const dropped = this.items.splice(0, overflow);
     for (const m of dropped) {
-      if (m.id) this.byId.delete(m.id);
-      if (m.clientId) this.byClientId.delete(m.clientId);
+      if (m.id && this.byId.get(String(m.id)) === m) this.byId.delete(String(m.id));
+      if (m.clientId && this.byClientId.get(String(m.clientId)) === m) this.byClientId.delete(String(m.clientId));
     }
     // We no longer hold the true head of history.
     this.hasMore = true;
@@ -291,6 +330,11 @@ export function getStore(conversationId) {
     stores.set(key, store);
   }
   return store;
+}
+
+/** Whether a conversation store is already tracked, without creating one. */
+export function hasStore(conversationId) {
+  return stores.has(String(conversationId));
 }
 
 export function dropStore(conversationId) {
@@ -443,14 +487,10 @@ export function createOptimistic(
 
 /** Apply the server's authoritative version of an optimistic message. */
 export function confirmOptimistic(conversationId, clientId, serverMessage) {
-  const store = getStore(conversationId);
   const normalized = normalizeMessage(serverMessage, { currentUserId });
   if (!normalized) return null;
-  if (!normalized.clientId) normalized.clientId = clientId;
-  const existing = store.byClientId.get(clientId);
-  const result = existing ? store.merge(existing, normalized) : store.insert(normalized);
-  messageEvents.emit('updated', store.id, result);
-  return result;
+  if (!normalized.clientId) normalized.clientId = String(clientId);
+  return applyNormalizedServerMessage(conversationId, normalized);
 }
 
 export function markLocalFailed(conversationId, clientId, error) {
@@ -598,14 +638,47 @@ export async function toggleReaction(conversationId, messageId, reaction, mine) 
 
 /* ---------------- Server event application ---------------- */
 
-export function applyServerMessage(conversationId, raw) {
+function messageSnapshot(message) {
+  return JSON.stringify({
+    id: message.id,
+    clientId: message.clientId,
+    conversationId: message.conversationId,
+    kind: message.kind,
+    text: message.text,
+    caption: message.caption,
+    createdAt: message.createdAt,
+    editedAt: message.editedAt,
+    isEdited: message.isEdited,
+    deletedAt: message.deletedAt,
+    isDeleted: message.isDeleted,
+    status: message.status,
+    sender: message.sender,
+    senderId: message.senderId,
+    outgoing: message.outgoing,
+    media: message.media,
+    replyTo: message.replyTo,
+    reactions: message.reactions,
+    permissions: message.permissions,
+    system: message.system,
+    local: message.local,
+  });
+}
+
+function applyNormalizedServerMessage(conversationId, normalized) {
   const store = getStore(conversationId);
+  const existing = (normalized.clientId && store.byClientId.get(String(normalized.clientId))) ||
+    (normalized.id && store.byId.get(String(normalized.id))) || null;
+  const before = existing ? messageSnapshot(existing) : null;
+  const message = store.insert(normalized);
+  const changed = !existing || before !== messageSnapshot(message);
+  if (changed) messageEvents.emit(existing ? 'updated' : 'added', store.id, message);
+  return message;
+}
+
+export function applyServerMessage(conversationId, raw) {
   const normalized = normalizeMessage(raw, { currentUserId });
   if (!normalized) return null;
-  const existed = !!store.find(normalized.id) || !!(normalized.clientId && store.byClientId.get(normalized.clientId));
-  const message = store.insert(normalized);
-  messageEvents.emit(existed ? 'updated' : 'added', store.id, message);
-  return message;
+  return applyNormalizedServerMessage(conversationId, normalized);
 }
 
 export function applyStatusUpdate(conversationId, messageId, status) {
@@ -662,6 +735,14 @@ export function scheduleReconciliation(conversationId, delay = 1500) {
 export async function reconcile(conversationId) {
   const store = getStore(conversationId);
   if (!store.loadedOnce) return;
+
+  // Keep one bounded recent-page fetch per reconnect to fill WebSocket gaps;
+  // exact client-id lookups below reconcile uncertain sends outside that page.
+  const pendingClientIds = Array.from(new Set(
+    store.items
+      .filter((message) => message.local && message.clientId && [STATUS.UNCONFIRMED, STATUS.FAILED].includes(message.status))
+      .map((message) => String(message.clientId))
+  ));
   const response = await api.conversations.messages(conversationId, { limit: PAGE_SIZE });
   const page = normalizePage(response.data ?? response);
   const seenClientIds = new Set();
@@ -669,16 +750,29 @@ export async function reconcile(conversationId) {
     const message = normalizeMessage(raw, { currentUserId });
     if (!message) continue;
     if (message.clientId) seenClientIds.add(message.clientId);
-    store.insert(message);
+    // Reconciliation must emit the same added/updated events as realtime and
+    // HTTP confirmation, otherwise the store becomes correct but the visible
+    // message row keeps its stale retry/status UI.
+    applyNormalizedServerMessage(store.id, message);
   }
-  // Anything still 'unconfirmed' and absent from the server never landed.
-  for (const message of store.items) {
-    if (message.status === STATUS.UNCONFIRMED && message.clientId && !seenClientIds.has(message.clientId)) {
-      message.status = STATUS.FAILED;
-      message.error = 'Message was not delivered. Tap to retry.';
-      messageEvents.emit('updated', store.id, message);
+
+  const missingClientIds = pendingClientIds.filter((clientId) => !seenClientIds.has(clientId));
+  for (let offset = 0; offset < missingClientIds.length; offset += 200) {
+    const batch = missingClientIds.slice(offset, offset + 200);
+    const result = await api.messages.statusByClientIds(batch);
+    const rows = result?.results ?? result?.data?.results ?? [];
+    for (const raw of rows) {
+      const message = normalizeMessage(raw, { currentUserId });
+      if (!message) continue;
+      if (message.clientId) seenClientIds.add(message.clientId);
+      applyNormalizedServerMessage(store.id, message);
     }
   }
+
+  // An absent status row is not proof of failure: a media upload may still be
+  // in storage staging when a reconnect check runs. Keep its same-client-id
+  // retry affordance; the server's unique (sender, client_id) key prevents a
+  // duplicate if the original request later commits.
   messageEvents.emit('reconciled', store.id, store.items);
 }
 

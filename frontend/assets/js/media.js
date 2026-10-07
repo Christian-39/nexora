@@ -10,7 +10,8 @@
  *  - Duplicate protection uses a stable client_id per attachment.
  */
 
-import { ApiError, api, apiConfig, resolveMediaUrl, upload } from './api.js';
+import { ApiError, api, apiConfig, createRequestId, resolveMediaUrl, upload } from './api.js';
+import { configureApiMediaElement, isApiMediaUrl } from './config.js';
 import { getLimits } from './theme.js';
 import {
   Emitter,
@@ -181,6 +182,8 @@ export async function uploadDraft(conversationId, draft, options = {}) {
   }
 
   const controller = new AbortController();
+  const requestId = createRequestId();
+  mediaEvents.emit('stage', draft.clientId, { stage: 'started', request_id: requestId });
   const form = new FormData();
   form.append('kind', draft.kind);
   form.append('client_id', draft.clientId);
@@ -194,6 +197,7 @@ export async function uploadDraft(conversationId, draft, options = {}) {
 
   const promise = upload(`/api/conversations/${encodeURIComponent(conversationId)}/messages/`, form, {
     signal: controller.signal,
+    requestId,
     onProgress: (info) => {
       // The transport helper reaches 100% on HTTP 2xx. For messages, wait for
       // the domain response/idempotency key below before showing completion.
@@ -203,20 +207,33 @@ export async function uploadDraft(conversationId, draft, options = {}) {
     },
   })
     .then((message) => {
+      mediaEvents.emit('stage', draft.clientId, { stage: 'http_completed', request_id: requestId });
       // A 2xx transport status alone is not a confirmed message. Requiring the
       // idempotency key in the response keeps the optimistic bubble/draft when
       // a proxy returns an empty or malformed 2xx after the server committed.
       if (!message || typeof message !== 'object' || !message.id || message.client_id !== draft.clientId) {
+        mediaEvents.emit('stage', draft.clientId, { stage: 'unconfirmed', request_id: requestId, status_class: '2xx' });
         throw new ApiError({
           message: 'The server did not confirm this attachment. Retry to confirm its status.',
           code: 'UPLOAD_UNCONFIRMED',
           status: 0,
+          requestId,
         });
       }
       const complete = { loaded: draft.size, total: draft.size, percent: 100 };
       mediaEvents.emit('progress', draft.clientId, complete);
+      mediaEvents.emit('stage', draft.clientId, { stage: 'confirmed', request_id: requestId, status_class: '2xx' });
       onProgress?.(complete);
       return message;
+    })
+    .catch((error) => {
+      mediaEvents.emit('stage', draft.clientId, {
+        stage: 'failed',
+        request_id: error?.requestId || requestId,
+        status: Number(error?.status) || 0,
+        code: String(error?.code || 'UPLOAD_ERROR').slice(0, 64),
+      });
+      throw error;
     })
     .finally(() => activeUploads.delete(draft.clientId));
 
@@ -242,7 +259,7 @@ export function cancelAllUploads() {
 }
 
 /* ============================================================
-   Authorized media URLs (signed / expiring)
+   Authorized, expiring media URLs
    ============================================================ */
 
 /** mediaId -> { url, expiresAt } */
@@ -256,18 +273,18 @@ function isExpired(expiresAt) {
 }
 
 function needsSignedCrossOriginMediaUrl(value) {
-  if (!value || !apiConfig.origin || apiConfig.origin === window.location.origin) return false;
-  try {
-    const url = new URL(resolveMediaUrl(value), window.location.origin);
-    return url.origin === apiConfig.origin && /^\/api\/media\/[^/]+\/?$/.test(url.pathname);
-  } catch {
-    return false;
-  }
+  return !!(
+    value
+    && apiConfig.origin
+    && apiConfig.origin !== window.location.origin
+    && isApiMediaUrl(resolveMediaUrl(value))
+  );
 }
 
 /**
- * Resolve a usable URL for a media object, re-requesting a fresh signed URL
- * from the backend when the cached one is missing or about to expire.
+ * Resolve a usable URL for a media object, re-authorizing through the backend
+ * when a cached URL is missing or about to expire. Relay-required production
+ * returns the protected relay media route instead of an object-store URL.
  * @param {object} media normalized media object
  * @param {'full'|'thumbnail'} [variant]
  * @returns {Promise<string|null>}
@@ -277,9 +294,9 @@ export async function getMediaUrl(media, variant = 'full') {
   const direct = variant === 'thumbnail' ? media.thumbnailUrl : media.url;
 
   // AttachmentSerializer's direct URL is an authenticated /api/media/ route.
-  // A cross-origin <img>/<video>/<audio> request cannot reliably carry the
-  // HttpOnly API cookie (notably with third-party-cookie restrictions). Ask the
-  // authorized backend resolver for a short-lived private-storage URL first.
+  // Resolve cross-origin protected media explicitly. Relay-required production
+  // keeps the authorized stream on /api/media/ rather than returning an object
+  // storage endpoint; media elements use credentialed CORS for this route.
   if (direct && !isExpired(media.expiresAt) && !needsSignedCrossOriginMediaUrl(direct)) {
     return resolveMediaUrl(direct);
   }
@@ -349,10 +366,12 @@ export function renderImageAttachment(media, { onOpen, alt = 'Image attachment' 
       showMediaError(frame, 'This image is unavailable.');
       return;
     }
-    const img = el('img', { src: url, alt, loading: 'lazy', decoding: 'async' });
+    const img = el('img', { alt, loading: 'lazy', decoding: 'async' });
+    configureApiMediaElement(img, url);
+    img.src = url;
     img.addEventListener('load', () => placeholder.remove(), { once: true });
     img.addEventListener('error', async () => {
-      // A signed URL may have expired between render and fetch.
+      // The authorization window or media request may have expired; re-resolve once.
       invalidateMediaUrl(media.id);
       const fresh = await getMediaUrl(media, 'full');
       if (fresh && fresh !== url) {
@@ -411,7 +430,9 @@ export function renderVideoAttachment(media, { onOpen } = {}) {
     loaded = true;
     const poster = await getMediaUrl(media, 'thumbnail');
     if (!poster) return; // keep the icon placeholder; do NOT fetch the video
-    const img = el('img', { src: poster, alt: '', loading: 'lazy', decoding: 'async' });
+    const img = el('img', { alt: '', loading: 'lazy', decoding: 'async' });
+    configureApiMediaElement(img, poster);
+    img.src = poster;
     img.addEventListener('load', () => placeholder.remove(), { once: true });
     img.addEventListener('error', () => img.remove(), { once: true });
     frame.insertBefore(img, frame.firstChild);

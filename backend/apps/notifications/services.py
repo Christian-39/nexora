@@ -106,7 +106,10 @@ def notify_new_message(*, message, recipient_ids) -> None:
                     sender_id=message.sender_id,
                 )
                 _queue_push(notification)
-        _broadcast(notification)
+        # The conversation message producer publishes the final authoritative
+        # unread snapshot after the message and its receipt rows are committed.
+        # Publishing here as well would run the same aggregates twice.
+        _broadcast(notification, include_unread=False)
 
 
 def _body(count: int, sender_name: str, message, show_preview: bool) -> str:
@@ -130,15 +133,16 @@ def _recipient_preferences(recipient_id):
     return row
 
 
-def _broadcast(notification) -> None:
-    from apps.conversations.realtime import broadcast_notification, emit_to_users
+def _broadcast(notification, *, include_unread=True) -> None:
+    from apps.conversations.realtime import broadcast_notification, broadcast_unread_state
 
     broadcast_notification(notification)
-    emit_to_users(
-        [notification.recipient_id],
-        "unread.update",
-        {"conversation_id": str(notification.conversation_id) if notification.conversation_id else None},
-    )
+    if include_unread:
+        # Counts come from the same receipt/notification queries used by the REST
+        # snapshot; do not ask clients to infer a delta from notification events.
+        broadcast_unread_state(
+            [notification.recipient_id], conversation_id=notification.conversation_id
+        )
 
 
 def _queue_push(notification) -> None:
@@ -186,9 +190,11 @@ def payload_for(notification) -> str:
 def unread_map_total(user_id) -> int:
     from apps.conversations.models import MessageReceipt
 
-    return MessageReceipt.objects.filter(
+    message_unread = MessageReceipt.objects.filter(
         recipient_id=user_id, read_at__isnull=True, message__conversation__is_active=True
     ).count()
+    notification_unread = Notification.objects.filter(recipient_id=user_id, read_at__isnull=True).count()
+    return message_unread + notification_unread
 
 
 def deliver(delivery) -> None:

@@ -2,9 +2,11 @@
 NEXORA — media delivery.
 
 ``GET /api/media/{uuid}/``      authenticated streaming download (range-aware)
-``GET /api/media/{uuid}/url/``  authorize, then issue a short-lived signed URL
+``GET /api/media/{uuid}/url/``  authorize, then return the configured media URL
 
-Both endpoints authorize first. An attachment belonging to somebody else's
+In relay-required production the URL stays on the authenticated API stream;
+non-relay deployments may return a short-lived signed storage URL. Both
+endpoints authorize first. An attachment belonging to somebody else's
 conversation is indistinguishable from a non-existent one (404), so UUIDs
 cannot be probed.
 """
@@ -139,7 +141,7 @@ def download(request, attachment_id):
 
 @api_view(["GET"])
 def media_url(request, attachment_id):
-    """Authorize, then return a usable URL (signed when storage supports it)."""
+    """Authorize and return a usable URL without exposing storage in relay mode."""
     attachment = _load(request, attachment_id)
     from django.utils import timezone
 

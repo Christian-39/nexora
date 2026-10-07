@@ -2,6 +2,7 @@
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { setNavigator } from './helpers/browser-env.mjs';
 
 const AUTH_MODULE = new URL('../assets/js/auth.js', import.meta.url).href;
 
@@ -29,7 +30,7 @@ test('a late aborted /api/me probe cannot erase or redirect after login succeeds
     getElementById: () => null, querySelector: () => null,
     addEventListener() {}, removeEventListener() {},
   };
-  globalThis.navigator = { onLine: true };
+  setNavigator({ onLine: true });
   const session = new Map();
   globalThis.sessionStorage = {
     getItem: (key) => session.get(key) ?? null,

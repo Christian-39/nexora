@@ -16,11 +16,11 @@ Security-first, independently deployed Django/DRF/Channels backend. Each install
 - Database-driven message/media/edit/delete/profile policies with bounded serializer validation, short-lived cache invalidation, and audit records for settings and branding changes.
 - Validated logo/favicon uploads with random private storage keys and controlled public proxy endpoints.
 - Safe public configuration allowlist, cookie-authentication CSRF enforcement and bootstrap endpoint, restricted CORS, CSP, Permissions-Policy, secure production cookie/header defaults, and normalized API errors.
-- Fail-closed production startup when a strong secret, MySQL-compatible database, Redis, or private object storage is missing.
+- Fail-closed production startup when the relay hop token, a strong secret, MySQL-compatible database, Redis, or private object storage is missing; production cannot disable the relay boundary.
 - Redis-backed multi-process presence with authorized contact scopes, connection counters, offline last-seen updates, and user privacy controls; local-memory presence is development-only.
 - Member profile preferences for theme, phone visibility, last-seen privacy, and push enablement.
 - Initial database migrations and automated authorization, group-permission, cross-conversation reply, idempotency, credential, media-IDOR, and upload tests.
-- Non-containerised deployment assets (`render.yaml`, `bin/render-build.sh`, `gunicorn.conf.py`) for an ASGI web service plus separate push/media/upload background workers, against external managed MySQL, Redis and object storage, with liveness/readiness probes. This project does not use Docker.
+- Native Python deployment assets (`render.yaml`, `bin/render-build.sh`, `gunicorn.conf.py`, and `../relay/`) for a public constrained Security Relay, private Django/Channels ASGI service, and separate push/media/upload workers, against the existing external managed MySQL, Redis and object storage. This project does not use Docker.
 
 ## Local development
 
@@ -43,7 +43,28 @@ Use an international phone number when `createsuperuser` asks for the username. 
 
 ## Production topology
 
-Static frontend (Vercel, or any static host / reverse proxy) → HTTPS → **ASGI** web service → independent MySQL 8 database + **external managed Redis** + private S3-compatible bucket. No Docker is involved at any layer.
+Static frontend (Vercel) → HTTPS/WSS → **public native-Python Security Relay**
+→ private Render network + shared relay-hop token → **private Django/Channels
+ASGI service** → the existing external managed MySQL 8, Redis and private
+S3-compatible bucket. Separate background workers continue to share the same
+configuration. No Docker is used.
+
+The relay (`../relay/app.py`) has one configured private upstream, exact public
+host and API/WebSocket/health path allowlists, preserves legitimate cookies,
+Authorization and media bodies, strips client-supplied forwarded-IP/scheme
+headers, inserts a shared hop token, and streams HTTP and WebSocket traffic.
+The backend `SecurityRelayBoundary` authenticates both protocols before Django
+or Channels handles them. In production, `SECURITY_RELAY_REQUIRED=True` and a
+32+ character `SECURITY_RELAY_TOKEN` are mandatory; settings fail closed if the
+token is missing or the boundary is disabled. Gunicorn/Uvicorn's generic
+proxy-header parsing is disabled. Only the authenticated relay hop may supply
+the forwarded scheme.
+
+The public browser `API_BASE_URL` must point at the relay. The backend must be
+a private Render service, and its `ALLOWED_HOSTS` must contain only the public
+relay hostname(s). Render Blueprints generate one shared token in an environment
+group and wire the private upstream host/port. For custom public aliases, set
+all exact names in the relay's `PUBLIC_HOSTS` and backend `ALLOWED_HOSTS`.
 
 Start command — ASGI only; `config.wsgi` cannot serve WebSockets:
 
@@ -51,13 +72,35 @@ Start command — ASGI only; `config.wsgi` cannot serve WebSockets:
 gunicorn config.asgi:application -k uvicorn.workers.UvicornWorker -c gunicorn.conf.py
 ```
 
-`gunicorn.conf.py` binds `0.0.0.0:$PORT` so a platform-assigned port is honoured, and trusts `X-Forwarded-Proto` so TLS termination upstream is detected.
+`gunicorn.conf.py` binds `0.0.0.0:$PORT` and does not trust arbitrary
+`X-Forwarded-*` metadata. Relay scheme trust is authenticated at the ASGI
+boundary. The Render public relay health check forwards `/health/live/` to the
+private backend; `/health/ready/` checks MySQL, Redis cache/Channels and
+private storage.
 
-Redis is mandatory in production (channel layer, cache, presence) and the boot fails clearly without it; the in-memory layer is development-only and can never be substituted in production. Use `rediss://` for TLS, and `REDIS_SSL_CERT_REQS=none` only when a managed provider's certificate chain is not verifiable.
+Redis is mandatory in production (channel layer, cache, presence) and boot
+fails clearly without it; the in-memory layer is development-only. Use
+`rediss://` for TLS, and `REDIS_SSL_CERT_REQS=none` only when a managed
+provider's certificate chain is not verifiable.
 
-Run migrations before switching traffic (`bin/render-build.sh` does this for the web service only, so parallel worker deploys cannot race).
+Run migrations before switching traffic (`bin/render-build.sh` does this for
+the backend service only, so parallel worker deploys cannot race).
 
-Set a unique `SECRET_KEY`, database credentials, exact `ALLOWED_HOSTS`, `CORS_ALLOWED_ORIGINS`, `CSRF_TRUSTED_ORIGINS`, `REDIS_URL`, private storage credentials and VAPID keys per deployment. When the frontend is on another site, also set `COOKIE_SAMESITE=None` and `COOKIE_SECURE=True`, or the browser will not send the session cookies. Provide FFmpeg/ffprobe to the API and media-worker hosts (`bin/render-build.sh` installs a static build into `backend/bin/`). The upload finalizer also needs permission to list objects under `media/staging/` so it can retry cleanup of superseded chunk objects; scope that bucket-list permission to the staging prefix where supported. Never share a database, bucket or credential set between organizations.
+Set a unique `SECRET_KEY`, shared relay token, database credentials, exact
+`ALLOWED_HOSTS`, CORS/CSRF origins, `REDIS_URL`, private storage credentials
+and VAPID keys per deployment. For the cross-site frontend, set
+`COOKIE_SAMESITE=None` and `COOKIE_SECURE=True`. Provide FFmpeg/ffprobe to the
+backend and media-worker hosts (`bin/render-build.sh` installs a static build
+into `backend/bin/`). The upload finalizer also needs permission to list objects
+under `media/staging/` so it can retry cleanup of superseded chunk objects;
+scope that bucket-list permission to the staging prefix where supported.
+Never share a database, bucket or credential set between organizations.
+
+Privacy boundary: the relay necessarily sees its incoming network peer. It is
+not an anonymity service. The relay does not forward peer IP headers to Django,
+and security-event rows in relay-required mode store no browser or shared relay
+IP. The relay token authenticates only the proxy hop; normal user authentication,
+authorization, CSRF and WebSocket origin checks remain active.
 
 Background processing runs as its own services, never inside the web service:
 
@@ -89,7 +132,7 @@ Responses use `{success,message,data}` or `{success,message,code,errors}`. Acces
 
 ## Media and push
 
-The models reserve private storage keys rather than public URLs. Production media endpoints issue short-lived signed URLs only after conversation authorization. Direct and resumable upload completion validates server-detected signatures, extensions, image structure, and (when available) ffprobe stream kind/duration before message commit. Push subscriptions are persisted; delivery workers use VAPID environment secrets and deactivate HTTP 404/410 subscriptions.
+The models reserve private storage keys rather than public URLs. Relay-required production authorizes each media request and streams it through the protected `/api/media/` route; it never returns an object-store address. Non-relay deployments may issue short-lived signed URLs after conversation authorization. Direct and resumable upload completion validates server-detected signatures, extensions, image structure, and (when available) ffprobe stream kind/duration before message commit. Push subscriptions are persisted; delivery workers use VAPID environment secrets and deactivate HTTP 404/410 subscriptions.
 
 ## Security notes
 

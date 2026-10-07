@@ -81,6 +81,25 @@ const WS_ORIGIN = trimSlashes(
   RUNTIME.WS_BASE_URL || RUNTIME.WS_ORIGIN || toWebSocketOrigin(API_ORIGIN || PAGE_ORIGIN),
 );
 
+/** Whether a URL targets the authenticated API media route (not object storage). */
+export function isApiMediaUrl(value) {
+  if (!value) return false;
+  try {
+    const url = new URL(String(value), PAGE_ORIGIN || undefined);
+    const expectedOrigin = API_ORIGIN || PAGE_ORIGIN;
+    const protectedAsset = url.pathname.startsWith('/api/media/') || /^\/api\/members\/[^/]+\/avatar\/?$/.test(url.pathname);
+    return !!expectedOrigin && url.origin === expectedOrigin && protectedAsset;
+  } catch {
+    return false;
+  }
+}
+
+/** Set credentialed CORS mode for cross-origin, cookie-authorized API media. */
+export function configureApiMediaElement(element, value) {
+  if (element && isApiMediaUrl(value)) element.crossOrigin = 'use-credentials';
+  return element;
+}
+
 /**
  * Build a canonical API URL. Callers may provide `/api/x/`, `api/x/`, or `x/`.
  * When API_BASE_URL is empty, URLs remain root-relative for a same-origin proxy.

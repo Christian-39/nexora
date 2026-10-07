@@ -144,7 +144,15 @@ class BaseAuthenticatedConsumer(AsyncJsonWebsocketConsumer):
         await self.close(code=self.AUTH_CLOSE_CODE)
 
     async def fanout(self, event) -> None:
-        await self._safe_send_json({"type": event["event"], "data": event["payload"]})
+        event_type = str(event.get("event") or "")
+        payload = event.get("payload") or {}
+        if event_type in {"typing.start", "typing.stop", "typing"} and str(payload.get("user_id")) == str(
+            getattr(getattr(self, "user", None), "id", "")
+        ):
+            # Conversation groups include the sender's other tabs/devices. Drop
+            # the self echo here so it never reaches any of the user's clients.
+            return
+        await self._safe_send_json({"type": event_type, "data": payload})
 
 
 class AppConsumer(BaseAuthenticatedConsumer):
@@ -308,8 +316,15 @@ class AppConsumer(BaseAuthenticatedConsumer):
         realtime.broadcast_receipts(
             conversation_id, user_id=self.user.id, state="read", message_ids=message_ids, timestamp=now
         )
-        await self.send_json(
-            {"type": "unread.update", "data": {"conversation_id": conversation_id, "unread": 0}}
+        summary = await self._unread_summary(conversation_id)
+        # The personal group reaches all of this user's devices, including this
+        # socket, with the same authoritative REST-compatible count shape.
+        realtime.emit_to_users([self.user.id], "unread.update", summary, on_commit=False)
+        realtime.emit_to_users(
+            [self.user.id],
+            "conversation.unread",
+            summary,
+            on_commit=False,
         )
 
     async def _on_delivered(self, content):
@@ -386,6 +401,10 @@ class AppConsumer(BaseAuthenticatedConsumer):
             last_read_at=now
         )
         return ids
+
+    @database_sync_to_async
+    def _unread_summary(self, conversation_id) -> dict:
+        return realtime.unread_summary(self.user.id, conversation_id=conversation_id)
 
     @database_sync_to_async
     def _presence_bootstrap(self):

@@ -23,7 +23,7 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 
 from apps.accounts.models import User
-from apps.core.observability import sanitize
+from apps.core.observability import get_request_id
 from apps.core.throttles import MessageThrottle, SearchThrottle, UploadThrottle
 
 from . import realtime
@@ -37,7 +37,7 @@ from .models import (
     MessageReceipt,
 )
 from .serializers import ConversationSerializer, MessageCreateSerializer, MessageSerializer, ReactionSerializer
-from .services import can_access, caption_for, private_conversation, recipients_of, send_message, unread_map
+from .services import can_access, caption_for, private_conversation, recipients_of, send_message
 
 #: Full upload lifecycle, so a failure is traceable in the Render log.
 upload_log = logging.getLogger("nexora.upload")
@@ -197,9 +197,7 @@ class ConversationViewSet(viewsets.ReadOnlyModelViewSet):
             realtime.broadcast_receipts(
                 conversation.id, user_id=request.user.id, state="read", message_ids=message_ids, timestamp=now
             )
-        realtime.emit_to_users(
-            [request.user.id], "unread.update", {"conversation_id": str(conversation.id), "unread": 0}
-        )
+        realtime.broadcast_unread_state([request.user.id], conversation_id=conversation.id)
         return envelope("Read state updated", {"read": len(message_ids)})
 
     @action(detail=True, methods=["post"])
@@ -312,10 +310,11 @@ def create_message_from_stored_upload(
     declared_duration=None,
 ):
     operation_started = time.perf_counter()
-    from apps.media.services import create_attachment, stage_upload
+    from apps.media.services import create_attachment, stage_upload, storage_failure_context
     from apps.media.validators import validate_upload
 
     log_context = {
+        "request_id": str(getattr(request, "request_id", "") or get_request_id()),
         "user_id": str(getattr(request.user, "id", "-")),
         "user_role": str(getattr(request.user, "role", "-")).upper(),
     }
@@ -362,16 +361,19 @@ def create_message_from_stored_upload(
         staged = stage_upload(fileobj, validated, poster=poster)
     except Exception as exc:
         storage_ms = int((time.perf_counter() - storage_started) * 1000)
+        provider_context = storage_failure_context(exc)
         upload_log.error(
-            "upload storage stage failed kind=%s size=%s conversation=%s storage_op=put validation_ms=%s storage_ms=%s exception=%s message=%s",
+            "upload storage stage failed kind=%s size=%s conversation=%s storage_op=put validation_ms=%s storage_ms=%s exception=%s storage_http_status=%s storage_error_code=%s storage_request_id=%s",
             kind,
             validated.size,
             conversation.id,
             validation_ms,
             storage_ms,
             exc.__class__.__name__,
-            sanitize(exc, limit=300),
-            extra=log_context,
+            provider_context.get("storage_http_status", "-"),
+            provider_context.get("storage_error_code", "-"),
+            provider_context.get("storage_request_id", "-"),
+            extra={**log_context, **provider_context},
         )
         raise
     storage_ms = int((time.perf_counter() - storage_started) * 1000)
@@ -408,7 +410,7 @@ def create_message_from_stored_upload(
         staged.discard()
         database_ms = int((time.perf_counter() - database_started) * 1000)
         upload_log.error(
-            "upload database commit failed kind=%s size=%s conversation=%s storage_op=database validation_ms=%s storage_ms=%s database_ms=%s exception=%s message=%s",
+            "upload database commit failed kind=%s size=%s conversation=%s storage_op=database validation_ms=%s storage_ms=%s database_ms=%s exception=%s",
             kind,
             validated.size,
             conversation.id,
@@ -416,7 +418,6 @@ def create_message_from_stored_upload(
             storage_ms,
             database_ms,
             exc.__class__.__name__,
-            sanitize(exc, limit=300),
             extra=log_context,
         )
         raise
@@ -569,19 +570,43 @@ def reaction(request, message_id):
 
 @api_view(["POST"])
 def message_status(request):
-    """Authoritative delivery state for a set of message ids (reconciliation)."""
-    ids = [str(x) for x in (request.data.get("ids") or [])][:200]
-    if not ids:
-        raise ValidationError({"ids": "Provide up to 200 message ids."})
+    """Return authoritative message rows by server id and/or sender client id.
+
+    Client-id lookups are scoped to the authenticated sender so a caller cannot
+    probe another participant's idempotency keys. They let the browser recover
+    a message that is older than the bounded latest page after a reconnect.
+    """
+    raw_ids = request.data.get("ids") or []
+    raw_client_ids = request.data.get("client_ids") or []
+    if not isinstance(raw_ids, (list, tuple)) or not isinstance(raw_client_ids, (list, tuple)):
+        raise ValidationError({"ids": "ids and client_ids must be lists."})
+    if len(raw_ids) + len(raw_client_ids) > 200:
+        raise ValidationError({"ids": "Provide no more than 200 ids in total."})
+
+    ids = [str(value).strip() for value in raw_ids if value is not None and str(value).strip()]
+    client_ids = [str(value).strip() for value in raw_client_ids if value is not None and str(value).strip()]
+    if not ids and not client_ids:
+        raise ValidationError({"ids": "Provide at least one message id or client_id."})
+    if any(len(value) > 64 for value in client_ids):
+        raise ValidationError({"client_ids": "Each client_id must be 64 characters or fewer."})
+
+    identity_filter = Q()
+    if ids:
+        identity_filter |= Q(id__in=ids)
+    if client_ids:
+        identity_filter |= Q(sender=request.user, client_id__in=client_ids)
+
     messages = (
         Message.objects.filter(
-            id__in=ids,
+            identity_filter,
             conversation__participants__user=request.user,
             conversation__participants__is_active=True,
+            conversation__is_active=True,
         )
         .select_related(*MESSAGE_SELECT)
         .prefetch_related(*MESSAGE_PREFETCH)
         .distinct()
+        .order_by("created_at", "id")
     )
     serializer = MessageSerializer(messages, many=True, context={"request": request})
     return envelope("Message status retrieved", {"results": serializer.data})
@@ -646,15 +671,8 @@ def search_messages(request):
 
 
 def _unread_payload(user) -> dict:
-    from apps.notifications.models import Notification
-
-    conversations = unread_map(user)
-    return {
-        "global": sum(conversations.values()),
-        "total": sum(conversations.values()),
-        "conversations": conversations,
-        "notifications": Notification.objects.filter(recipient=user, read_at__isnull=True).count(),
-    }
+    # REST and WebSocket clients consume the same authoritative count contract.
+    return realtime.unread_summary(user.id)
 
 
 @api_view(["GET"])

@@ -15,10 +15,14 @@ product offline. ``ResilientThrottleMixin`` implements exactly that.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
+import re
 import threading
 import time
 
+from django.conf import settings
 from rest_framework.throttling import AnonRateThrottle, SimpleRateThrottle, UserRateThrottle
 
 from .cache import CACHE_ERRORS, should_report
@@ -34,6 +38,7 @@ logger = logging.getLogger("nexora.throttle")
 _LOCAL_BUCKETS: dict[str, list[float]] = {}
 _LOCAL_LOCK = threading.Lock()
 _LOCAL_MAX_KEYS = 5000
+_CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
 
 def _local_allow(key: str, num_requests: int, duration: int) -> bool:
@@ -116,7 +121,21 @@ class ResilientThrottleMixin:
 
 
 class SafeAnonRateThrottle(ResilientThrottleMixin, AnonRateThrottle):
-    pass
+    """Use a hashed browser pseudonym when all clients share a relay address.
+
+    The identifier is only an anonymous throttle partition, not an account or
+    audit identity. It is validated and keyed with SECRET_KEY before being used
+    in Redis/local limiter keys. Requests without it fall back to DRF's direct
+    peer address.
+    """
+
+    def get_ident(self, request):
+        candidate = str(request.META.get("HTTP_X_NEXORA_CLIENT_ID") or "").strip()
+        if _CLIENT_ID_RE.fullmatch(candidate):
+            message = f"{self.scope}\0{candidate}".encode("utf-8")
+            digest = hmac.new(str(settings.SECRET_KEY).encode("utf-8"), message, hashlib.sha256).hexdigest()
+            return f"browser:{digest}"
+        return super().get_ident(request)
 
 
 class SafeUserRateThrottle(ResilientThrottleMixin, UserRateThrottle):

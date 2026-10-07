@@ -97,6 +97,23 @@ test('paths normalize to exactly one API prefix; explicit absolute URLs pass thr
   assert.equal(buildApiUrl('https://other.example.test/x'), 'https://other.example.test/x');
 });
 
+test('credentialed CORS mode is limited to protected API media and avatar endpoints', async () => {
+  const { isApiMediaUrl, configureApiMediaElement } = await loadConfig({ inline: { API_BASE_URL: API_ORIGIN } });
+  const mediaUrl = `${API_ORIGIN}/api/media/attachment-1/?variant=thumbnail`;
+  const avatarUrl = `${API_ORIGIN}/api/members/member-1/avatar/`;
+  assert.equal(isApiMediaUrl(mediaUrl), true);
+  assert.equal(isApiMediaUrl(avatarUrl), true);
+  assert.equal(isApiMediaUrl('https://storage.example.test/bucket/object?signature=secret'), false);
+  assert.equal(isApiMediaUrl('https://other.example.test/api/media/attachment-1/'), false);
+
+  const image = {};
+  configureApiMediaElement(image, mediaUrl);
+  assert.equal(image.crossOrigin, 'use-credentials');
+  const storageImage = {};
+  configureApiMediaElement(storageImage, 'https://storage.example.test/bucket/object');
+  assert.equal(storageImage.crossOrigin, undefined);
+});
+
 test('the runtime resolver contains no deployment host or loopback/port fallback', async () => {
   const source = await readFile(new URL('../assets/js/config.js', import.meta.url), 'utf8');
   assert.doesNotMatch(source, /onrender\.com|localhost|127\.0\.0\.1|0\.0\.0\.0|::1|LOCAL_API_PORT|PRODUCTION_API_ORIGIN|8000/);

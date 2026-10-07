@@ -227,6 +227,7 @@ async def test_typing_is_broadcast_and_read_receipts_flow_back(admin, member_a, 
     typing, seen = await drain(listener, "typing.start")
     assert typing is not None, seen
     assert typing["data"]["user_id"] == str(member_a.id)
+    assert await sender.receive_nothing(timeout=0.1), "the sender never receives its own typing indicator"
 
     @database_sync_to_async
     def publish():
@@ -246,6 +247,52 @@ async def test_typing_is_broadcast_and_read_receipts_flow_back(admin, member_a, 
 
     await sender.disconnect()
     await listener.disconnect()
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.asyncio
+async def test_typing_echo_is_suppressed_on_every_sender_device_but_reaches_an_independent_peer(admin, member_a, private_thread):
+    listener = await socket(admin)
+    first_sender_device = await socket(member_a)
+    second_sender_device = await socket(member_a)
+    communicators = [listener, first_sender_device, second_sender_device]
+
+    try:
+        for communicator in communicators:
+            connected, _ = await communicator.connect()
+            assert connected
+            await communicator.receive_json_from(timeout=3)
+            await communicator.send_json_to({
+                "type": "conversation.join",
+                "conversation_id": str(private_thread.id),
+            })
+            joined, seen = await drain(communicator, "conversation.joined")
+            assert joined is not None, seen
+
+        await first_sender_device.send_json_to({
+            "type": "typing",
+            "conversation_id": str(private_thread.id),
+            "typing": True,
+        })
+        frame, seen = await drain(listener, "typing.start")
+        assert frame is not None, seen
+        assert frame["data"]["user_id"] == str(member_a.id)
+        assert await first_sender_device.receive_nothing(timeout=0.1)
+        assert await second_sender_device.receive_nothing(timeout=0.1)
+
+        await first_sender_device.send_json_to({
+            "type": "typing",
+            "conversation_id": str(private_thread.id),
+            "typing": False,
+        })
+        stopped, seen = await drain(listener, "typing.stop")
+        assert stopped is not None, seen
+        assert stopped["data"]["user_id"] == str(member_a.id)
+        assert await first_sender_device.receive_nothing(timeout=0.1)
+        assert await second_sender_device.receive_nothing(timeout=0.1)
+    finally:
+        for communicator in communicators:
+            await communicator.disconnect()
 
 
 @pytest.mark.django_db(transaction=True)
@@ -305,13 +352,24 @@ async def test_user_group_receives_unread_and_notification_events(admin, member_
         broadcast_new_message(message, recipient_ids=recipients_of(message))
 
     await publish()
-    frame, seen = await drain(communicator, "conversation.updated", limit=15)
-    assert frame is not None, seen
-    types = [f["type"] for f in seen]
-    # A user not currently viewing the thread still gets the notification and
-    # the unread delta on their personal channel.
-    assert "notification.new" in types
-    assert "unread.update" in types
+    seen = []
+    wanted = {"conversation.updated", "notification.new", "unread.update"}
+    for _ in range(12):
+        if await communicator.receive_nothing(timeout=1):
+            break
+        seen.append(await communicator.receive_json_from(timeout=2))
+        if wanted.issubset({frame.get("type") for frame in seen}):
+            break
+    types = [frame["type"] for frame in seen]
+    # A user not currently viewing the thread still gets the notification,
+    # list update, and authoritative count snapshot on their personal channel.
+    assert wanted.issubset(set(types)), seen
+    summary = next(frame["data"] for frame in seen if frame["type"] == "unread.update")
+    assert summary["conversation_id"] == str(private_thread.id)
+    assert summary["unread_count"] == 1
+    assert summary["global"] == 1
+    assert summary["unread_messages_total"] == 1
+    assert summary["unread_total"] >= summary["unread_messages_total"]
     await communicator.disconnect()
 
 

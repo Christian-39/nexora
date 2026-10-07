@@ -10,6 +10,7 @@
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { setNavigator } from './helpers/browser-env.mjs';
 
 class StuckWebSocket {
   static CONNECTING = 0;
@@ -65,7 +66,7 @@ function installEnvironment() {
     getElementById: () => null,
     createElement: () => ({ style: {}, setAttribute() {}, append() {} }),
   };
-  globalThis.navigator = { onLine: true };
+  setNavigator({ onLine: true });
   globalThis.WebSocket = StuckWebSocket;
   return target;
 }

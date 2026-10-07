@@ -2,6 +2,7 @@
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { setNavigator } from './helpers/browser-env.mjs';
 
 const API_MODULE = new URL('../assets/js/api.js', import.meta.url).href;
 const API_ORIGIN = 'https://api.example.test';
@@ -21,7 +22,7 @@ function installEnvironment(fetchImpl) {
     removeEventListener() {},
   };
   globalThis.document = { cookie: '', querySelector: () => null, getElementById: () => null };
-  globalThis.navigator = { onLine: true };
+  setNavigator({ onLine: true });
   globalThis.sessionStorage = { getItem: () => null, setItem() {}, removeItem() {} };
   globalThis.NEXORA_RUNTIME = { API_BASE_URL: API_ORIGIN };
   globalThis.fetch = fetchImpl;

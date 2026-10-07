@@ -58,6 +58,13 @@ test('deployment fingerprints client source and offers an explicit safe service-
 });
 
 
+test('push notifications use the backend unread_total for the PWA badge', () => {
+  assert.match(sw, /typeof payload\.unread_total === 'number'/);
+  assert.match(sw, /setAppBadge\(payload\.unread_total\)/);
+  assert.match(sw, /else await self\.navigator\.clearAppBadge\(\)/);
+});
+
+
 test('chat uses visual viewport sizing and natural message wrapping', () => {
   assert.match(mainCss, /--app-viewport-height, 100dvh/);
   const bubble = chatCss.split('.bubble {', 2)[1].split('}', 1)[0];

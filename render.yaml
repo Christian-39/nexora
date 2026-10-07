@@ -1,31 +1,41 @@
 # ============================================================================
-# NEXORA — Render blueprint (no Docker anywhere in this project).
+# NEXORA — Render Blueprint (native Python runtimes; no Docker).
 #
 #   Vercel static frontend
-#        │  HTTPS / WSS
-#        ▼
-#   Render Python web service  →  Gunicorn + UvicornWorker + Django Channels
-#        ├── external managed MySQL 8
-#        ├── external managed Redis        (REDIS_URL)
-#        └── external private S3-compatible bucket
+#      HTTPS / WSS
+#          │
+#          ▼
+#   nexora-security-relay (public ASGI reverse proxy)
+#          │ private network + shared hop token
+#          ▼
+#   nexora-backend (private Django/Channels ASGI service)
+#      ├── external managed MySQL 8
+#      ├── external managed Redis (REDIS_URL)
+#      └── private S3-compatible object storage
 #
-# Every secret is declared with `sync: false`: Render prompts for the value and
-# stores it in the service environment. Nothing secret is ever committed here.
-#
-# Apply with the Render dashboard ("New → Blueprint") or keep using the existing
-# services and simply mirror the build/start commands and environment below.
+# The relay is the only public API/WebSocket service. The backend is private.
+# Set ALLOWED_HOSTS on the backend to the exact public hostname shown in the
+# relay's Render dashboard (plus any custom API hostname). The relay obtains
+# its default public hostname from RENDER_EXTERNAL_HOSTNAME automatically.
+# The shared SECURITY_RELAY_TOKEN is generated once in an environment group.
+# External DB/Redis/storage/push secrets remain dashboard-managed.
 # ============================================================================
 
+envVarGroups:
+  - name: nexora-security-boundary
+    envVars:
+      - key: SECURITY_RELAY_TOKEN
+        generateValue: true
+
 services:
-  # ---------------------------------------------------------------- web ----
-  - type: web
+  # ------------------------------------------------------------ private API ---
+  - type: pserv
     name: nexora-backend
     runtime: python
     rootDir: backend
     plan: starter
-    healthCheckPath: /health/ready/
     buildCommand: ./bin/render-build.sh
-    # MUST be config.asgi (ASGI). config.wsgi cannot serve WebSockets.
+    # MUST be config.asgi (ASGI); Channels/WebSockets are required.
     startCommand: gunicorn config.asgi:application -k uvicorn.workers.UvicornWorker -c gunicorn.conf.py
     autoDeploy: true
     envVars:
@@ -38,12 +48,15 @@ services:
       - key: WEB_CONCURRENCY
         value: "2"
       - key: ALLOWED_HOSTS
-        value: nexora-f397.onrender.com
+        sync: false
+      - key: SECURITY_RELAY_REQUIRED
+        value: "True"
+      - fromGroup: nexora-security-boundary
       - key: CORS_ALLOWED_ORIGINS
         value: https://nexora-eight-lilac.vercel.app
       - key: CSRF_TRUSTED_ORIGINS
         value: https://nexora-eight-lilac.vercel.app
-      # Cross-site frontend (Vercel) → the auth cookies must be None + Secure.
+      # Cross-site frontend (Vercel) → auth cookies must be None + Secure.
       - key: COOKIE_SAMESITE
         value: None
       - key: COOKIE_SECURE
@@ -52,7 +65,7 @@ services:
         value: "True"
       - key: MEDIA_PROCESS_INLINE
         value: "False"
-      # FFmpeg is installed into ./bin by the build script (see render-build.sh).
+      # FFmpeg is installed into ./bin by the native Python build script.
       - key: FFMPEG_BINARY
         value: /opt/render/project/src/backend/bin/ffmpeg
       - key: FFPROBE_BINARY
@@ -81,10 +94,39 @@ services:
       - key: PUSH_CONTACT
         sync: false
 
-  # ------------------------------------------------------------- workers ---
-  # Background processing must NOT run inside the web service: a web dyno is
-  # restarted on every deploy and scaled per request. These are separate Render
-  # background workers sharing the same code, database, Redis and bucket.
+  # ------------------------------------------------------------- public relay ---
+  - type: web
+    name: nexora-security-relay
+    runtime: python
+    rootDir: relay
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:application --host 0.0.0.0 --port ${PORT:-10000} --no-proxy-headers --no-server-header
+    healthCheckPath: /health/live/
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.6"
+      - fromGroup: nexora-security-boundary
+      - key: UPSTREAM_HOST
+        fromService:
+          name: nexora-backend
+          type: pserv
+          property: host
+      - key: UPSTREAM_PORT
+        fromService:
+          name: nexora-backend
+          type: pserv
+          property: port
+      - key: UPSTREAM_SCHEME
+        value: http
+      - key: PUBLIC_SCHEME
+        value: https
+      - key: MAX_BODY_BYTES
+        value: "2164260864"
+
+  # -------------------------------------------------------------- workers ---
+  # Workers remain separate, preserving the existing async jobs architecture.
   - type: worker
     name: nexora-push-worker
     runtime: python
@@ -99,8 +141,9 @@ services:
         value: production
       - key: DEBUG
         value: "False"
-      - key: ALLOWED_HOSTS
-        value: nexora-f397.onrender.com
+      - key: SECURITY_RELAY_REQUIRED
+        value: "True"
+      - fromGroup: nexora-security-boundary
       - key: CORS_ALLOWED_ORIGINS
         value: https://nexora-eight-lilac.vercel.app
       - key: CSRF_TRUSTED_ORIGINS

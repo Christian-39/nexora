@@ -287,6 +287,12 @@
 }
 .msg-row[data-dir="out"] { justify-content: flex-end; }
 .msg-row[data-dir="in"] { justify-content: flex-start; }
+.msg-row--long-pressed {
+  border-radius: var(--r-lg);
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+  outline: 2px solid color-mix(in srgb, var(--accent) 42%, transparent);
+  outline-offset: 3px;
+}
 /* Extra breathing room when author changes */
 .msg-row[data-group-start="true"] { margin-top: var(--sp-3); }
 .msg-row__avatar { width: 28px; flex: none; }

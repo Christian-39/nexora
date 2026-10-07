@@ -2,6 +2,7 @@
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { setNavigator } from './helpers/browser-env.mjs';
 
 const MEDIA_MODULE = new URL('../assets/js/media.js', import.meta.url).href;
 const API_ORIGIN = 'https://api.example.test';
@@ -27,7 +28,7 @@ function installEnvironment(fetchImpl) {
     querySelector: () => ({ setAttribute() {} }),
   };
   globalThis.getComputedStyle = () => ({ getPropertyValue: () => '' });
-  globalThis.navigator = { onLine: true };
+  setNavigator({ onLine: true });
   globalThis.sessionStorage = { getItem: () => null, setItem() {}, removeItem() {} };
   globalThis.NEXORA_RUNTIME = { API_BASE_URL: API_ORIGIN };
   globalThis.fetch = fetchImpl;
@@ -58,14 +59,14 @@ test('video MIME values with codec parameters are checked by MIME essence', asyn
   );
 });
 
-test('a protected cross-origin /api/media URL is resolved to an authorized signed URL before rendering', async () => {
+test('relay-required media resolution returns a protected API stream URL, not an object-store address', async () => {
   const calls = [];
   installEnvironment(async (url, init = {}) => {
     const requestUrl = new URL(String(url));
     calls.push({ requestUrl, init });
     assert.equal(requestUrl.pathname, '/api/media/attachment-77/url/');
     return jsonResponse({
-      url: 'https://private-storage.example.test/object?signature=short-lived',
+      url: `${API_ORIGIN}/api/media/attachment-77/`,
       expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
     });
   });
@@ -76,8 +77,9 @@ test('a protected cross-origin /api/media URL is resolved to an authorized signe
     media.getMediaUrl(item, 'full'),
     media.getMediaUrl(item, 'full'),
   ]);
-  assert.equal(first, 'https://private-storage.example.test/object?signature=short-lived');
+  assert.equal(first, `${API_ORIGIN}/api/media/attachment-77/`);
   assert.equal(second, first);
+  assert.doesNotMatch(first, /storage|signature/i);
   assert.equal(calls.length, 1, 'parallel renders share one authorization request');
   assert.equal(calls[0].requestUrl.origin, API_ORIGIN);
   assert.equal(calls[0].init.credentials, 'include');

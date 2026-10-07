@@ -9,18 +9,52 @@ that owns its message. Guessing an attachment UUID therefore yields 404.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 
 from django.conf import settings
 from django.core.files.storage import default_storage
 from django.db import transaction
 
-from apps.core.observability import sanitize
-
 from .validators import storage_key
 
 
 logger = logging.getLogger("nexora.upload")
+_SAFE_PROVIDER_TOKEN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+
+def storage_failure_context(exc) -> dict:
+    """Extract only safe provider status/code/request-id fields for upload logs.
+
+    Storage exception messages and response bodies can contain object keys,
+    endpoints, request data, or credentials; they are deliberately never
+    copied into logs. The returned mapping is suitable for ``LogRecord.extra``.
+    """
+    response = getattr(exc, "response", None)
+    metadata = response.get("ResponseMetadata", {}) if isinstance(response, dict) else {}
+    error = response.get("Error", {}) if isinstance(response, dict) else {}
+    result = {}
+
+    status = metadata.get("HTTPStatusCode") if isinstance(metadata, dict) else None
+    if status is None and response is not None and not isinstance(response, dict):
+        status = getattr(response, "status_code", None)
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        status = None
+    if status is not None and 100 <= status <= 599:
+        result["storage_http_status"] = status
+
+    code = error.get("Code") if isinstance(error, dict) else None
+    if code is None:
+        code = getattr(exc, "code", None)
+    if code is not None and _SAFE_PROVIDER_TOKEN.fullmatch(str(code)):
+        result["storage_error_code"] = str(code)
+
+    provider_request_id = metadata.get("RequestId") if isinstance(metadata, dict) else None
+    if provider_request_id and _SAFE_PROVIDER_TOKEN.fullmatch(str(provider_request_id)):
+        result["storage_request_id"] = str(provider_request_id)
+    return result
 
 
 def store_upload(fileobj, validated, *, prefix: str = "media/originals") -> str:
@@ -35,9 +69,8 @@ def store_upload(fileobj, validated, *, prefix: str = "media/originals") -> str:
             default_storage.delete(key)
         except Exception as cleanup_exc:  # noqa: BLE001 - preserve original error
             logger.warning(
-                "failed upload object cleanup deferred storage_op=delete exception=%s message=%s",
+                "failed upload object cleanup deferred storage_op=delete exception=%s",
                 cleanup_exc.__class__.__name__,
-                sanitize(cleanup_exc, limit=300),
             )
         raise
 
@@ -69,9 +102,8 @@ class StagedUpload:
                 default_storage.delete(key)
             except Exception as exc:  # noqa: BLE001 - cleanup must never mask the original error
                 logger.warning(
-                    "could not remove staged object after a failed upload (%s: %s)",
+                    "could not remove staged object after a failed upload storage_op=delete exception=%s",
                     exc.__class__.__name__,
-                    sanitize(exc, limit=300),
                 )
 
 
@@ -154,12 +186,16 @@ def variant_key(attachment, variant: str) -> str | None:
 
 
 def signed_url(attachment, variant: str = "original") -> str | None:
-    """Issue a short-lived signed URL *after* authorization has been granted.
+    """Return a signed URL only when no production relay privacy boundary exists.
 
-    With S3-compatible storage this is a pre-signed object URL. With local
-    filesystem storage there is no signature mechanism, so the caller keeps
-    using the authenticated streaming endpoint instead.
+    Production media must stay on the authenticated `/api/media/` route so a
+    private object-store endpoint or signed object URL is never exposed to the
+    browser. The relay streams this response (including Range requests) over
+    the private backend hop. Local/non-relay deployments retain the existing
+    short-lived S3 URL behaviour.
     """
+    if settings.SECURITY_RELAY_REQUIRED:
+        return None
     key = variant_key(attachment, variant)
     if not key:
         return None

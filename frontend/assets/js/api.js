@@ -141,7 +141,7 @@ export class ApiError extends Error {
    * @param {string|null} init.endpoint URL origin + path only (no query string)
    * @param {string|null} init.host request host, when known
    */
-  constructor({ message, status = 0, code = 'ERROR', errors = {}, retryAfter = null, cause = null, method = null, endpoint = null, host = null }) {
+  constructor({ message, status = 0, code = 'ERROR', errors = {}, retryAfter = null, cause = null, method = null, endpoint = null, host = null, requestId = null }) {
     super(message || 'Something went wrong.');
     this.name = 'ApiError';
     this.status = status;
@@ -151,6 +151,7 @@ export class ApiError extends Error {
     this.method = method;
     this.endpoint = endpoint;
     this.host = host;
+    this.requestId = safeRequestId(requestId);
     if (cause) this.cause = cause;
   }
 
@@ -294,6 +295,42 @@ async function parseBody(response) {
   }
 }
 
+function safeRequestId(value) {
+  const candidate = String(value || '').trim();
+  // Must match the relay and Django request-ID grammar so the UI's ID is
+  // exactly the one used for backend stage/error log correlation.
+  return /^[a-zA-Z0-9_-]{1,64}$/.test(candidate) ? candidate : null;
+}
+
+/** Opaque correlation ID for one logical upload attempt; contains no user data. */
+export function createRequestId() {
+  try {
+    if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  } catch { /* use a non-secret fallback in older browser contexts */ }
+  return `nx-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 14)}`;
+}
+
+const CLIENT_INSTANCE_KEY = 'nexora.client-instance.v1';
+let memoryClientInstanceId = null;
+
+/** Ephemeral, non-secret throttle pseudonym; never used for auth or audit IPs. */
+function clientInstanceId() {
+  if (memoryClientInstanceId) return memoryClientInstanceId;
+  try {
+    const existing = sessionStorage.getItem(CLIENT_INSTANCE_KEY);
+    if (existing && /^[a-zA-Z0-9._:-]{1,128}$/.test(existing)) {
+      memoryClientInstanceId = existing;
+      return existing;
+    }
+    memoryClientInstanceId = createRequestId();
+    sessionStorage.setItem(CLIENT_INSTANCE_KEY, memoryClientInstanceId);
+    return memoryClientInstanceId;
+  } catch {
+    memoryClientInstanceId = createRequestId();
+    return memoryClientInstanceId;
+  }
+}
+
 function toApiError(status, payload, headers, context = {}) {
   const retryAfterRaw = headers?.get?.('retry-after');
   const retryAfter = retryAfterRaw ? Number(retryAfterRaw) : null;
@@ -328,6 +365,9 @@ function toApiError(status, payload, headers, context = {}) {
     method,
     endpoint,
     host,
+    requestId: safeRequestId(
+      headers?.get?.('x-request-id') || payload?.request_id || payload?.data?.request_id || context.requestId
+    ),
   });
 }
 
@@ -400,7 +440,11 @@ export async function ensureCsrfToken() {
         method: 'GET',
         credentials: 'include',
         cache: 'no-store',
-        headers: { Accept: 'application/json' },
+        headers: {
+          Accept: 'application/json',
+          'X-Nexora-Client-ID': clientInstanceId(),
+          'X-Request-ID': createRequestId(),
+        },
       });
       const payload = await parseBody(response);
       if (!response.ok) throw toApiError(response.status, payload, response.headers);
@@ -428,7 +472,11 @@ export async function ensureCsrfToken() {
 }
 
 function authHeaders(method, extra = {}, { auth = true } = {}) {
-  const headers = { Accept: 'application/json', ...extra };
+  const headers = {
+    Accept: 'application/json',
+    'X-Nexora-Client-ID': clientInstanceId(),
+    ...extra,
+  };
   if (!SAFE_METHODS.has(method)) {
     const csrf = csrfToken || readableCsrfCookie();
     if (csrf) headers[DEFAULTS.csrfHeader] = csrf;
@@ -758,15 +806,15 @@ export const del = (path, options = {}) => request(path, { ...options, method: '
  * @param {AbortSignal} [options.signal]
  * @returns {Promise<any>}
  */
-function xhrUploadAttempt(url, formData, { onProgress, signal, timeout, method, auth }) {
+function xhrUploadAttempt(url, formData, { onProgress, signal, timeout, method, auth, requestId }) {
   return new Promise((resolve, reject) => {
     if (navigator.onLine === false) {
       apiEvents.emit('offline');
-      reject(new ApiError({ message: "You're offline. The upload will need to be retried.", code: 'OFFLINE', status: 0 }));
+      reject(new ApiError({ message: "You're offline. The upload will need to be retried.", code: 'OFFLINE', status: 0, requestId }));
       return;
     }
     if (signal?.aborted) {
-      reject(new ApiError({ message: 'Upload cancelled.', code: 'ABORTED', status: 0 }));
+      reject(new ApiError({ message: 'Upload cancelled.', code: 'ABORTED', status: 0, requestId }));
       return;
     }
 
@@ -780,6 +828,7 @@ function xhrUploadAttempt(url, formData, { onProgress, signal, timeout, method, 
       // Content-Type intentionally omitted: XHR sets the multipart boundary.
       xhr.setRequestHeader(key, value);
     }
+    if (requestId) xhr.setRequestHeader('X-Request-ID', requestId);
 
     const abortHandler = () => xhr.abort();
     signal?.addEventListener('abort', abortHandler, { once: true });
@@ -816,17 +865,18 @@ function xhrUploadAttempt(url, formData, { onProgress, signal, timeout, method, 
         message: offline ? "You're offline. Reconnect to retry this upload." : 'The upload failed because the connection was interrupted.',
         code: offline ? 'OFFLINE' : 'NETWORK_ERROR',
         status: 0,
+        requestId,
       }));
     });
 
     xhr.addEventListener('timeout', () => {
       cleanup();
-      reject(new ApiError({ message: 'The upload timed out. Its server-side result may still be confirmed by retrying.', code: 'TIMEOUT', status: 0 }));
+      reject(new ApiError({ message: 'The upload timed out. Its server-side result may still be confirmed by retrying.', code: 'TIMEOUT', status: 0, requestId }));
     });
 
     xhr.addEventListener('abort', () => {
       cleanup();
-      reject(new ApiError({ message: 'Upload cancelled.', code: 'ABORTED', status: 0 }));
+      reject(new ApiError({ message: 'Upload cancelled.', code: 'ABORTED', status: 0, requestId }));
     });
 
     xhr.send(formData);
@@ -841,9 +891,11 @@ export async function upload(path, formData, options = {}) {
     method = 'POST',
     auth = true,
     allowRefresh = true,
+    requestId = createRequestId(),
   } = options;
   const verb = String(method).toUpperCase();
   const url = buildUrl(path);
+  const correlationId = safeRequestId(requestId) || createRequestId();
 
   if (!SAFE_METHODS.has(verb)) await ensureCsrfToken();
 
@@ -851,7 +903,7 @@ export async function upload(path, formData, options = {}) {
   let csrfRetried = false;
   for (;;) {
     const result = await xhrUploadAttempt(url, formData, {
-      onProgress, signal, timeout, method: verb, auth,
+      onProgress, signal, timeout, method: verb, auth, requestId: correlationId,
     });
     if (result.status >= 200 && result.status < 300) {
       if (auth) resetAuthenticationFailures();
@@ -862,6 +914,7 @@ export async function upload(path, formData, options = {}) {
     const error = toApiError(result.status, result.payload, result.headers, {
       url: result.url,
       method: verb,
+      requestId: correlationId,
     });
 
     // As in fetch(), only a CSRF-specific 403 is replayed, and only once.
@@ -1021,6 +1074,7 @@ export const api = {
     unreact: (id, reaction, options) =>
       request(`/api/messages/${encodeURIComponent(id)}/reactions/`, { ...options, method: 'DELETE', params: { reaction } }),
     status: (ids, options) => post('/api/messages/status/', { ids }, options),
+    statusByClientIds: (clientIds, options) => post('/api/messages/status/', { client_ids: clientIds }, options),
   },
 
   /* ---- groups ---- */

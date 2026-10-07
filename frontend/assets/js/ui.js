@@ -6,6 +6,7 @@
  */
 
 import { $, clear, el, trapFocus, uid } from './utils.js';
+import { configureApiMediaElement } from './config.js';
 
 /* ============================================================
    Icons — Lucide-compatible outline paths, inlined as SVG.
@@ -257,8 +258,9 @@ export const toastWarning = (m, o) => toast(m, { ...o, type: 'warning' });
 export function toastApiError(error, fallback = 'Something went wrong.') {
   if (!error) return;
   if (error.isAborted) return; // user-initiated cancellation is not an error
+  const requestId = /^[a-zA-Z0-9._:-]{1,128}$/.test(String(error.requestId || '')) ? String(error.requestId) : '';
   const message = error.message || fallback;
-  toast(message, { type: error.isOffline || error.isNetwork ? 'warning' : 'error' });
+  toast(requestId ? `${message} Request ID: ${requestId}` : message, { type: error.isOffline || error.isNetwork ? 'warning' : 'error' });
 }
 
 /* ============================================================
@@ -492,11 +494,15 @@ export function openLightbox(item) {
 
   const stage = el('div', { class: 'lightbox__stage' });
   if (kind === 'video') {
-    const video = el('video', { src: url, controls: true, playsInline: true, preload: 'metadata' });
+    const video = el('video', { controls: true, playsInline: true, preload: 'metadata' });
+    configureApiMediaElement(video, url);
     if (poster) video.poster = poster;
+    video.src = url;
     stage.append(video);
   } else {
-    const img = el('img', { src: url, alt: title || 'Image attachment' });
+    const img = el('img', { alt: title || 'Image attachment' });
+    configureApiMediaElement(img, url);
+    img.src = url;
     img.addEventListener('error', () => {
       clear(stage);
       stage.append(el('p', { class: 'media-frame__error', style: { color: '#fff' }, text: 'This media is no longer available or you are not authorized to view it.' }));
@@ -669,7 +675,9 @@ export function avatar(name, url, { size = '', presence = null, alt, square = fa
   const fallback = el('span', { text: initialsOf(name), 'aria-hidden': 'true' });
   node.append(fallback);
   if (url) {
-    const img = el('img', { src: url, alt: alt || '', loading: 'lazy', decoding: 'async' });
+    const img = el('img', { alt: alt || '', loading: 'lazy', decoding: 'async' });
+    configureApiMediaElement(img, url);
+    img.src = url;
     img.addEventListener('error', () => img.remove(), { once: true });
     img.addEventListener('load', () => fallback.remove(), { once: true });
     node.append(img);

@@ -10,6 +10,7 @@ import { getLimits } from './theme.js';
 import { Emitter, el, formatDuration, uid } from './utils.js';
 import { icon, iconButton, announce } from './ui.js';
 import { getMediaUrl } from './media.js';
+import { configureApiMediaElement } from './config.js';
 
 export const voiceEvents = new Emitter();
 
@@ -303,6 +304,7 @@ export function renderVoicePlayer(media, { duration = 0 } = {}) {
       }
       audio = new Audio();
       audio.preload = 'metadata';
+      configureApiMediaElement(audio, url);
       audio.src = url;
 
       audio.addEventListener('loadedmetadata', () => {

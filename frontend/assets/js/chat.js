@@ -31,6 +31,7 @@ import {
 import {
   STATUS,
   STATUS_LABEL,
+  applyServerMessage,
   createOptimistic,
   confirmOptimistic,
   deleteMessage as apiDeleteMessage,
@@ -65,7 +66,6 @@ import { VoiceRecorder, isRecordingSupported, renderVoicePlayer, renderVoicePrev
 import {
   clearConversationUnread,
   getConversationUnread,
-  incrementConversationUnread,
   refreshUnread,
   setConversationUnread,
   unreadEvents,
@@ -127,6 +127,8 @@ export class ChatController {
     this.atBottom = true;
     this.newWhileAway = 0;
     this.rendered = new Map();  // messageId/clientId -> row element
+    this.selectedMessageRow = null;
+    this.selectedMessageKey = null;
     this.destroyed = false;
 
     setCurrentUser(this.user?.id);
@@ -425,6 +427,8 @@ export class ChatController {
     this.editing = null;
     this.clearDraft();
     this.rendered.clear();
+    this.selectedMessageRow = null;
+    this.selectedMessageKey = null;
     this.newWhileAway = 0;
     prefs.set('lastConversation', id);
 
@@ -630,12 +634,12 @@ export class ChatController {
     let previous = null;
     for (const message of store.items) {
       if (!previous || !isSameDay(previous.createdAt, message.createdAt)) {
-        messagesEl.append(el('div', { class: 'date-sep' }, [el('span', { text: formatDayLabel(message.createdAt) })]));
+        messagesEl.append(this.dateSeparator(message));
       }
       const groupStart = !previous || previous.senderId !== message.senderId || !isSameDay(previous.createdAt, message.createdAt);
       const node = this.renderMessage(message, { conv, groupStart });
       messagesEl.append(node);
-      this.rendered.set(message.id || message.clientId, node);
+      this.registerMessageNode(message, node);
       previous = message;
     }
 
@@ -647,6 +651,242 @@ export class ChatController {
         this.atBottom = true;
         this.updateJumpButton();
       });
+    }
+  }
+
+  dateSeparator(message) {
+    return el('div', { class: 'date-sep' }, [el('span', { text: formatDayLabel(message.createdAt) })]);
+  }
+
+  messageSignature(message) {
+    try {
+      return JSON.stringify([
+        message.id,
+        message.clientId,
+        message.conversationId,
+        message.kind,
+        message.text,
+        message.caption,
+        message.createdAt,
+        message.editedAt,
+        message.isEdited,
+        message.deletedAt,
+        message.isDeleted,
+        message.sender,
+        message.senderId,
+        message.outgoing,
+        message.media,
+        message.replyTo,
+        message.reactions,
+        message.permissions,
+        message.local,
+        message.system,
+      ]);
+    } catch {
+      return `${message.id || ''}:${message.clientId || ''}:${message.kind}:${message.text}:${message.createdAt}`;
+    }
+  }
+
+  registerMessageNode(message, node) {
+    const id = message.id == null ? '' : String(message.id);
+    const clientId = message.clientId == null ? '' : String(message.clientId);
+    if (id) this.rendered.set(id, node);
+    if (clientId) this.rendered.set(clientId, node);
+    node.__nexoraMessage = message;
+    node.__nexoraSignature = this.messageSignature(message);
+    node.__nexoraStatus = message.status;
+    node.__nexoraError = message.error;
+    node.dataset.id = id || clientId;
+    if (clientId) node.dataset.clientId = clientId;
+    if (node.classList.contains('msg-row')) {
+      node.dataset.groupStart = node.dataset.groupStart || 'true';
+    }
+  }
+
+  unregisterMessageNode(node) {
+    if (!node) return;
+    for (const [key, value] of this.rendered) {
+      if (value === node) this.rendered.delete(key);
+    }
+  }
+
+  findMessageNode(message) {
+    return (message.id != null && this.rendered.get(String(message.id))) ||
+      (message.clientId != null && this.rendered.get(String(message.clientId))) || null;
+  }
+
+  groupStarts(message, previous) {
+    return !previous || previous.senderId !== message.senderId || !isSameDay(previous.createdAt, message.createdAt);
+  }
+
+  syncDateSeparator(node, message, previous) {
+    const prior = node.previousElementSibling;
+    const existing = prior?.classList.contains('date-sep') ? prior : null;
+    const needsSeparator = !previous || !isSameDay(previous.createdAt, message.createdAt);
+    if (needsSeparator) {
+      if (existing) {
+        const label = existing.querySelector('span');
+        if (label) label.textContent = formatDayLabel(message.createdAt);
+      } else {
+        node.before(this.dateSeparator(message));
+      }
+    } else if (existing) {
+      existing.remove();
+    }
+  }
+
+  renderOneMessage(message, { groupStart, conversation }) {
+    return this.renderMessage(message, { conv: conversation, groupStart });
+  }
+
+  replaceOneMessage(message, node, { groupStart, conversation } = {}) {
+    const wasSelected = node.classList.contains('msg-row--long-pressed');
+    const scrollEl = this.refs.scrollEl;
+    const oldTop = !this.atBottom && scrollEl ? node.getBoundingClientRect().top : null;
+    const next = this.renderOneMessage(message, { groupStart, conversation });
+    if (wasSelected && next.classList.contains('msg-row')) {
+      next.classList.add('msg-row--long-pressed');
+      this.selectedMessageRow = next;
+      this.selectedMessageKey = String(message.id || message.clientId || '');
+    }
+    this.unregisterMessageNode(node);
+    node.replaceWith(next);
+    this.registerMessageNode(message, next);
+    if (oldTop !== null && scrollEl && oldTop < scrollEl.getBoundingClientRect().top) {
+      scrollEl.scrollTop += next.getBoundingClientRect().top - oldTop;
+    }
+    return next;
+  }
+
+  refreshMessageStatus(message, node) {
+    if (!node?.classList.contains('msg-row')) return;
+    const bubble = node.querySelector('.bubble');
+    const footer = bubble?.querySelector('.bubble__footer');
+    if (!footer) return;
+    const current = footer.querySelector('.msg-status');
+    current?.remove();
+    if (!message.outgoing || message.isDeleted) return;
+    const label = STATUS_LABEL[message.status] || '';
+    const status = el('span', {
+      class: 'msg-status',
+      dataset: { status: message.status },
+      title: label,
+      'aria-label': label,
+      role: 'img',
+    });
+    status.append(icon(statusIconFor(message.status), { size: 14 }));
+    const tools = footer.querySelector('.bubble__tools');
+    if (tools) tools.before(status);
+    else footer.append(status);
+  }
+
+  /** Insert or update exactly one message row; do not rebuild the thread DOM. */
+  renderOrUpdateMessage(message) {
+    const conversationId = String(message.conversationId || '');
+    if (!conversationId || conversationId !== this.activeId) return null;
+    const store = getStore(conversationId);
+    const index = store.items.indexOf(message);
+    if (index < 0) return null;
+
+    const messagesEl = this.refs.messagesEl;
+    if (!messagesEl) return null;
+    const conversation = this.conversations.get(conversationId);
+    const previous = store.items[index - 1] || null;
+    const nextMessage = store.items[index + 1] || null;
+    const groupStart = this.groupStarts(message, previous);
+    let node = this.findMessageNode(message);
+
+    if (!node) {
+      // A realtime event can beat history initialization. Remove only temporary
+      // loading/empty placeholders; keep pagination controls and message rows.
+      for (const child of Array.from(messagesEl.children)) {
+        if (child.classList.contains('empty-state') || child.classList.contains('skeleton-row')) child.remove();
+      }
+      if (!store.hasMore && !messagesEl.querySelector('.thread__history-end')) {
+        messagesEl.prepend(el('div', { class: 'thread__history-end', text: 'Beginning of conversation' }));
+      }
+      node = this.renderOneMessage(message, { groupStart, conversation });
+      this.registerMessageNode(message, node);
+    } else {
+      const previousStatus = node.__nexoraStatus;
+      const retryLayoutChanged =
+        [STATUS.FAILED, STATUS.UNCONFIRMED].includes(previousStatus) !==
+          [STATUS.FAILED, STATUS.UNCONFIRMED].includes(message.status) ||
+        (message.status === STATUS.FAILED || message.status === STATUS.UNCONFIRMED) && node.__nexoraError !== message.error;
+      const contentChanged = node.__nexoraSignature !== this.messageSignature(message);
+      const groupChanged = node.classList.contains('msg-row') && node.dataset.groupStart !== String(groupStart);
+      if (contentChanged || groupChanged || retryLayoutChanged) {
+        node = this.replaceOneMessage(message, node, { groupStart, conversation });
+      } else if (previousStatus !== message.status) {
+        this.refreshMessageStatus(message, node);
+        node.__nexoraStatus = message.status;
+        node.__nexoraError = message.error;
+      }
+    }
+
+    const nextNode = nextMessage ? this.findMessageNode(nextMessage) : null;
+    const typing = messagesEl.querySelector('#typing-row');
+    const before = nextNode || typing;
+    if (before && node !== before) messagesEl.insertBefore(node, before);
+    else if (!node.parentNode) messagesEl.append(node);
+    this.syncDateSeparator(node, message, previous);
+    this.registerMessageNode(message, node);
+
+    if (nextMessage) {
+      let nextNodeNow = this.findMessageNode(nextMessage);
+      if (nextNodeNow) {
+        const afterInserted = store.items[index] || message;
+        const nextGroupStart = this.groupStarts(nextMessage, afterInserted);
+        if (nextNodeNow.classList.contains('msg-row') && nextNodeNow.dataset.groupStart !== String(nextGroupStart)) {
+          nextNodeNow = this.replaceOneMessage(nextMessage, nextNodeNow, {
+            groupStart: nextGroupStart,
+            conversation,
+          });
+        }
+        this.syncDateSeparator(nextNodeNow, nextMessage, message);
+      }
+    }
+    if (!messagesEl.querySelector('#typing-row')) messagesEl.append(this.typingRow());
+    this.updateTypingRow();
+    return node;
+  }
+
+  removeMessageRow(conversationId, message) {
+    if (String(conversationId) !== this.activeId || !message) return;
+    const node = this.findMessageNode(message);
+    if (!node) return;
+    const messagesEl = this.refs.messagesEl;
+    let nextNode = node.nextElementSibling;
+    if (nextNode?.classList.contains('date-sep')) nextNode = nextNode.nextElementSibling;
+    this.unregisterMessageNode(node);
+    if (this.selectedMessageRow === node) {
+      this.selectedMessageRow = null;
+      this.selectedMessageKey = null;
+    }
+    if (node.previousElementSibling?.classList.contains('date-sep')) node.previousElementSibling.remove();
+    node.remove();
+
+    const store = getStore(conversationId);
+    const nextMessage = nextNode?.__nexoraMessage || null;
+    if (nextMessage && store.items.includes(nextMessage)) {
+      const index = store.items.indexOf(nextMessage);
+      const previous = store.items[index - 1] || null;
+      const conversation = this.conversations.get(String(conversationId));
+      const groupStart = this.groupStarts(nextMessage, previous);
+      if (nextNode.classList.contains('msg-row') && nextNode.dataset.groupStart !== String(groupStart)) {
+        nextNode = this.replaceOneMessage(nextMessage, nextNode, { groupStart, conversation });
+      }
+      this.syncDateSeparator(nextNode, nextMessage, previous);
+    }
+    if (!store.items.length) {
+      clear(messagesEl);
+      messagesEl.append(emptyState({
+        icon: 'message-square',
+        title: 'No messages yet',
+        text: this.conversations.get(String(conversationId))?.isGroup
+          ? 'Start the conversation with this group.'
+          : 'Send a message to start the conversation.',
+      }));
     }
   }
 
@@ -770,6 +1010,7 @@ export class ChatController {
     if (!message.local && !message.isDeleted && getFeatures().replies) {
       this.bindSwipeToReply(row, bubble, message);
     }
+    this.bindLongPressHighlight(row, message);
     return row;
   }
 
@@ -925,6 +1166,49 @@ export class ChatController {
 
     void conv;
     return tools;
+  }
+
+  /** Highlight a whole message row on a stationary mobile long press. */
+  bindLongPressHighlight(row, message) {
+    const HOLD_MS = 500;
+    const MOVE_CANCEL_PX = 10;
+    let timer = null;
+    let startX = 0;
+    let startY = 0;
+
+    const cancel = () => {
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+    };
+    row.addEventListener('touchstart', (event) => {
+      cancel();
+      if (event.touches.length !== 1) return;
+      const target = event.target;
+      if (target?.closest?.('button, a, audio, video, input, textarea, select, [role="slider"], .voice__track')) return;
+      const touch = event.touches[0];
+      startX = touch.clientX;
+      startY = touch.clientY;
+      timer = setTimeout(() => {
+        timer = null;
+        if (!row.isConnected) return;
+        if (this.selectedMessageRow && this.selectedMessageRow !== row) {
+          this.selectedMessageRow.classList.remove('msg-row--long-pressed');
+        }
+        row.classList.add('msg-row--long-pressed');
+        this.selectedMessageRow = row;
+        this.selectedMessageKey = String(message.id || message.clientId || '');
+      }, HOLD_MS);
+    }, { passive: true });
+    row.addEventListener('touchmove', (event) => {
+      if (timer === null || !event.touches.length) return;
+      const touch = event.touches[0];
+      if (Math.abs(touch.clientX - startX) > MOVE_CANCEL_PX || Math.abs(touch.clientY - startY) > MOVE_CANCEL_PX) cancel();
+    }, { passive: true });
+    row.addEventListener('touchend', cancel, { passive: true });
+    row.addEventListener('touchcancel', cancel, { passive: true });
+    row.addEventListener('contextmenu', (event) => {
+      if (row.classList.contains('msg-row--long-pressed')) event.preventDefault();
+    });
   }
 
   /**
@@ -1782,18 +2066,10 @@ export class ChatController {
      ============================================================ */
 
   bindStoreEvents() {
-    const rerenderIfActive = (convId) => {
-      if (String(convId) !== this.activeId) return;
-      const wasAtBottom = this.atBottom;
-      this.renderMessages({ scrollToBottom: false });
-      this.updateTypingRow();
-      if (wasAtBottom) this.scrollToBottom();
-    };
-
     messageEvents.on('added', (convId, message) => {
       if (String(convId) !== this.activeId) return;
       const wasAtBottom = this.atBottom;
-      this.renderMessages({ scrollToBottom: false });
+      this.renderOrUpdateMessage(message);
       if (wasAtBottom || message.outgoing) this.scrollToBottom();
       else {
         this.newWhileAway += 1;
@@ -1802,9 +2078,13 @@ export class ChatController {
       if (!message.outgoing && wasAtBottom) this.markRead();
     });
 
-    messageEvents.on('updated', (convId) => rerenderIfActive(convId));
-    messageEvents.on('removed', (convId) => rerenderIfActive(convId));
-    messageEvents.on('reconciled', (convId) => rerenderIfActive(convId));
+    messageEvents.on('updated', (convId, message) => {
+      if (String(convId) !== this.activeId) return;
+      const wasAtBottom = this.atBottom;
+      this.renderOrUpdateMessage(message);
+      if (wasAtBottom) this.scrollToBottom();
+    });
+    messageEvents.on('removed', (convId, message) => this.removeMessageRow(convId, message));
 
     messageEvents.on('progress', (convId, message) => {
       if (String(convId) !== this.activeId) return;
@@ -1832,6 +2112,11 @@ export class ChatController {
       if (!convId) return;
       const raw = payload.message || payload;
       const message = normalizeMessage(raw, { currentUserId: this.user?.id });
+      if (!message) return;
+      // The active thread may be joining/loading history while realtime is
+      // already connected. Upsert into its store now; client_id + server id
+      // matching makes this safe when the WS and HTTP response race.
+      if (convId === this.activeId) applyServerMessage(convId, raw);
 
       let conv = this.conversations.get(convId);
       if (!conv) {
@@ -1842,7 +2127,6 @@ export class ChatController {
       conv.lastMessage = message;
       conv.previewText = messagePreview(message);
       conv.lastActivity = message.createdAt;
-      if (convId !== this.activeId && !message.outgoing) incrementConversationUnread(convId, 1);
       this.renderList();
 
       if (convId === this.activeId && !message.outgoing) {

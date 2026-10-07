@@ -2,6 +2,7 @@
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { setNavigator } from './helpers/browser-env.mjs';
 
 const API_MODULE = new URL('../assets/js/api.js', import.meta.url).href;
 const REFRESH_REJECTED_KEY = 'nexora.auth.refresh-rejected.v1';
@@ -21,7 +22,7 @@ test('failed PIN login leaves auth recovery state alone; successful login clears
   };
   globalThis.window = { location: globalThis.location, addEventListener() {}, removeEventListener() {} };
   globalThis.document = { cookie: '', querySelector: () => null, getElementById: () => null };
-  globalThis.navigator = { onLine: true };
+  setNavigator({ onLine: true });
   globalThis.sessionStorage = {
     getItem: (key) => session.get(key) ?? null,
     setItem: (key, value) => session.set(key, String(value)),

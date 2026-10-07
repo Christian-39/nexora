@@ -24,6 +24,7 @@ Three middleware, in the order they are installed:
 from __future__ import annotations
 
 import logging
+import re
 import time
 
 from django.conf import settings
@@ -46,12 +47,13 @@ LOGGED_ATTR = "_nexora_logged"
 
 #: Requests slower than this are reported at WARNING even when they succeed.
 SLOW_REQUEST_MS_DEFAULT = 2000
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 def _header_request_id(request) -> str:
-    """Adopt a client-supplied id only when it is a safe, bounded token."""
-    raw = str(request.headers.get("X-Request-ID", "") or "")[:64].strip()
-    if raw and all(char.isalnum() or char in "-_" for char in raw):
+    """Adopt only the bounded ASCII grammar shared by relay and browser."""
+    raw = str(request.headers.get("X-Request-ID", "") or "").strip()
+    if _REQUEST_ID_RE.fullmatch(raw):
         return raw
     return new_request_id()
 

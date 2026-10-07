@@ -12,6 +12,7 @@
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { setNavigator } from './helpers/browser-env.mjs';
 
 /* ------------------------------------------------------------------ stubs */
 
@@ -94,7 +95,7 @@ function installEnvironment() {
     getElementById: () => null,
     createElement: () => ({ style: {}, setAttribute() {}, append() {} }),
   };
-  globalThis.navigator = { onLine: true };
+  setNavigator({ onLine: true });
   globalThis.NEXORA_RUNTIME = { API_BASE_URL: 'https://api.example.test' };
   globalThis.WebSocket = FakeWebSocket;
   globalThis.localStorage = {

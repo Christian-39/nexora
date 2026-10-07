@@ -7,6 +7,7 @@
  */
 
 import { Emitter } from './utils.js';
+import { getUser } from './auth.js';
 import { socketEvents } from './websocket.js';
 
 const TYPING_TTL = 6000; // clear if no refresh arrives
@@ -81,6 +82,8 @@ export function setTyping(conversationId, user, isTyping) {
   if (!conversationId || !user?.id) return;
   const convId = String(conversationId);
   const userId = String(user.id);
+  const currentUserId = getUser()?.id;
+  if (currentUserId != null && userId === String(currentUserId)) return;
 
   if (!typingMap.has(convId)) typingMap.set(convId, new Map());
   const bucket = typingMap.get(convId);

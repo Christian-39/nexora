@@ -188,15 +188,31 @@ def test_receipts_and_unread_counts(admin, member_a):
 @pytest.mark.django_db
 def test_message_status_reconciliation_endpoint(admin, member_a):
     conversation, _ = private_conversation(admin, member_a)
+    own_client_id = client_id()
     created = authed(member_a).post(
         f"/api/conversations/{conversation.id}/messages/",
-        {"client_id": client_id(), "text": "reconcile"},
+        {"client_id": own_client_id, "text": "reconcile"},
         format="json",
     ).json()["data"]
+    other_client_id = client_id()
+    other_message, _ = send_message(
+        user=admin, conversation=conversation, client_id=other_client_id, text="not the requester’s key"
+    )
 
-    body = authed(member_a).post("/api/messages/status/", {"ids": [created["id"]]}, format="json")
-    assert body.status_code == 200
-    assert body.json()["data"]["results"][0]["id"] == created["id"]
+    by_id = authed(member_a).post("/api/messages/status/", {"ids": [created["id"]]}, format="json")
+    assert by_id.status_code == 200
+    assert by_id.json()["data"]["results"][0]["id"] == created["id"]
+
+    by_client_id = authed(member_a).post(
+        "/api/messages/status/",
+        {"client_ids": [own_client_id, other_client_id]},
+        format="json",
+    )
+    assert by_client_id.status_code == 200
+    results = by_client_id.json()["data"]["results"]
+    assert [row["id"] for row in results] == [created["id"]]
+    assert results[0]["client_id"] == own_client_id
+    assert str(other_message.id) not in {row["id"] for row in results}
 
 
 @pytest.mark.django_db

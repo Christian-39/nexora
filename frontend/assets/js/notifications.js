@@ -65,53 +65,111 @@ export function getConversationUnread(conversationId) {
   return unread.byConversation.get(String(conversationId)) || 0;
 }
 
-function recompute() {
-  let conversations = 0;
-  let groups = 0;
-  for (const [, entry] of unread.byConversation) {
-    if (typeof entry === 'number') conversations += entry;
-  }
-  unread.conversations = conversations;
-  unread.groups = groups || unread.groups;
-  unread.total = unread.conversations + unread.notifications;
+function publishUnread() {
   persistUnread();
   unreadEvents.emit('change', getUnread());
   syncAppBadge(unread.total);
 }
 
-/** Apply the authoritative summary from the backend. */
+function recompute({ deriveMessagesFromMap = false } = {}) {
+  if (deriveMessagesFromMap) {
+    unread.conversations = Array.from(unread.byConversation.values()).reduce(
+      (sum, entry) => sum + (Number.isFinite(entry) ? Math.max(0, entry) : 0),
+      0
+    );
+  }
+  unread.total = unread.conversations + unread.notifications;
+  publishUnread();
+}
+
+function unreadCountFromEntry(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+  const value = entry.unread_count ?? entry.unread;
+  return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : null;
+}
+
+/** Apply the authoritative summary from REST or a full WebSocket snapshot. */
 export function applyUnreadSummary(summary) {
   if (!summary || typeof summary !== 'object') return;
 
-  if (Array.isArray(summary.conversations)) {
+  let hasFullConversationMap = false;
+  const conversationMap = summary.conversations;
+  if (Array.isArray(conversationMap)) {
     unread.byConversation.clear();
-    for (const entry of summary.conversations) {
-      const id = String(entry.conversation_id ?? entry.id ?? '');
-      if (!id) continue;
-      unread.byConversation.set(id, Number(entry.unread_count ?? entry.unread ?? 0) || 0);
+    for (const entry of conversationMap) {
+      const id = String(entry?.conversation_id ?? entry?.id ?? '');
+      const count = unreadCountFromEntry(entry);
+      if (id && count !== null) unread.byConversation.set(id, count);
     }
+    hasFullConversationMap = true;
+  } else if (conversationMap && typeof conversationMap === 'object') {
+    unread.byConversation.clear();
+    for (const [rawId, rawCount] of Object.entries(conversationMap)) {
+      const id = String(rawId);
+      const value = Number(rawCount);
+      if (id && Number.isFinite(value)) unread.byConversation.set(id, Math.max(0, value));
+    }
+    hasFullConversationMap = true;
   }
-  if (typeof summary.total_unread_conversations === 'number') unread.conversations = summary.total_unread_conversations;
-  if (typeof summary.total_unread_messages === 'number') unread.conversations = summary.total_unread_messages;
-  if (typeof summary.groups_unread === 'number') unread.groups = summary.groups_unread;
-  if (typeof summary.notifications_unread === 'number') unread.notifications = summary.notifications_unread;
-  if (typeof summary.total === 'number') {
-    unread.total = summary.total;
-    persistUnread();
-    unreadEvents.emit('change', getUnread());
-    syncAppBadge(unread.total);
-    return;
+
+  const conversationId = summary.conversation_id == null ? '' : String(summary.conversation_id);
+  const conversationCount =
+    typeof summary.unread_count === 'number' && Number.isFinite(summary.unread_count)
+      ? Math.max(0, summary.unread_count)
+      : typeof summary.count === 'number' && Number.isFinite(summary.count)
+        ? Math.max(0, summary.count)
+        : null;
+  let previousConversationCount;
+  if (conversationId && conversationCount !== null) {
+    previousConversationCount = unread.byConversation.get(conversationId);
+    unread.byConversation.set(conversationId, conversationCount);
   }
-  recompute();
+
+  if (typeof summary.groups_unread === 'number') unread.groups = Math.max(0, summary.groups_unread);
+  if (typeof summary.notifications_unread === 'number') {
+    unread.notifications = Math.max(0, summary.notifications_unread);
+  } else if (typeof summary.notifications === 'number') {
+    unread.notifications = Math.max(0, summary.notifications);
+  }
+
+  const messageTotal = [
+    summary.unread_messages_total,
+    summary.total_unread_messages,
+    summary.global,
+    summary.total,
+  ].find((value) => typeof value === 'number' && Number.isFinite(value));
+  if (messageTotal !== undefined) {
+    unread.conversations = Math.max(0, messageTotal);
+  } else if (hasFullConversationMap) {
+    unread.conversations = Array.from(unread.byConversation.values()).reduce((sum, value) => sum + value, 0);
+  } else if (conversationId && conversationCount !== null && previousConversationCount !== undefined) {
+    // A per-thread authoritative delta can adjust a known aggregate, but an
+    // absent map entry is not assumed to mean zero.
+    unread.conversations = Math.max(0, unread.conversations - previousConversationCount + conversationCount);
+  }
+
+  const combinedTotal = [summary.unread_total, summary.total_unread].find(
+    (value) => typeof value === 'number' && Number.isFinite(value)
+  );
+  unread.total = combinedTotal === undefined
+    ? unread.conversations + unread.notifications
+    : Math.max(0, combinedTotal);
+  publishUnread();
+  if (conversationId && conversationCount !== null) unreadEvents.emit('conversation', conversationId, conversationCount);
 }
 
 export function setConversationUnread(conversationId, count) {
   const id = String(conversationId);
   const value = Math.max(0, Number(count) || 0);
-  if (unread.byConversation.get(id) === value) return;
+  const previous = unread.byConversation.get(id);
+  if (previous === value) return;
   unread.byConversation.set(id, value);
+  if (previous !== undefined) {
+    unread.conversations = Math.max(0, unread.conversations - previous + value);
+  }
   recompute();
   unreadEvents.emit('conversation', id, value);
+  if (previous === undefined) refreshUnread({ force: true });
 }
 
 export function incrementConversationUnread(conversationId, by = 1) {
@@ -344,14 +402,25 @@ socketEvents.on('unread.update', (payload) => applyUnreadSummary(payload));
 
 socketEvents.on('conversation.unread', (payload) => {
   if (payload?.conversation_id === undefined) return;
-  setConversationUnread(payload.conversation_id, payload.unread_count ?? payload.count ?? 0);
+  if (
+    payload.unread_messages_total !== undefined ||
+    payload.global !== undefined ||
+    payload.total !== undefined ||
+    payload.conversations !== undefined
+  ) {
+    applyUnreadSummary(payload);
+    return;
+  }
+  const count = payload.unread_count ?? payload.count;
+  if (typeof count === 'number' && Number.isFinite(count)) setConversationUnread(payload.conversation_id, count);
 });
 
 socketEvents.on('notification.new', (payload) => {
   if (!payload) return;
   notificationEvents.emit('new', payload);
+  // A notification event is not a count delta. The server follows it with an
+  // authoritative unread.update; only accept an explicit count if provided.
   if (typeof payload.unread_count === 'number') setNotificationUnread(payload.unread_count);
-  else setNotificationUnread(unread.notifications + 1);
 });
 
 socketEvents.on('notification.read', (payload) => {
@@ -386,8 +455,6 @@ export function mountForegroundMessageAlerts(options = {}) {
 
     if (convId === String(getActiveConversationId?.() || '')) return;
     if (document.visibilityState !== 'visible') return; // the SW handles background
-
-    incrementConversationUnread(convId, 1);
 
     const title = payload.conversation_name || message?.sender?.display_name || 'New message';
     const body = previewsEnabled ? summarize(message) : 'You have a new message.';

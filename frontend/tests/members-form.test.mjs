@@ -11,6 +11,7 @@
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { setNavigator } from './helpers/browser-env.mjs';
 
 /* ---- minimal browser environment (members.js transitively imports api.js,
    which binds window listeners at module scope) ---- */
@@ -38,7 +39,7 @@ function installEnvironment() {
     getElementById: () => null,
     createElement: () => ({ style: {}, setAttribute() {}, append() {}, addEventListener() {} }),
   };
-  globalThis.navigator = { onLine: true };
+  setNavigator({ onLine: true });
   globalThis.matchMedia = () => ({ matches: false, addEventListener() {} });
 }
 

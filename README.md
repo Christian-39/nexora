@@ -54,10 +54,11 @@ devices. They are not cosmetic.
 | Object storage | local filesystem | **S3-compatible bucket (required)** |
 | `ffmpeg` / `ffprobe` | optional | **required for video posters and duration probing** |
 
-Production start-up refuses to boot without `SECRET_KEY`, `ALLOWED_HOSTS`,
-`REDIS_URL`, a non-SQLite database, `STORAGE_BUCKET` and at least one
-CORS/CSRF origin. That is deliberate: a misconfigured deployment should fail
-loudly, not quietly serve an insecure app.
+Production start-up refuses to boot without `SECRET_KEY`, an authenticated
+`SECURITY_RELAY_TOKEN`, `ALLOWED_HOSTS`, `REDIS_URL`, a non-SQLite database,
+`STORAGE_BUCKET` and at least one CORS/CSRF origin. The production relay cannot
+be disabled. That is deliberate: misconfiguration should fail loudly rather
+than silently expose the backend.
 
 ---
 
@@ -123,9 +124,10 @@ mistakenly posted to the static server. For a same-origin reverse proxy, use
 `API_BASE_URL=same-origin`. The browser-side `config.js` reads only the
 build-injected `API_BASE_URL`; it never guesses a backend hostname or falls
 back to a committed production origin. On Vercel, configure the public HTTPS
-API origin in the Vercel project environment; its production build rejects a
-missing, loopback, or plain-HTTP API origin unless same-origin proxy mode is
-explicitly selected.
+Security Relay origin in the Vercel project environment; its production build
+rejects a missing, loopback, or plain-HTTP API origin unless same-origin proxy
+mode is explicitly selected. Never point browser code at the private Django
+service or object-store internals.
 
 The WebSocket scheme is derived from that same value (`http→ws`, `https→wss`).
 The handshake uses the HttpOnly access cookie; credentials are not placed in a
@@ -168,49 +170,65 @@ logged.
 
 ## 4. Production deployment
 
-### 4.1 The deployed topology (no Docker)
+### 4.1 The deployed topology (native Python; no Docker)
 
 ```
-Vercel static frontend            https://nexora-eight-lilac.vercel.app
-        │ HTTPS + WSS
+Vercel static frontend
+        │ HTTPS / WSS; API_BASE_URL points to the public relay
         ▼
-Render Python web service         https://nexora-f397.onrender.com
-  Gunicorn + UvicornWorker + Django Channels
+Render public Python Security Relay
+  fixed-host/path ASGI reverse proxy; auth, cookies, media + WebSocket upgrades
+        │ private Render network; shared relay-hop token
+        ▼
+Render private Django/Channels ASGI service
         ├── external managed MySQL 8
-        ├── external managed Redis        (REDIS_URL — channels, cache, presence)
-        └── external private S3-compatible bucket
-        +  separate Render background workers (push / media / uploads)
+        ├── external managed Redis (REDIS_URL — channels, cache, presence)
+        ├── private S3-compatible object storage
+        └── separate Render background workers (push / media / uploads)
 ```
 
-There is **no Docker anywhere in this project**: no Dockerfile, no Compose, no
-container Redis and no container MySQL. Redis, MySQL and object storage are
-external managed services reached over the network.
+Only the relay is public. The backend is a private Render service and refuses
+HTTP and WebSocket requests without the shared relay token. The relay has one
+configured private upstream and exact public-host/path allowlists; it is not an
+open proxy. The browser continues to use the centralized `API_BASE_URL` from
+`config.js`, but that value must point to the relay—not the private backend.
 
-`render.yaml` in the repository root is the blueprint for exactly this layout.
+There is **no Docker anywhere in this project**: no Dockerfile, Compose file,
+container Redis or container MySQL. MySQL, Redis and object storage remain the
+existing external managed services. `render.yaml` describes the native Python
+relay, private ASGI backend and separate workers.
 
-**Build command** (`rootDir: backend`)
-
-```bash
-./bin/render-build.sh
-```
-
-**Start command** — ASGI, never WSGI:
+The backend start command remains ASGI, never WSGI:
 
 ```bash
 gunicorn config.asgi:application -k uvicorn.workers.UvicornWorker -c gunicorn.conf.py
 ```
 
-`gunicorn.conf.py` binds `0.0.0.0:$PORT`, which is what the platform health
-checks; a hard-coded port makes the deploy time out. `config.wsgi` cannot serve
-WebSockets — deploying it silently removes every realtime feature.
+`gunicorn.conf.py` binds `0.0.0.0:$PORT` and disables Uvicorn's generic
+proxy-header parser. The ASGI boundary trusts exactly one forwarded scheme only
+after the relay token is authenticated. Do not expose the private backend or
+replace this with a proxy that forwards arbitrary client-supplied headers.
+
+**Relay configuration** (the Render Blueprint wires the private host/port and
+shared token):
+
+```
+SECURITY_RELAY_TOKEN=<same generated secret on relay and backend>
+UPSTREAM_HOST / UPSTREAM_PORT=<private backend host/port from Render>
+UPSTREAM_SCHEME=http
+PUBLIC_SCHEME=https
+PUBLIC_HOSTS=<optional exact aliases; Render hostname is auto-detected>
+```
 
 **Backend environment (Render → Environment)**
 
 ```
 DJANGO_ENV=production
 DEBUG=False
-SECRET_KEY=<64+ random characters>
-ALLOWED_HOSTS=nexora-f397.onrender.com
+SECRET_KEY=<unique random value>
+SECURITY_RELAY_REQUIRED=True
+SECURITY_RELAY_TOKEN=<same generated secret as relay>
+ALLOWED_HOSTS=<exact public relay hostname and configured API aliases>
 CORS_ALLOWED_ORIGINS=https://nexora-eight-lilac.vercel.app
 CSRF_TRUSTED_ORIGINS=https://nexora-eight-lilac.vercel.app
 COOKIE_SAMESITE=None            # cross-site frontend
@@ -225,7 +243,17 @@ MEDIA_PROCESS_INLINE=False
 FFMPEG_BINARY / FFPROBE_BINARY  (see 4.3)
 ```
 
-Secrets are set in the dashboard, never committed.
+Never commit secrets. The backend must list the relay's actual public hostname
+in `ALLOWED_HOSTS`; custom aliases must also be listed exactly in the relay's
+`PUBLIC_HOSTS` setting and backend `ALLOWED_HOSTS`.
+
+**Privacy boundary:** the relay necessarily sees the connecting peer at its
+network edge. The app does not claim anonymity. It strips user-supplied
+forwarded-IP metadata, never forwards a browser IP to Django, and does not
+persist the relay or peer address in security-event rows in relay-required
+mode. The browser sees the relay origin, not the backend's private host. The
+shared token authenticates the service-to-service hop; it is not a replacement
+for user authentication, authorization, CSRF or WebSocket-origin checks.
 
 ### 4.2 Redis is a hard requirement in production
 
@@ -245,7 +273,8 @@ only for users who happened to land on the same worker.
   `REDIS_CHANNEL_EXPIRY=60`). The channel socket timeout is automatically kept
   above `channels_redis`'s 5-second `BZPOPMIN` blocking window so idle WebSocket
   consumers never crash with `redis.exceptions.TimeoutError`.
-* `/health/live/` reports process liveness; `/health/ready/` independently
+* The public relay health check forwards `/health/live/` to the private ASGI
+  backend. `/health/ready/` is also routed through the relay and independently
   verifies MySQL (`database`), Redis cache (`cache`), Redis Channels
   (`channels`), and private object storage (`storage`) without exposing
   connection URLs or secrets.
@@ -290,12 +319,15 @@ is never enabled.
 `frontend/vercel.json` serves `dist/` and revalidates HTML, JavaScript, CSS and
 `sw.js` so a deploy cannot be masked by a stale cached bundle.
 
-### 4.5 Alternative: one origin behind a reverse proxy
+### 4.5 Alternative: another trusted proxy topology
 
-One nginx/Caddy serving the frontend build and forwarding `/api/`, `/ws/`,
-`/static/` and `/health/` to the ASGI server works unchanged. Build with
-`API_BASE_URL=same-origin`; configure the backend's cookie policy appropriately
-for that topology. The browser uses relative API URLs.
+A same-origin proxy can serve the frontend and forward `/api/`, `/ws/` and
+health requests, but in production it must provide the same network boundary:
+fixed private upstream, exact host/path allowlists, trusted forwarded headers,
+and the shared relay token expected by the backend ASGI gate. Do not expose the
+Django service directly or simply pass browser-supplied `X-Forwarded-*` headers.
+Build with `API_BASE_URL=same-origin` only when the proxy actually forwards the
+API and WebSocket routes. The browser then uses relative URLs.
 
 ### 4.6 Web push keys
 
@@ -399,8 +431,10 @@ PDFs are rejected outright.
 
 Files are private. `GET /api/media/{uuid}/` authorizes the caller and then
 streams the object with HTTP range support; `GET /api/media/{uuid}/url/`
-authorizes first and then issues a short-lived signed URL (S3-compatible
-storage only). Derivatives — thumbnail, optimized WebP, video poster — are
+authorizes first and returns the configured media URL. In relay-required
+production this stays on the protected API stream and never exposes an
+object-store address; non-relay deployments may use short-lived signed URLs.
+Derivatives — thumbnail, optimized WebP, video poster — are
 produced by `media_worker` out of band; a derivative failure never destroys
 the original, and `media.ready` tells connected clients when they exist.
 

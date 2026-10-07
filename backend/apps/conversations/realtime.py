@@ -118,6 +118,116 @@ def _message_payload(message, *, request=None):
     return MessageSerializer(message, context={"request": request}).data
 
 
+def unread_summaries(user_ids) -> dict[str, dict]:
+    """Return one authoritative unread snapshot per user in two grouped queries.
+
+    Message unread counts remain receipt-derived; notification unread counts are
+    separate. This is deliberately aggregate-only and never fetches message or
+    notification bodies.
+    """
+    from django.db.models import Count
+
+    from apps.notifications.models import Notification
+    from .models import MessageReceipt
+
+    ids = {str(value) for value in user_ids if value}
+    summaries = {
+        user_id: {
+            "global": 0,  # legacy message-only total
+            "total": 0,   # legacy message-only total
+            "unread_messages_total": 0,
+            "unread_total": 0,  # messages + persistent notifications
+            "notifications": 0,
+            "notifications_unread": 0,
+            "conversations": {},
+            "conversation_counts": [],
+        }
+        for user_id in ids
+    }
+    if not ids:
+        return summaries
+
+    rows = (
+        MessageReceipt.objects.filter(
+            recipient_id__in=ids,
+            read_at__isnull=True,
+            message__conversation__is_active=True,
+        )
+        .values("recipient_id", "message__conversation_id")
+        .annotate(count=Count("id"))
+        .order_by()
+    )
+    for row in rows:
+        user_id = str(row["recipient_id"])
+        conversation_id = str(row["message__conversation_id"])
+        count = int(row["count"])
+        state = summaries.get(user_id)
+        if state is None:
+            continue
+        state["conversations"][conversation_id] = count
+        state["unread_messages_total"] += count
+        state["conversation_counts"].append(
+            {"conversation_id": conversation_id, "unread_count": count}
+        )
+
+    notification_rows = (
+        Notification.objects.filter(recipient_id__in=ids, read_at__isnull=True)
+        .values("recipient_id")
+        .annotate(count=Count("id"))
+        .order_by()
+    )
+    for row in notification_rows:
+        user_id = str(row["recipient_id"])
+        if user_id in summaries:
+            summaries[user_id]["notifications"] = int(row["count"])
+            summaries[user_id]["notifications_unread"] = int(row["count"])
+
+    for state in summaries.values():
+        state["conversation_counts"].sort(key=lambda item: item["conversation_id"])
+        state["global"] = state["unread_messages_total"]
+        state["total"] = state["unread_messages_total"]
+        state["unread_total"] = state["unread_messages_total"] + state["notifications_unread"]
+    return summaries
+
+
+def unread_summary(user_id, *, conversation_id=None) -> dict:
+    """Get the current authoritative unread contract for one authenticated user."""
+    key = str(user_id)
+    state = unread_summaries([user_id]).get(key, {
+        "global": 0,
+        "total": 0,
+        "unread_messages_total": 0,
+        "unread_total": 0,
+        "notifications": 0,
+        "notifications_unread": 0,
+        "conversations": {},
+        "conversation_counts": [],
+    })
+    if conversation_id is not None:
+        state = dict(state)
+        state["conversation_id"] = str(conversation_id)
+        state["unread_count"] = int(state["conversations"].get(str(conversation_id), 0))
+    return state
+
+
+def broadcast_unread_state(user_ids, *, conversation_id=None, on_commit=True) -> None:
+    """Publish full global and, when requested, per-conversation counts."""
+    conversation_key = str(conversation_id) if conversation_id is not None else None
+    for user_id, state in unread_summaries(user_ids).items():
+        payload = dict(state)
+        if conversation_key is not None:
+            payload["conversation_id"] = conversation_key
+            payload["unread_count"] = int(state["conversations"].get(conversation_key, 0))
+        emit_to_users([user_id], "unread.update", payload, on_commit=on_commit)
+        if conversation_key is not None:
+            emit_to_users(
+                [user_id],
+                "conversation.unread",
+                payload,
+                on_commit=on_commit,
+            )
+
+
 def broadcast_new_message(message, *, request=None, recipient_ids=()) -> None:
     payload = _message_payload(message, request=request)
     emit_to_conversation(message.conversation_id, "message.new", payload)
@@ -126,12 +236,9 @@ def broadcast_new_message(message, *, request=None, recipient_ids=()) -> None:
         "conversation_id": str(message.conversation_id),
         "last_message": payload,
     })
-    for recipient_id in recipient_ids:
-        # Both names are published: 'unread.update' is the global badge signal,
-        # 'conversation.unread' is the per-thread one the chat list listens to.
-        payload = {"conversation_id": str(message.conversation_id)}
-        emit_to_users([recipient_id], "unread.update", payload)
-        emit_to_users([recipient_id], "conversation.unread", payload)
+    # Each recipient receives the authoritative receipt-derived conversation
+    # count and global badge state. A missing count is never interpreted as 0.
+    broadcast_unread_state(recipient_ids, conversation_id=message.conversation_id)
 
 
 def broadcast_message_updated(message, *, request=None) -> None:

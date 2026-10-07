@@ -3,8 +3,8 @@
 Pure HTML + CSS + vanilla JavaScript (ES modules). No frameworks, bundler or
 runtime dependencies. The optional Node build step only injects public
 deployment configuration and versions the service worker; it does not compile
-or transform the application. The static bundle talks to Django/DRF/Channels
-over REST and WebSockets.
+or transform the application. The static bundle talks to Django/DRF/Channels over REST and WebSockets
+through the configured public Security Relay in production.
 
 ---
 
@@ -60,10 +60,12 @@ origin into every HTML page, and versions the service-worker cache from the
 static source fingerprint, commit identity and API origin. Example value:
 
 ```text
-API_BASE_URL=https://api.example.org
+API_BASE_URL=https://<public-security-relay-host>
 ```
 
-It must be an HTTP(S) origin only (no credentials, path, query or fragment);
+It must be the public Security Relay origin in production—never the private
+Django service or storage endpoint. It must be an HTTP(S) origin only (no
+credentials, path, query or fragment);
 Vercel requires HTTPS and rejects a missing value, loopback hosts, and plain
 HTTP API origins. Use the explicit value `same-origin` only when a reverse proxy
 serves `/api/` and `/ws/` from the same origin as the pages. `API_BASE_URL` is public configuration, never a
@@ -86,10 +88,10 @@ untracked and never shipped. For a same-origin reverse proxy, set
 a runtime override also intentionally keeps root-relative URLs for that proxy.
 
 On Vercel, set `API_BASE_URL` in the project environment to the public HTTPS
-Django API origin. Never use the local example value there. The Vercel build
-fails if this production value is missing, loopback, or plain HTTP unless an
-explicit same-origin reverse proxy is configured. Never commit a real
-frontend `.env`.
+Security Relay origin. Never use the local example value or a private backend
+hostname there. The Vercel build fails if this production value is missing,
+loopback, or plain HTTP unless an explicit same-origin trusted proxy is
+configured. Never commit a real frontend `.env`.
 
 The `API_PREFIX` remains `/api`. REST requests live in `assets/js/api.js`; the
 WebSocket scheme/origin is derived centrally (`http→ws`, `https→wss`) from the
@@ -98,8 +100,14 @@ configured API origin. No other module maintains a backend host.
 For a cross-origin frontend/API deployment, the backend must return an explicit
 `Access-Control-Allow-Origin` plus `Access-Control-Allow-Credentials: true`,
 trust the frontend origin for CSRF, and set auth cookies `SameSite=None; Secure`.
-For a same-origin reverse proxy, configure cookie policy and proxy routes in the
-backend deployment instead; the browser still uses relative API URLs.
+In production, HTTP requests, WebSocket upgrades, authentication cookies,
+Authorization, and media API traffic all go through the public Security Relay;
+that relay forwards to a fixed private Django upstream. Do not point this
+setting at the private backend. The relay is a privacy boundary, not an
+anonymity service: its network edge can observe the connecting peer, while the
+backend does not receive browser-supplied client-IP headers. For a different
+same-origin proxy, configure the equivalent authenticated network boundary and
+trusted header policy before using relative API URLs.
 
 HTML and code responses are revalidated by Vercel. The service worker versions
 its shell cache when `API_BASE_URL` changes, so a previous deployment cannot
@@ -200,7 +208,7 @@ POST /groups/{id}/archive/   ·  /unarchive/   ·  /leave/
 GET/POST /groups/{id}/members/  ·  DELETE /groups/{id}/members/{memberId}/
 POST /groups/{id}/image/     multipart
 
-GET  /media/{id}/url/        → { url, thumbnail_url, expires_at }   (signed URLs)
+GET  /media/{id}/url/        → { url, thumbnail_url, expires_at }   (protected API stream in relay mode; signed URL only outside relay mode)
 
 GET  /members/ ?search= &is_active= &selectable=   ·  POST /members/
 GET/PATCH /members/{id}/  ·  POST /members/{id}/activate|deactivate|reset-pin/
@@ -289,8 +297,9 @@ refreshed on reconnect and on tab focus only.
 
 **Media is lazy.** Images and video posters load via `IntersectionObserver`;
 video files are never fetched to render a list — only on explicit playback.
-Voice notes fetch audio only on first play. Expiring signed URLs are
-re-resolved automatically on load failure.
+Voice notes fetch audio only on first play. Media URLs are re-authorized and
+re-resolved automatically on load failure; relay-required production keeps
+media delivery on the protected API stream instead of exposing storage URLs.
 
 ---
 
